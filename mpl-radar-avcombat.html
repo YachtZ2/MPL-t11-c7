@@ -1,0 +1,204 @@
+/* ============================================================
+   MPL — mpl-radar-avcombat.js  (arquivo NOVO, SUBSTITUI o radar anterior)
+   ADICIONE no index.html, DEPOIS de mpl-radar-aviao-fix.js:
+     <script src="js/mpl-radar-avcombat.js"></script>
+   (pode deixar o arquivo anterior — este apenas reassume o desenho)
+
+   Estilo "Ace Combat" replicado do radar-teste.html do usuário:
+   - Feixe giratório que "varre" o radar continuamente.
+   - Cada dezena do RR(K) só fica 100% visível (com rótulo) quando
+     o feixe acabou de passar por ela — depois esmaece gradualmente.
+     Isso resolve o acúmulo de números (ex.: Lotomania com 100 dezenas)
+     sem precisar empurrar pontos: nunca há mais que um punhado de
+     rótulos plenamente visíveis ao mesmo tempo.
+   - Rastro de "motion blur" (em vez de limpar o canvas a cada frame,
+     pinta uma camada semitransparente por cima — cria o rastro).
+   - Anéis concêntricos + cruz de eixos, como no radar de referência.
+   - Cor do feixe/alvos = cor oficial da modalidade; dezenas Classe A
+     (mais fortes) recebem destaque dourado, como "alvos prioritários".
+   - Radar maior (520px) para melhor leitura.
+   ============================================================ */
+(function () {
+  "use strict";
+
+  var ANGULO_VARREDURA_VELOCIDADE = 0.022;
+  var anguloVarredura = 0;
+  var estadoAlvos = {}; // dezena -> {opacity}
+
+  function ajustarTamanhoCanvas() {
+    var canvas = document.getElementById("radarAviaoCanvas");
+    if (!canvas) return null;
+    if (canvas.width !== 520) {
+      canvas.width = 520;
+      canvas.height = 520;
+      canvas.style.maxWidth = "520px";
+      canvas.style.borderRadius = "50%";
+    }
+    return canvas;
+  }
+
+  function corHex(hex, alpha) {
+    var h = hex.replace("#", "");
+    var r = parseInt(h.substring(0, 2), 16), g = parseInt(h.substring(2, 4), 16), b = parseInt(h.substring(4, 6), 16);
+    return "rgba(" + r + "," + g + "," + b + "," + alpha + ")";
+  }
+
+  window.desenharRadarAviao = function () {
+    var canvas = ajustarTamanhoCanvas();
+    if (!canvas) return;
+    var ranking = MPL_STATE.cache.scoresDezenas;
+    var reduzido = (MPL_STATE.cache.radar && MPL_STATE.cache.radar.reduzido) || [];
+    var ctx = canvas.getContext("2d");
+
+    if (!MPL_STATE.modalidade) return;
+    if (typeof isSuperSete === "function" && isSuperSete(MPL_STATE.modalidade)) {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.fillStyle = "#8fa3c4"; ctx.font = "13px monospace"; ctx.textAlign = "center";
+      ctx.fillText("RADAR NÃO DISPONÍVEL PARA SUPER SETE", canvas.width / 2, canvas.height / 2);
+      return;
+    }
+    if (!ranking || !ranking.length) {
+      ctx.fillStyle = "rgba(5,11,15,1)";
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      ctx.fillStyle = "#8fa3c4"; ctx.font = "13px monospace"; ctx.textAlign = "center";
+      ctx.fillText("AGUARDANDO SCORES...", canvas.width / 2, canvas.height / 2);
+      return;
+    }
+
+    var cor = (typeof obterCorModalidade === "function") ? obterCorModalidade(MPL_STATE.modalidade) : { principal: "#22d3ee" };
+    var corBase = cor.principal;
+    var cx = canvas.width / 2, cy = canvas.height / 2;
+    var Rmax = cx - 40;
+    var U = MPL_STATE.modalidade.universo;
+    var idsNoRR = {}; reduzido.forEach(function (d) { idsNoRR[d.dezena] = d; });
+
+    // rastro (motion blur): pinta uma camada quase opaca por cima do frame anterior
+    ctx.fillStyle = "rgba(4,8,10,0.14)";
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    // anéis concêntricos
+    ctx.strokeStyle = corHex(corBase, 0.18);
+    ctx.lineWidth = 1;
+    for (var r = Rmax / 4; r <= Rmax; r += Rmax / 4) {
+      ctx.beginPath(); ctx.arc(cx, cy, r, 0, 2 * Math.PI); ctx.stroke();
+    }
+    // cruz de eixos
+    ctx.strokeStyle = corHex(corBase, 0.15);
+    ctx.beginPath();
+    ctx.moveTo(cx - Rmax, cy); ctx.lineTo(cx + Rmax, cy);
+    ctx.moveTo(cx, cy - Rmax); ctx.lineTo(cx, cy + Rmax);
+    ctx.stroke();
+
+    // posição fixa de cada dezena (ângulo por número, raio por STF)
+    var pontos = ranking.map(function (d) {
+      var ang = ((d.dezena - 1) / U) * 2 * Math.PI - Math.PI / 2;
+      var norm = ang < 0 ? ang + 2 * Math.PI : ang;
+      var distFrac = Math.max(0.10, Math.min(1, 1 - (d.STF / 100)));
+      var raio = distFrac * Rmax;
+      return {
+        dezena: d.dezena, classe: d.classe, ang: norm, raio: raio,
+        x: cx + Math.cos(ang) * raio, y: cy + Math.sin(ang) * raio,
+        dentro: !!idsNoRR[d.dezena]
+      };
+    });
+
+    // pontinhos-base de TODAS as dezenas (contexto constante, bem discreto)
+    pontos.forEach(function (p) {
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, p.dentro ? 2.2 : 1.4, 0, 2 * Math.PI);
+      ctx.fillStyle = p.dentro ? corHex(corBase, 0.55) : "rgba(120,130,150,.25)";
+      ctx.fill();
+    });
+
+    // varredura: só dezenas DENTRO do RR(K) viram "alvos" com target-box + rótulo
+    pontos.filter(function (p) { return p.dentro; }).forEach(function (p) {
+      if (!estadoAlvos[p.dezena]) estadoAlvos[p.dezena] = { opacity: 0 };
+      var alvo = estadoAlvos[p.dezena];
+
+      var anguloDiff = Math.abs(anguloVarredura - p.ang);
+      anguloDiff = Math.min(anguloDiff, 2 * Math.PI - anguloDiff);
+      if (anguloDiff < 0.09) alvo.opacity = 1;
+      else alvo.opacity = Math.max(0, alvo.opacity - 0.006);
+
+      if (alvo.opacity <= 0.02) return;
+
+      var corAlvo = p.classe === "A" ? "#eab308" : corBase;
+      ctx.save();
+      ctx.globalAlpha = alvo.opacity;
+      ctx.strokeStyle = corAlvo;
+      ctx.fillStyle = corAlvo;
+      ctx.lineWidth = 2;
+      ctx.shadowColor = corAlvo;
+      ctx.shadowBlur = 10 * alvo.opacity;
+
+      var box = 16;
+      ctx.strokeRect(p.x - box / 2, p.y - box / 2, box, box);
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, 2, 0, 2 * Math.PI);
+      ctx.fill();
+
+      ctx.shadowBlur = 0;
+      ctx.font = "bold 11px 'Courier New', monospace";
+      ctx.textAlign = "left";
+      ctx.textBaseline = "middle";
+      ctx.fillText(String(p.dezena).padStart(2, "0"), p.x + box / 2 + 3, p.y);
+      ctx.restore();
+    });
+
+    // feixe giratório + rastro cônico
+    ctx.save();
+    ctx.translate(cx, cy);
+    ctx.rotate(anguloVarredura);
+    ctx.strokeStyle = corHex(corBase, 0.85);
+    ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(Rmax, 0); ctx.stroke();
+    ctx.fillStyle = corHex(corBase, 0.06);
+    ctx.beginPath();
+    ctx.moveTo(0, 0);
+    ctx.arc(0, 0, Rmax, 0, -0.4, true);
+    ctx.closePath();
+    ctx.fill();
+    ctx.restore();
+
+    // HUD textual (estilo caça)
+    ctx.font = "11px 'Courier New', monospace";
+    ctx.fillStyle = corHex(corBase, 0.9);
+    ctx.shadowColor = corBase; ctx.shadowBlur = 4;
+    ctx.textAlign = "left"; ctx.textBaseline = "alphabetic";
+    ctx.fillText("SYS: RR(K) ONLINE", 14, 20);
+    ctx.fillText("TARGETS: " + reduzido.length + "/" + U, 14, 34);
+    ctx.textAlign = "right";
+    ctx.fillText("MPL RADAR", canvas.width - 14, 20);
+    ctx.fillText(MPL_STATE.modalidade.sigla || "", canvas.width - 14, 34);
+    ctx.shadowBlur = 0;
+
+    anguloVarredura += ANGULO_VARREDURA_VELOCIDADE;
+    if (anguloVarredura > 2 * Math.PI) anguloVarredura -= 2 * Math.PI;
+  };
+
+  // container com brilho/borda na cor da modalidade (visual do radar-teste.html)
+  function estilizarContainer() {
+    var canvas = document.getElementById("radarAviaoCanvas");
+    if (!canvas) return;
+    var cor = (MPL_STATE.modalidade && typeof obterCorModalidade === "function") ? obterCorModalidade(MPL_STATE.modalidade) : { principal: "#22d3ee" };
+    canvas.style.border = "3px solid " + cor.principal;
+    canvas.style.boxShadow = "0 0 25px " + corHex(cor.principal, 0.35) + ", inset 0 0 30px " + corHex(cor.principal, 0.12);
+    canvas.style.background = "radial-gradient(circle, " + corHex(cor.principal, 0.06) + " 0%, rgba(3,5,10,1) 100%)";
+  }
+
+  var jaAgendado = false;
+  document.addEventListener("DOMContentLoaded", function () {
+    setTimeout(function () {
+      estilizarContainer();
+      if (!jaAgendado) { jaAgendado = true; }
+    }, 500);
+  });
+
+  // reaplica o estilo do container sempre que o STF for recalculado / modalidade trocar
+  var __origRenderRadarFormAV = renderRadarForm;
+  renderRadarForm = function () {
+    var r = __origRenderRadarFormAV();
+    setTimeout(estilizarContainer, 20);
+    return r;
+  };
+})();

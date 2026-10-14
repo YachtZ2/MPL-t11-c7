@@ -1,0 +1,576 @@
+/* ============================================================
+   MPL — mpl-api.js
+   Camada de Adaptadores de API Pública (Caixa) — Seção 8 do Prompt Master
+   Endpoint oficial: https://servicebus2.caixa.gov.br/portaldeloterias/api/{modalidade}/{numero}
+   v1.1 — CORREÇÃO Super Sete: preserva a ORDEM das dezenas por coluna
+          (modalidade posicional). Demais modalidades continuam ordenadas.
+   ============================================================ */
+const MPL_API_DEFAULT_BASEURL = "https://servicebus2.caixa.gov.br/portaldeloterias/api/";
+
+/* Mapa: chave interna do preset -> nome do endpoint na API da Caixa.
+   Modalidades especiais reutilizam o motor da modalidade principal (Volume 0). */
+const MAPA_API_CAIXA = {
+  megaSena: "megasena",
+  lotofacil: "lotofacil",
+  quina: "quina",
+  lotomania: "lotomania",
+  timemania: "timemania",
+  duplaSena: "duplasena",
+  diaDeSorte: "diadesorte",
+  superSete: "supersete",
+  maisMilionaria: "maismilionaria",
+  lotofacilIndependencia: "lotofacil",
+  megaDaVirada: "megasena",
+  quinaSaoJoao: "quina"
+};
+
+/* Modalidades POSICIONAIS: a ordem das dezenas é significativa (cada valor = uma coluna).
+   NÃO devem ser ordenadas na importação. */
+const MODALIDADES_POSICIONAIS_API = new Set(["superSete"]);
+
+function getApiBaseUrl() {
+  return localStorage.getItem("mplApiBaseUrl") || MPL_API_DEFAULT_BASEURL;
+}
+function setApiBaseUrl(url) {
+  localStorage.setItem("mplApiBaseUrl", url || MPL_API_DEFAULT_BASEURL);
+}
+
+/* Fetch com timeout + cache simples em localStorage (fallback de robustez) */
+async function caixaFetch(path, timeoutMs = 12000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const resp = await fetch(getApiBaseUrl() + path, {
+      signal: controller.signal,
+      headers: { "Accept": "application/json" }
+    });
+    clearTimeout(timer);
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const json = await resp.json();
+    try { localStorage.setItem("mplApiCache_" + path, JSON.stringify({ json, quando: Date.now() })); } catch (e) {}
+    return json;
+  } catch (e) {
+    clearTimeout(timer);
+    const cache = localStorage.getItem("mplApiCache_" + path);
+    if (cache) { console.warn("Usando cache local por falha de rede:", e.message); return JSON.parse(cache).json; }
+    throw e;
+  }
+}
+async function caixaFetchComRetry(path, tentativas = 2) {
+  let ultimoErro;
+  for (let i = 0; i <= tentativas; i++) {
+    try { return await caixaFetch(path); }
+    catch (e) { ultimoErro = e; await new Promise(r => setTimeout(r, 500 * (i + 1))); }
+  }
+  throw ultimoErro;
+}
+
+/* normalizeResponse — adapta o JSON da Caixa para o formato interno do MPL.
+   manterOrdem=true  -> preserva a ordem das dezenas (Super Sete: ordem = coluna).
+   manterOrdem=false -> ordena crescente (comportamento padrão das demais). */
+function normalizeCaixaResponse(json, manterOrdem = false) {
+  const dezenasRaw = json.listaDezenas || json.dezenasSorteadasOrdemSorteio || json.dezenas || [];
+  let dezenas = dezenasRaw.map(Number).filter(n => !isNaN(n));
+  if (!manterOrdem) dezenas = dezenas.sort((a, b) => a - b);
+  let campoExtra = null;
+  if (json.nomeTimeCoracaoMesSorte) campoExtra = json.nomeTimeCoracaoMesSorte;
+  if (json.timeCoracaoMesSorte) campoExtra = json.timeCoracaoMesSorte;
+  if (json.trevosSorteados?.length) campoExtra = json.trevosSorteados.join(" ");
+  if (json.mesSorte) campoExtra = json.mesSorte;
+  return {
+    numero: json.numero,
+    data: json.dataApuracao || json.dataProximoConcurso || null,
+    dezenas,
+    campoExtra,
+    fonte: "Caixa Econômica Federal (servicebus2)",
+    acumulado: json.acumulado ?? null,
+    valorEstimadoProximoConcurso: json.valorEstimadoProximoConcurso ?? null,
+    bruto: json
+  };
+}
+
+/* validateResponse */
+function validarRespostaCaixa(concurso, modalidade) {
+  if (!concurso || !concurso.numero || !concurso.dezenas?.length) {
+    return { valido: false, motivo: "Resposta vazia ou incompleta da API." };
+  }
+  if (modalidade && !modalidade.possuiSorteioMultiplo && concurso.dezenas.length !== modalidade.dezenasSorteadas) {
+    return { valido: false, motivo: `Quantidade de dezenas divergente (API=${concurso.dezenas.length}, esperado=${modalidade.dezenasSorteadas}).` };
+  }
+  return { valido: true };
+}
+
+/* getLatestDraw */
+async function getUltimoConcursoAPI(modalidadeKey) {
+  const path = MAPA_API_CAIXA[modalidadeKey];
+  if (!path) throw new Error("Esta modalidade ainda não possui adaptador de API configurado.");
+  const json = await caixaFetchComRetry(path);
+  return normalizeCaixaResponse(json, MODALIDADES_POSICIONAIS_API.has(modalidadeKey));
+}
+
+/* getDrawByNumber */
+async function getConcursoPorNumeroAPI(modalidadeKey, numero) {
+  const path = MAPA_API_CAIXA[modalidadeKey];
+  if (!path) throw new Error("Esta modalidade ainda não possui adaptador de API configurado.");
+  const json = await caixaFetchComRetry(`${path}/${numero}`);
+  return normalizeCaixaResponse(json, MODALIDADES_POSICIONAIS_API.has(modalidadeKey));
+}
+
+/* getDrawRange + AIB — Atualização Incremental via API.
+   Regra: nunca sobrescreve concurso divergente automaticamente; reporta conflito.
+   Super Sete: comparação de conflito também respeita a ORDEM (posicional). */
+async function atualizarBasePorAPI(modalidadeKey, baseAtual, modalidade, onProgress) {
+  const ultimo = await getUltimoConcursoAPI(modalidadeKey);
+  const vUltimo = validarRespostaCaixa(ultimo, modalidade);
+  if (!vUltimo.valido) throw new Error(vUltimo.motivo);
+  const ultimoLocal = baseAtual.length ? Math.max(...baseAtual.map(c => c.numero)) : 0;
+  const novos = [], conflitos = [], falhas = [];
+  if (ultimo.numero <= ultimoLocal) {
+    return { novos, conflitos, falhas, ultimoAPI: ultimo.numero, ultimoLocal, mensagem: "A base local já está atualizada com a API." };
+  }
+  for (let n = ultimoLocal + 1; n <= ultimo.numero; n++) {
+    try {
+      const c = (n === ultimo.numero) ? ultimo : await getConcursoPorNumeroAPI(modalidadeKey, n);
+      const v = validarRespostaCaixa(c, modalidade);
+      if (!v.valido) { falhas.push({ numero: n, motivo: v.motivo }); continue; }
+      const existente = baseAtual.find(x => x.numero === n);
+      if (existente) {
+        // Comparação sensível à ordem (posicional) — JSON.stringify já preserva a ordem.
+        const igual = JSON.stringify(existente.dezenas) === JSON.stringify(c.dezenas);
+        if (!igual) conflitos.push({ numero: n, local: existente.dezenas, api: c.dezenas });
+      } else {
+        novos.push({ numero: c.numero, data: c.data, dezenas: c.dezenas, campoExtra: c.campoExtra });
+      }
+      if (onProgress) onProgress(n, ultimo.numero);
+    } catch (e) {
+      falhas.push({ numero: n, motivo: e.message });
+    }
+  }
+  return { novos, conflitos, falhas, ultimoAPI: ultimo.numero, ultimoLocal };
+}
+
+/* Registro de metadados de sincronização (localStorage — preferências leves) */
+function salvarStatusSincronizacao(modalidadeKey, info) {
+  localStorage.setItem("mplApiSync_" + modalidadeKey, JSON.stringify({ ...info, quando: new Date().toISOString() }));
+}
+function lerStatusSincronizacao(modalidadeKey) {
+  const raw = localStorage.getItem("mplApiSync_" + modalidadeKey);
+  return raw ? JSON.parse(raw) : null;
+}
+/* ============================================================
+   #pessoal
+   MPL — PATCH D (Dupla Sena) — 2º SORTEIO VIA API
+   COLE ESTE BLOCO NO FINAL DE js/mpl-api.js — não apaga nada.
+   A API da Caixa (servicebus2) retorna o 2º sorteio da Dupla Sena
+   no campo "listaDezenasSegundoSorteio" (mesmo padrão observado em
+   integrações públicas de terceiros para essa modalidade).
+   ============================================================ */
+(function () {
+  "use strict";
+
+  var __origNormalizeCaixaResponse = normalizeCaixaResponse;
+  normalizeCaixaResponse = function (json, manterOrdem) {
+    var base = __origNormalizeCaixaResponse(json, manterOrdem);
+    var segundoRaw = json.listaDezenasSegundoSorteio || json.dezenasSorteadasOrdemSorteio2 || null;
+    if (segundoRaw && segundoRaw.length) {
+      base.dezenas2 = segundoRaw.map(Number).filter(function (n) { return !isNaN(n); }).sort(function (a, b) { return a - b; });
+    }
+    return base;
+  };
+
+  /* validateResponse — Dupla Sena exige também o 2º sorteio para ser
+     considerada 100% válida (mas não descarta o registro: quem decide
+     é a validarBase, que já emite aviso de "pendente" em vez de erro). */
+  var __origValidarRespostaCaixa = validarRespostaCaixa;
+  validarRespostaCaixa = function (concurso, modalidade) {
+    var r = __origValidarRespostaCaixa(concurso, modalidade);
+    if (r.valido && modalidade && modalidade.presetKey === "duplaSena") {
+      if (!concurso.dezenas2 || concurso.dezenas2.length !== modalidade.dezenasSorteadas) {
+        r.avisoSegundoSorteio = "2º sorteio ausente ou incompleto na resposta da API para o concurso " + concurso.numero + ".";
+      }
+    }
+    return r;
+  };
+
+  /* AIB via API — garante que dezenas2 seja propagado para o objeto
+     final salvo na base (o fluxo original só copiava numero/data/dezenas/campoExtra). */
+  var __origAtualizarBasePorAPI = atualizarBasePorAPI;
+  atualizarBasePorAPI = async function (modalidadeKey, baseAtual, modalidade, onProgress) {
+    var r = await __origAtualizarBasePorAPI(modalidadeKey, baseAtual, modalidade, onProgress);
+    if (modalidade && modalidade.presetKey === "duplaSena" && r.novos && r.novos.length) {
+      // Os itens de r.novos já vieram só com campos básicos; buscamos de novo
+      // o concurso completo para recuperar dezenas2 (o objeto "ultimo"/"c" original
+      // já tinha essa info, mas o mapeamento anterior descartou). Reconsulta é
+      // barata pois já está em cache local (caixaFetch cacheia por path).
+      for (var i = 0; i < r.novos.length; i++) {
+        try {
+          var completo = await getConcursoPorNumeroAPI(modalidadeKey, r.novos[i].numero);
+          if (completo.dezenas2) r.novos[i].dezenas2 = completo.dezenas2;
+        } catch (e) { /* silencioso: fica pendente, VBE avisa */ }
+      }
+    }
+    return r;
+  };
+})();
+/* ============================================================
+   #pessoal
+   MPL — PATCH FINAL — API consolidada (substitui Patches M, P e R)
+   COLE ESTE BLOCO NO FINAL DE js/mpl-api.js.
+   IMPORTANTE: antes de colar, REMOVA do arquivo os blocos antigos
+   dos Patches M, P e R (procure os comentários "PATCH M", "PATCH P"
+   e "PATCH R" e apague o trecho inteiro de cada um). Eles ficaram
+   se embrulhando uns nos outros e um fallback quebrado (fonte do
+   GitHub, nunca confirmada) pode estar travando a cadeia antes do
+   proxy do FORTUNA ter chance de terminar. Mantenha o PATCH D
+   (Dupla Sena), que não tem relação com este problema.
+
+   Esta versão tem logs em CADA etapa (não só nas falhas), para a
+   gente ver exatamente onde para, caso ainda não funcione.
+   ============================================================ */
+(function () {
+  "use strict";
+
+  var PROXIES_CAIXA = [
+    { nome: "direto (sem proxy)", fn: function (url) { return url; } },
+    { nome: "corsproxy.io", fn: function (url) { return "https://corsproxy.io/?" + encodeURIComponent(url); } },
+    { nome: "allorigins.win", fn: function (url) { return "https://api.allorigins.win/raw?url=" + encodeURIComponent(url); } },
+    { nome: "thingproxy", fn: function (url) { return "https://thingproxy.freeboard.io/fetch/" + url; } }
+  ];
+
+  caixaFetch = async function (path, timeoutMs) {
+    var urlBase = getApiBaseUrl() + path;
+    console.log("MPL API: iniciando busca de \"" + path + "\"...");
+
+    for (var i = 0; i < PROXIES_CAIXA.length; i++) {
+      var tentativa = PROXIES_CAIXA[i];
+      try {
+        console.log("MPL API: tentando via " + tentativa.nome + "...");
+        var proxyUrl = tentativa.fn(urlBase);
+        var controller = new AbortController();
+        var timer = setTimeout(function () { controller.abort(); }, timeoutMs || 12000);
+        var resp = await fetch(proxyUrl, { signal: controller.signal, headers: { Accept: "application/json" }, cache: "no-store" });
+        clearTimeout(timer);
+        if (!resp.ok) throw new Error("HTTP " + resp.status);
+
+        var texto = await resp.text();
+        var json = JSON.parse(texto);
+        if (json && typeof json.contents === "string") json = JSON.parse(json.contents);
+
+        console.log("MPL API: ✓ SUCESSO via " + tentativa.nome + ". Concurso recebido: " + (json.numero || json.concurso || "?"));
+        try { localStorage.setItem("mplApiCache_" + path, JSON.stringify({ json: json, quando: Date.now() })); } catch (e2) {}
+        return json;
+      } catch (e) {
+        console.warn("MPL API: ✗ " + tentativa.nome + " falhou — " + e.message);
+      }
+    }
+
+    console.error("MPL API: todos os 4 métodos falharam para \"" + path + "\".");
+    var cache = localStorage.getItem("mplApiCache_" + path);
+    if (cache) {
+      console.warn("MPL API: usando cache local salvo anteriormente (pode estar desatualizado).");
+      return JSON.parse(cache).json;
+    }
+    throw new Error("Não foi possível obter dados da API (todos os proxies falharam e não há cache local).");
+  };
+
+  /* Mantém simples: sem fallback extra para fontes de terceiros não
+     verificadas. Se a busca falhar de verdade, o erro sobe visível
+     até a tela (mensagem "Falha ao consultar a API"), em vez de ser
+     mascarado por mais uma camada de tentativa desconhecida. */
+  getUltimoConcursoAPI = async function (modalidadeKey) {
+    var path = MAPA_API_CAIXA[modalidadeKey];
+    if (!path) throw new Error("Esta modalidade ainda não possui adaptador de API configurado.");
+    var json = await caixaFetch(path);
+    return normalizeCaixaResponse(json, (typeof MODALIDADES_POSICIONAIS_API !== "undefined") && MODALIDADES_POSICIONAIS_API.has(modalidadeKey));
+  };
+
+  getConcursoPorNumeroAPI = async function (modalidadeKey, numero) {
+    var path = MAPA_API_CAIXA[modalidadeKey];
+    if (!path) throw new Error("Esta modalidade ainda não possui adaptador de API configurado.");
+    var json = await caixaFetch(path + "/" + numero);
+    return normalizeCaixaResponse(json, (typeof MODALIDADES_POSICIONAIS_API !== "undefined") && MODALIDADES_POSICIONAIS_API.has(modalidadeKey));
+  };
+
+  /* Também instrumenta o fluxo de atualização incremental, para
+     vermos no console cada decisão tomada (quantos concursos novos,
+     por que parou, etc.) */
+  var __origAtualizarBasePorAPI_FINAL = atualizarBasePorAPI;
+  atualizarBasePorAPI = async function (modalidadeKey, baseAtual, modalidade, onProgress) {
+    console.log("MPL API: verificando atualização para \"" + modalidadeKey + "\". Último concurso local: " +
+      (baseAtual.length ? Math.max.apply(null, baseAtual.map(function (c) { return c.numero; })) : "nenhum"));
+    var r = await __origAtualizarBasePorAPI_FINAL(modalidadeKey, baseAtual, modalidade, onProgress);
+    console.log("MPL API: resultado da atualização —", r);
+    return r;
+  };
+})();
+/* ============================================================
+   #pessoal
+   MPL — FASE 9.1 — CORREÇÃO: busca dupla na API + base não salva
+   COLE NO FINAL DE js/mpl-api.js (depois de todos os outros patches).
+
+   Causa: PATCH D (Dupla Sena) e Fase 8 (premiações) reconsultavam
+   CADA concurso novo para recuperar dezenas2/premiacoes. Como o
+   caixaFetch passou a usar cache:"no-store" + cadeia de proxies,
+   essa "reconsulta barata" virou uma segunda ida real à rede — e
+   se um proxy travasse, o await nunca resolvia e o salvamento da
+   base nunca acontecia.
+
+   Solução: buscar UMA vez só, já aproveitando o objeto completo
+   devolvido por normalizeCaixaResponse (que desde a Fase 8 já traz
+   dezenas2 E premiacoes juntos). Zero reconsulta.
+   ============================================================ */
+(function () {
+  "use strict";
+
+  atualizarBasePorAPI = async function (modalidadeKey, baseAtual, modalidade, onProgress) {
+    console.log("MPL API (9.1): iniciando atualização de \"" + modalidadeKey + "\" — busca única por concurso.");
+
+    var ultimo = await getUltimoConcursoAPI(modalidadeKey);
+    var v = validarRespostaCaixa(ultimo, modalidade);
+    if (!v.valido) throw new Error(v.motivo);
+
+    var ultimoLocal = baseAtual.length ? Math.max.apply(null, baseAtual.map(function (c) { return c.numero; })) : 0;
+    var novos = [], conflitos = [], falhas = [];
+
+    if (ultimo.numero <= ultimoLocal) {
+      return { novos: novos, conflitos: conflitos, falhas: falhas,
+        ultimoAPI: ultimo.numero, ultimoLocal: ultimoLocal,
+        mensagem: "A base local já está atualizada com a API." };
+    }
+
+    for (var n = ultimoLocal + 1; n <= ultimo.numero; n++) {
+      try {
+        var c = (n === ultimo.numero) ? ultimo : await getConcursoPorNumeroAPI(modalidadeKey, n);
+        var vc = validarRespostaCaixa(c, modalidade);
+        if (!vc.valido) { falhas.push({ numero: n, motivo: vc.motivo }); continue; }
+
+        var existente = baseAtual.find(function (x) { return x.numero === n; });
+        if (existente) {
+          if (JSON.stringify(existente.dezenas) !== JSON.stringify(c.dezenas)) {
+            conflitos.push({ numero: n, local: existente.dezenas, api: c.dezenas });
+          }
+        } else {
+          /* Copia TUDO de uma vez — sem reconsultar depois */
+          var reg = { numero: c.numero, data: c.data, dezenas: c.dezenas, campoExtra: c.campoExtra };
+          if (c.dezenas2) reg.dezenas2 = c.dezenas2;
+          if (c.premiacoes) reg.premiacoes = c.premiacoes;
+          if (c.acumulado !== undefined) reg.acumulado = c.acumulado;
+          if (c.valorAcumuladoProximo) reg.valorAcumuladoProximo = c.valorAcumuladoProximo;
+          if (c.valorArrecadado) reg.valorArrecadado = c.valorArrecadado;
+          novos.push(reg);
+        }
+        if (onProgress) onProgress(n, ultimo.numero);
+      } catch (e) {
+        falhas.push({ numero: n, motivo: e.message });
+        console.warn("MPL API (9.1): concurso " + n + " falhou — " + e.message);
+      }
+    }
+
+    console.log("MPL API (9.1): concluído — " + novos.length + " novo(s), " +
+      conflitos.length + " conflito(s), " + falhas.length + " falha(s).");
+    return { novos: novos, conflitos: conflitos, falhas: falhas,
+      ultimoAPI: ultimo.numero, ultimoLocal: ultimoLocal };
+  };
+})();
+/* ============================================================
+   #pessoal
+   MPL — FASE 9.2 — Trava de execução única + rastreio da origem
+   COLE NO FINAL DE js/mpl-api.js.
+   Impede que a sincronização rode duas vezes em paralelo e mostra
+   no console QUEM disparou cada chamada (para identificarmos a
+   origem da segunda execução, se ela ainda existir).
+   ============================================================ */
+(function () {
+  "use strict";
+  var __emExecucao = false;
+  var __orig = atualizarBasePorAPI;
+
+  atualizarBasePorAPI = async function (modalidadeKey, baseAtual, modalidade, onProgress) {
+    if (__emExecucao) {
+      console.warn("MPL 9.2: ⛔ SEGUNDA chamada bloqueada (já havia uma sincronização em andamento).");
+      console.trace("MPL 9.2: origem da chamada bloqueada ↑");
+      return { novos: [], conflitos: [], falhas: [],
+        ultimoAPI: 0, ultimoLocal: 0, mensagem: "Sincronização já em andamento — chamada duplicada ignorada." };
+    }
+    __emExecucao = true;
+    console.log("MPL 9.2: ▶ INÍCIO da sincronização.");
+    console.trace("MPL 9.2: origem desta chamada ↑");
+    try {
+      return await __orig(modalidadeKey, baseAtual, modalidade, onProgress);
+    } finally {
+      __emExecucao = false;
+      console.log("MPL 9.2: ■ FIM da sincronização.");
+    }
+  };
+})();
+/* ============================================================
+   #pessoal
+   MPL — API 9.10 — Fim do cache redundante de API
+   COLE NO FINAL DE js/mpl-api.js.
+
+   Causa: cada concurso consultado gravava o JSON bruto da Caixa
+   em localStorage (mplApiCache_*). Com milhares de concursos,
+   ocupou 98,6% do limite (~5 MB) e impediu presets/projeções.
+
+   Esse cache é redundante: a base completa já fica no IndexedDB.
+
+   Solução: bloqueia a gravação de chaves mplApiCache_* na origem
+   (independe de qual versão do caixaFetch está ativa) e remove
+   as entradas antigas uma única vez.
+
+   Efeito colateral aceito: se a API da Caixa estiver fora do ar,
+   a sincronização mostra erro em vez de servir cópia antiga.
+   A base, presets, projeções e preferências NÃO são afetados.
+   ============================================================ */
+(function () {
+  "use strict";
+  var PREFIXO = "mplApiCache_";
+
+  /* 1) bloqueia novas gravações do cache */
+  var __setItem = Storage.prototype.setItem;
+  Storage.prototype.setItem = function (chave, valor) {
+    if (this === window.localStorage && String(chave).indexOf(PREFIXO) === 0) return;
+    return __setItem.apply(this, arguments);
+  };
+
+  /* 2) remove o cache antigo, uma única vez */
+  var removidos = 0, liberado = 0;
+  Object.keys(localStorage).forEach(function (k) {
+    if (k.indexOf(PREFIXO) === 0) {
+      liberado += (localStorage.getItem(k) || "").length;
+      localStorage.removeItem(k);
+      removidos++;
+    }
+  });
+
+  if (removidos) {
+    console.log("MPL API 9.10: " + removidos + " entrada(s) de cache removida(s) — " +
+      (liberado / 1024).toFixed(1) + " KB liberados.");
+  }
+  console.log("MPL API 9.10: cache redundante de API desativado (base segue no IndexedDB).");
+})();
+/* ============================================================
+   #pessoal
+   MPL — API 9.12 — Espelho alternativo + disjuntor (circuit breaker)
+   COLE NO FINAL DE js/mpl-api.js.
+
+   1) Se a API oficial da Caixa falhar (todos os proxies), tenta o
+      espelho loteriascaixa-api.herokuapp.com e TRADUZ o JSON para o
+      formato da Caixa — o restante do MPL não precisa mudar.
+   2) Disjuntor: depois de uma falha da Caixa, vai direto ao espelho
+      por 10 minutos (evita 4 proxies × retries × timeouts por
+      concurso, que travava o navegador).
+
+   ⚠ O espelho NÃO é oficial. Cada concurso obtido por ele é
+   marcado com fonte = "espelho" para rastreabilidade.
+   ============================================================ */
+(function () {
+  "use strict";
+
+  var ESPELHO = "https://loteriascaixa-api.herokuapp.com/api/";
+  var PAUSA_MS = 10 * 60 * 1000;
+  var caixaFalhouEm = 0;
+
+  /* "megasena" -> "megasena/latest" · "megasena/3065" -> "megasena/3065" */
+  function rotaEspelho(path) {
+    var p = String(path).replace(/^\/+|\/+$/g, "").split("/");
+    return ESPELHO + p[0] + "/" + (p[1] ? p[1] : "latest");
+  }
+
+  function num(v) { return Number(String(v).replace(/\./g, "").replace(",", ".")) || 0; }
+
+  /* traduz o JSON do espelho para o formato da API da Caixa */
+  function traduzir(j, path) {
+    var mod = String(path).split("/")[0];
+    var dz = (j.dezenas || j.dezenasOrdemSorteio || []).map(Number);
+    var dz2 = null;
+
+    /* Dupla Sena: o espelho pode trazer 12 números juntos */
+    if (mod === "duplasena" && dz.length === 12) { dz2 = dz.slice(6); dz = dz.slice(0, 6); }
+
+    var rateio = (j.premiacoes || []).map(function (p) {
+      return {
+        descricaoFaixa: p.descricao || p.faixaDescricao || "",
+        faixa: p.faixa,
+        numeroDeGanhadores: num(p.ganhadores),
+        valorPremio: num(p.valorPremio)
+      };
+    });
+
+    return {
+      numero: Number(j.concurso),
+      dataApuracao: j.data,
+      listaDezenas: dz.map(function (d) { return String(d).padStart(2, "0"); }),
+      dezenasSorteadasOrdemSorteio: (j.dezenasOrdemSorteio || []).map(String),
+      listaDezenasSegundoSorteio: dz2 ? dz2.map(function (d) { return String(d).padStart(2, "0"); }) : null,
+      trevosSorteados: j.trevos || null,
+      nomeTimeCoracaoMesSorte: j.timeCoracao || j.mesSorte || null,
+      acumulado: !!j.acumulou,
+      listaRateioPremio: rateio,
+      valorEstimadoProximoConcurso: num(j.valorEstimadoProximoConcurso),
+      valorAcumuladoProximoConcurso: num(j.valorAcumuladoProximoConcurso),
+      __fonte: "espelho:loteriascaixa-api"
+    };
+  }
+
+  async function buscarEspelho(path) {
+    var url = rotaEspelho(path);
+    var ctrl = new AbortController();
+    var t = setTimeout(function () { ctrl.abort(); }, 15000);
+    try {
+      var r = await fetch(url, { signal: ctrl.signal, cache: "no-store" });
+      clearTimeout(t);
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      var j = await r.json();
+      if (!j || j.concurso == null) throw new Error("resposta vazia");
+      console.log("MPL API 9.12: ✓ espelho → " + url);
+      return traduzir(j, path);
+    } catch (e) {
+      clearTimeout(t);
+      throw new Error("espelho falhou (" + e.message + ")");
+    }
+  }
+
+  var __origFetch = caixaFetch;
+  caixaFetch = async function (path, timeoutMs) {
+    /* disjuntor aberto: vai direto ao espelho */
+    if (Date.now() - caixaFalhouEm < PAUSA_MS) {
+      try { return await buscarEspelho(path); }
+      catch (e) { caixaFalhouEm = 0; /* espelho também caiu: reabre e tenta a Caixa */ }
+    }
+    try {
+      return await __origFetch(path, timeoutMs);
+    } catch (eCaixa) {
+      caixaFalhouEm = Date.now();
+      console.warn("MPL API 9.12: Caixa indisponível — usando espelho por 10 min.");
+      try { return await buscarEspelho(path); }
+      catch (eEsp) {
+        throw new Error("Caixa e espelho indisponíveis. " + eEsp.message +
+          ". Tente mais tarde ou use a importação manual (aba Base).");
+      }
+    }
+  };
+
+  /* reduz retries: com espelho disponível, insistir na Caixa só trava */
+  if (typeof caixaFetchComRetry === "function") {
+    caixaFetchComRetry = async function (path) { return caixaFetch(path); };
+  }
+
+  /* marca a fonte no concurso normalizado */
+  if (typeof normalizeCaixaResponse === "function") {
+    var __origNorm = normalizeCaixaResponse;
+    normalizeCaixaResponse = function (json, manterOrdem) {
+      var c = __origNorm(json, manterOrdem);
+      if (json && json.__fonte) c.fonte = json.__fonte;
+      return c;
+    };
+  }
+
+  window.mplApiStatus = function () {
+    var ab = Date.now() - caixaFalhouEm < PAUSA_MS;
+    return ab ? "Usando ESPELHO (Caixa falhou há " + Math.round((Date.now() - caixaFalhouEm) / 60000) + " min)"
+              : "Usando API OFICIAL da Caixa";
+  };
+
+  console.log("MPL API 9.12: espelho alternativo + disjuntor ativos.");
+})();

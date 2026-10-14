@@ -1,0 +1,72 @@
+/* ============================================================
+   MPL — mpl-ranking-podio.js  (arquivo NOVO)
+   ADICIONE no index.html, depois de js/mpl-ui.js:
+     <script src="js/mpl-ranking-podio.js"></script>
+
+   Melhoria de experiência na aba Ranking de Jogos: destaque visual
+   tipo "pódio" para os 3 melhores jogos por STJ (ouro/prata/bronze),
+   acima da tabela completa que já existia (mantida intacta, com
+   ordenação e filtros de score já funcionando como antes).
+   ============================================================ */
+(function () {
+  "use strict";
+
+  var MEDALHAS = [
+    { emoji: "🥇", cor: "#eab308", label: "1º LUGAR" },
+    { emoji: "🥈", cor: "#c0c0c0", label: "2º LUGAR" },
+    { emoji: "🥉", cor: "#cd7f32", label: "3º LUGAR" }
+  ];
+
+  function montarPodio() {
+    var filtrosCard = document.getElementById("rankingJogosFiltros");
+    if (!filtrosCard || document.getElementById("rankingPodioCard")) return;
+    var card = document.createElement("div");
+    card.className = "card";
+    card.id = "rankingPodioCard";
+    card.innerHTML = '<h3>🏆 Pódio — Top 3 por STJ</h3><div id="rankingPodioGrid" class="grid-cards"></div>';
+    filtrosCard.parentNode.insertBefore(card, filtrosCard);
+  }
+
+  function renderizarPodio() {
+    var grid = document.getElementById("rankingPodioGrid");
+    if (!grid) return;
+    var lista = (MPL_STATE.cache.rankingExibicao && MPL_STATE.cache.rankingExibicao.length)
+      ? MPL_STATE.cache.rankingExibicao : MPL_STATE.cache.ranking;
+    if (!lista || !lista.length) { grid.innerHTML = '<p class="muted">Ranqueie os jogos para ver o pódio aqui.</p>'; return; }
+
+    var top3 = lista.slice(0, 3);
+    grid.innerHTML = top3.map(function (r, i) {
+      var m = MEDALHAS[i];
+      return '<div class="stat-card" style="border-top:3px solid ' + m.cor + ';text-align:center;">' +
+        '<div style="font-size:24px;">' + m.emoji + '</div>' +
+        '<div style="font-size:10px;color:' + m.cor + ';font-weight:700;letter-spacing:1px;">' + m.label + '</div>' +
+        '<div style="font-size:15px;font-weight:700;margin-top:6px;letter-spacing:1px;">' +
+        r.jogo.map(function (d) { return String(d).padStart(2, "0"); }).join(" ") + '</div>' +
+        '<div style="font-size:11px;color:#8fa3c4;margin-top:4px;">STJ: <b style="color:#e6edf7;">' + r.stj.toFixed(1) + '</b> · Classe ' + r.classeSTJ + '</div>' +
+        '</div>';
+    }).join("");
+  }
+
+  function religarBotaoRanking() {
+    var btn = document.getElementById("btnRankearJogos");
+    if (!btn || btn.__podioLigado) return;
+    btn.__podioLigado = true;
+    btn.addEventListener("click", function () { setTimeout(renderizarPodio, 60); });
+  }
+
+  var tentativas = 0;
+  var vigia = setInterval(function () {
+    tentativas++;
+    montarPodio();
+    religarBotaoRanking();
+    renderizarPodio();
+    if (tentativas > 40) clearInterval(vigia);
+  }, 200);
+
+  // atualiza também quando os filtros de score (min/max) ou a ordenação forem aplicados
+  document.addEventListener("click", function (e) {
+    if (e.target && (e.target.id === "btnFiltrarRankingJogos" || e.target.id === "btnLimparFiltroRankingJogos" || e.target.id === "btnRecalcularSTJ")) {
+      setTimeout(renderizarPodio, 80);
+    }
+  });
+})();

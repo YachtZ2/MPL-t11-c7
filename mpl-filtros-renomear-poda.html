@@ -1,0 +1,30 @@
+/* ============================================================
+   MPL — mpl-filtros-renomear-poda.js  (arquivo NOVO)
+   ADICIONE no index.html, depois de js/mpl-ui.js:
+     <script src="js/mpl-filtros-renomear-poda.js"></script>
+
+   Renomeia a aba/título "Filtros" para "Poda & Polimento" — nome
+   mais evocativo do que a etapa realmente faz (reduzir e lapidar
+   os jogos candidatos, como no Volume 2). Não altera nenhuma
+   função interna, só rótulos visíveis.
+   ============================================================ */
+(function () {
+  "use strict";
+
+  function renomear() {
+    var btn = document.querySelector('.tab-btn[data-tab="filtros"]');
+    if (btn && btn.textContent.indexOf("Poda") === -1) btn.textContent = "Poda & Polimento";
+    var painel = document.getElementById("tab-filtros");
+    if (painel) {
+      var h2 = painel.querySelector("h2");
+      if (h2 && h2.textContent.indexOf("Poda") === -1) h2.textContent = "Poda & Polimento dos Jogos";
+    }
+  }
+
+  var tentativas = 0;
+  var vigia = setInterval(function () {
+    tentativas++;
+    renomear();
+    if (tentativas > 30) clearInterval(vigia);
+  }, 150);
+})();

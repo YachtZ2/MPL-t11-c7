@@ -1,0 +1,270 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>MPL — Método Parametrizável das Loterias</title>
+<link rel="stylesheet" href="css/styles.css" />
+</head>
+<body>
+
+<header class="mpl-header">
+  <div class="mpl-brand">
+    <span class="mpl-logo">MPL</span>
+    <span class="mpl-subtitle">Método Parametrizável das Loterias</span>
+  </div>
+  <div class="mpl-scope-badge" id="scopeBadge">Nenhuma modalidade ativa</div>
+</header>
+
+<div class="mpl-disclaimer">
+  "A análise histórica não elimina a aleatoriedade; ela organiza decisões, reduz universos e permite validação objetiva."
+</div>
+
+<nav class="mpl-tabs" id="mplTabs">
+  <button data-tab="dashboard" class="tab-btn active">Dashboard</button>
+  <button data-tab="modalidade" class="tab-btn">Modalidade</button>
+  <button data-tab="base" class="tab-btn">Base &amp; Storage</button>
+  <button data-tab="api" class="tab-btn">API e Atualizações</button>
+  <button data-tab="escopo" class="tab-btn">Escopo de Análise</button>
+  <button data-tab="caixa" class="tab-btn">Caixa / RECH / JMCT</button>
+  <button data-tab="scores" class="tab-btn">Scores das Dezenas</button>
+  <button data-tab="teia" class="tab-btn">Teia de Relações</button>
+  <button data-tab="pesos" class="tab-btn">Módulos &amp; Pesos</button>
+  <button data-tab="radar" class="tab-btn">Radar Reduzido</button>
+  <button data-tab="gerador" class="tab-btn">Gerador de Jogos</button>
+  <button data-tab="filtros" class="tab-btn">Filtros</button>
+  <button data-tab="ranking" class="tab-btn">Ranking de Jogos</button>
+  <button data-tab="backtest" class="tab-btn">Backtest</button>
+  <button data-tab="exportacao" class="tab-btn">Exportação</button>
+  <button data-tab="ajuda" class="tab-btn">Ajuda / Glossário</button>
+</nav>
+
+<main id="mplMain" class="mpl-main">
+
+  <section id="tab-dashboard" class="tab-panel active">
+    <h2>Cockpit Analítico</h2>
+
+    <div class="card">
+      <h3>Volante Dinâmico</h3>
+      <div id="volanteDashboard"></div>
+    </div>
+
+    <div class="card" id="insightsCockpitCard">
+      <div id="insightsCockpit"></div>
+    </div>
+
+    <div class="card" id="resumoEstatisticas">
+      <h3>Resumo Estatístico</h3>
+      <p class="muted">Calcule a Caixa, os Scores e o Radar para ver o resumo aqui.</p>
+    </div>
+
+    <div class="grid-cards" id="dashboardCards"></div>
+    <div class="card">
+      <h3>Distribuição da JMCT (histograma)</h3>
+      <canvas id="chartJMCT" width="760" height="220"></canvas>
+    </div>
+    <div class="card">
+      <h3>Alerta metodológico</h3>
+      <p class="muted">O MPL não promete acerto, não prevê sorteios e não elimina a aleatoriedade. O método organiza dados históricos, reduz universos, ranqueia alternativas e permite validação por backtest.</p>
+    </div>
+  </section>
+
+  <section id="tab-modalidade" class="tab-panel">
+    <h2>Modalidade</h2>
+    <div class="card">
+      <label>Preset oficial</label>
+      <select id="presetSelect"></select>
+      <button id="btnAplicarPreset" class="btn-primary">Aplicar Preset</button>
+      <button id="btnDemo" class="btn-secondary">Carregar Dados Sintéticos (Demo)</button>
+    </div>
+    <div class="card" id="modalidadeForm"></div>
+  </section>
+
+  <section id="tab-base" class="tab-panel">
+    <h2>Base Histórica &amp; Storage</h2>
+    <div class="card">
+      <label>Importar (CSV ou JSON)</label>
+      <input type="file" id="fileImport" accept=".csv,.txt,.json" />
+      <textarea id="pasteArea" rows="4" placeholder="Ou cole os dados aqui: concurso;data;dez1 dez2 dez3..."></textarea>
+      <button id="btnImportar" class="btn-primary">Importar / Validar</button>
+      <button id="btnSalvarBase" class="btn-secondary">Salvar Base (IndexedDB)</button>
+      <button id="btnCarregarBase" class="btn-secondary">Carregar Base Salva</button>
+      <button id="btnLimparBase" class="btn-danger">Apagar Base</button>
+    </div>
+    <div class="card">
+      <h3>Relatório de Validação (VBE)</h3>
+      <div id="vbeReport" class="muted">Nenhuma validação executada ainda.</div>
+    </div>
+    <div class="card">
+      <h3>Concursos (últimos 30)</h3>
+      <div id="baseTable" class="table-wrap"></div>
+    </div>
+  </section>
+
+  <section id="tab-api" class="tab-panel">
+    <h2>API Pública (Caixa) e Atualização Incremental</h2>
+    <div class="card">
+      <p class="muted">Fonte oficial: <code>servicebus2.caixa.gov.br/portaldeloterias/api/{modalidade}/{concurso}</code>. Mesmo padrão utilizado nos demais projetos (FAITH, FORTUNA, OneiroNik). Caso o navegador bloqueie por CORS, configure abaixo um endpoint alternativo (proxy) ou utilize a importação manual na aba Base.</p>
+      <label>URL base da API (avançado / proxy alternativo)</label>
+      <input id="apiBaseUrlInput" placeholder="https://servicebus2.caixa.gov.br/portaldeloterias/api/">
+      <button id="btnSalvarApiBaseUrl" class="btn-secondary">Salvar Endpoint</button>
+      <button id="btnRestaurarApiBaseUrl" class="btn-secondary">Restaurar Padrão Oficial</button>
+    </div>
+    <div class="card">
+      <h3>Status da Sincronização</h3>
+      <div id="apiStatus" class="muted">Nenhuma sincronização realizada para esta modalidade ainda.</div>
+      <button id="btnBuscarUltimo" class="btn-secondary">Buscar Último Concurso (API)</button>
+      <button id="btnAtualizarAPI" class="btn-primary">Atualizar Base via API (somente concursos novos)</button>
+      <div id="apiProgress" class="muted" style="margin-top:8px;"></div>
+    </div>
+    <div class="card">
+      <h3>Concursos com Conflito (API × Base Local)</h3>
+      <div id="apiConflitos" class="muted">Nenhum conflito detectado.</div>
+    </div>
+  </section>
+
+  <section id="tab-escopo" class="tab-panel">
+    <h2>Escopo de Análise</h2>
+    <div class="card" id="escopoForm"></div>
+  </section>
+
+  <section id="tab-caixa" class="tab-panel">
+    <h2>Caixa Estatística, RECH e JMCT</h2>
+    <div class="card">
+      <button id="btnCalcularCaixa" class="btn-primary">Calcular Caixa / JMCT / TJF</button>
+    </div>
+    <div class="card" id="caixaStatsCard"></div>
+    <div class="card">
+      <h3>Teste de Janelas Fixas (TJF)</h3>
+      <div id="tjfTable" class="table-wrap"></div>
+    </div>
+    <div class="card" id="caixaRBCard"></div>
+  </section>
+
+  <section id="tab-scores" class="tab-panel">
+    <h2>Scores das Dezenas (SIC · SF · SA · SC · SRT · SEI · SU)</h2>
+    <div class="card">
+      <button id="btnCalcularScores" class="btn-primary">Calcular Scores e STF</button>
+    </div>
+    <div class="card" id="suForm"></div>
+    <div class="card">
+      <h3>Ranking Final por STF <span class="muted">(clique nos cabeçalhos das colunas para ordenar A→Z / Z→A)</span></h3>
+      <div id="rankingDezenasTable" class="table-wrap"></div>
+    </div>
+  </section>
+
+  <section id="tab-teia" class="tab-panel">
+    <h2>Teia de Relações (Duplas e Triplas)</h2>
+    <div class="card">
+      <canvas id="chartTeia" width="760" height="420"></canvas>
+    </div>
+    <div class="card">
+      <h3>Top Duplas por Lift</h3>
+      <div id="topDuplasTable" class="table-wrap"></div>
+    </div>
+    <div class="card">
+      <h3>Top Triplas</h3>
+      <div id="topTriplasTable" class="table-wrap"></div>
+    </div>
+  </section>
+
+  <section id="tab-pesos" class="tab-panel">
+    <h2>Controle Analítico Modular (CAM/FAM/RAP)</h2>
+    <div class="card" id="pesosForm"></div>
+  </section>
+
+  <section id="tab-radar" class="tab-panel">
+    <h2>Radar Bruto, Ajustado e Reduzido</h2>
+    <div class="card" id="radarForm"></div>
+    <div class="card" id="radarResult"></div>
+    <div class="card" id="radarBacktestCard"></div>
+  </section>
+
+  <section id="tab-gerador" class="tab-panel">
+    <h2>Gerador de Jogos (RR(K) → JC)</h2>
+    <div class="card" id="geradorForm"></div>
+    <div class="card" id="geradorResult"></div>
+  </section>
+
+  <section id="tab-filtros" class="tab-panel">
+    <h2>Filtros Duros (FD) e Filtro Histórico</h2>
+    <div class="card" id="filtrosVolanteCard"></div>
+    <div class="card" id="filtrosForm"></div>
+    <div class="card" id="filtrosResult"></div>
+  </section>
+
+  <section id="tab-ranking" class="tab-panel">
+    <h2>Ranking dos Jogos (SEJ · SUJ · SCOJ · STJ)</h2>
+    <div class="card">
+      <button id="btnRankearJogos" class="btn-primary">Calcular SEJ/SUJ/SCOJ/STJ e Ranquear</button>
+    </div>
+    <div class="card" id="rankingJogosFiltros"></div>
+    <div class="card">
+      <div id="rankingJogosTable" class="table-wrap"></div>
+    </div>
+  </section>
+
+  <section id="tab-backtest" class="tab-panel">
+    <h2>Backtest Modular (BTM) e de Jogos (BTJ)</h2>
+    <div class="card" id="backtestForm"></div>
+    <div class="card" id="backtestResult"></div>
+    <div class="card" id="overfittingPanel"></div>
+  </section>
+
+  <section id="tab-exportacao" class="tab-panel">
+    <h2>Exportações e Relatórios</h2>
+    <div class="card" id="exportForm"></div>
+  </section>
+
+  <section id="tab-ajuda" class="tab-panel">
+    <h2>Ajuda e Glossário Oficial do MPL</h2>
+    <div class="card" id="glossarioCard"></div>
+  </section>
+
+</main>
+
+<footer class="mpl-footer">
+  MPL — Método Parametrizável de Loterias · Ferramenta de organização, redução e validação histórica. Não garante resultados.
+</footer>
+
+<script src="js/mpl-core.js"></script>
+<script src="js/mpl-hooks.js"></script>
+<script src="js/mpl-volante.js"></script>
+<script src="js/mpl-api.js"></script>
+<script src="js/mpl-api-premiacoes.js"></script>
+<script src="js/mpl-statistics.js"></script>
+<script src="js/mpl-scoring.js"></script>
+<script src="js/mpl-games.js"></script>
+<script src="js/mpl-backtest.js"></script>
+<script src="js/mpl-ui.js"></script>
+<script src="js/mpl-base-lacunas.js"></script>
+<script src="js/mpl-dashboard-premiados.js"></script>
+<script src="js/mpl-backtest-custo-retorno.js"></script>
+<script src="js/mpl-radar-container.js"></script>
+<script src="js/mpl-radar-avcombat-v3.js"></script>
+<script src="js/mpl-cockpit-pesos.js"></script>
+<script src="js/mpl-gerador-matrix.js"></script>
+<script src="js/mpl-cockpit-pesos-fix.js"></script>
+<script src="js/mpl-gerador-matrix-fix.js"></script>
+<script src="js/mpl-gerador-assincrono.js"></script>
+<script src="js/mpl-filtros-renomear-poda.js"></script>
+<script src="js/mpl-ranking-podio.js"></script>
+<script src="js/mpl-filtros-excluir-arquivo.js"></script>
+<script src="js/mpl-filtros-arquivo-ponte.js"></script>
+<script src="js/mpl-filtros-excluir-arquivo-subconjunto.js"></script>
+<script src="js/mpl-mapa-inicial-fix.js"></script>
+<script src="js/mpl-radar-aviao-fix.js"></script>
+<script src="js/mpl-radar-desligar-antigo.js"></script>
+<script src="js/mpl-mapa-aumentar-tamanho.js"></script>
+<script src="js/mpl-cores-dinamicas.js"></script>
+<script src="js/mpl-perfil-dezena.js"></script>
+<script src="js/mpl-vca.js"></script>
+<script src="js/mpl-presets.js"></script>
+<script src="js/mpl-vca-validacao.js"></script>
+<script src="js/mpl-precos.js"></script>
+<script src="js/mpl-conferidor-premiacao.js"></script>
+<script src="js/mpl-premiacoes-mapa.js"></script>
+<script src="js/mpl-labquant-oca.js"></script>
+<script src="js/mpl-labquant-irineu.js"></script>
+</body>
+</html>

@@ -1,0 +1,92 @@
+/* ============================================================
+   #pessoal
+   MPL — mpl-hooks.js — INFRAESTRUTURA DE HOOKS (t11-C3, Fase 1)
+   ARQUIVO NOVO. No index.html, carregue LOGO APÓS mpl-core.js.
+
+   Substitui o padrão de monkey-patch empilhado por um registro
+   central de callbacks. Cada módulo se REGISTRA em vez de
+   embrulhar a função — assim a ordem de carregamento deixa de
+   ser lógica de negócio, e um módulo com erro não derruba os
+   demais (cada hook roda em try/catch isolado).
+
+   Uso:
+     mplOn("dashboard", minhaFuncao, 50);   // 50 = prioridade
+     mplOn("volante:navigate", fn, 30);
+
+   Prioridade: menor número roda primeiro (padrão 50).
+   Depuração: mplHooks() lista tudo que está registrado.
+   ============================================================ */
+(function () {
+  "use strict";
+  if (window.MPL_HOOKS) return;
+
+  var registry = {};
+  var instalados = {};
+
+  /* Registra um callback num evento */
+  window.mplOn = function (evento, fn, prioridade) {
+    if (typeof fn !== "function") return;
+    if (!registry[evento]) registry[evento] = [];
+    registry[evento].push({ fn: fn, p: (prioridade == null ? 50 : prioridade), nome: fn.name || "anon" });
+    registry[evento].sort(function (a, b) { return a.p - b.p; });
+  };
+
+  /* Dispara todos os callbacks de um evento, isoladamente */
+  window.mplEmit = function (evento, args) {
+    var lista = registry[evento];
+    if (!lista || !lista.length) return;
+    for (var i = 0; i < lista.length; i++) {
+      try {
+        lista[i].fn.apply(null, args || []);
+      } catch (e) {
+        console.error('MPL Hooks: falha no hook "' + evento + '" (' + lista[i].nome + ') —', e);
+        /* segue para o próximo: um módulo quebrado não derruba os outros */
+      }
+    }
+  };
+
+  /* Instala o ponto de emissão numa função global, UMA única vez */
+  window.mplInstalarHook = function (nomeFuncao, evento) {
+    if (instalados[nomeFuncao]) return true;
+    if (typeof window[nomeFuncao] !== "function") return false;
+    var orig = window[nomeFuncao];
+    window[nomeFuncao] = function () {
+      var r = orig.apply(this, arguments);
+      mplEmit(evento, Array.prototype.slice.call(arguments));
+      return r;
+    };
+    instalados[nomeFuncao] = true;
+    console.log('MPL Hooks: ponto de emissão instalado em ' + nomeFuncao + '() → evento "' + evento + '".');
+    return true;
+  };
+
+  /* Diagnóstico */
+  window.mplHooks = function () {
+    var out = {};
+    Object.keys(registry).forEach(function (k) {
+      out[k] = registry[k].map(function (h) { return h.nome + " (p" + h.p + ")"; });
+    });
+    console.table(out);
+    return out;
+  };
+
+  window.MPL_HOOKS = registry;
+
+  /* Instala os pontos de emissão assim que as funções existirem.
+     Não remove nenhum embrulho atual — apenas cria o canal novo,
+     para migrarmos os módulos um a um nas próximas fases. */
+  var t = 0;
+  var vigia = setInterval(function () {
+    t++;
+    var ok = 0;
+    if (mplInstalarHook("renderDashboard", "dashboard")) ok++;
+    if (mplInstalarHook("renderVolante", "volante")) ok++;
+    if (mplInstalarHook("renderRadarForm", "radar:form")) ok++;
+    if (mplInstalarHook("renderGeradorForm", "gerador:form")) ok++;
+    if (mplInstalarHook("renderFiltrosForm", "filtros:form")) ok++;
+    if (ok >= 5 || t > 60) {
+      clearInterval(vigia);
+      console.log("MPL Hooks: infraestrutura pronta. Use mplHooks() para inspecionar.");
+    }
+  }, 200);
+})();

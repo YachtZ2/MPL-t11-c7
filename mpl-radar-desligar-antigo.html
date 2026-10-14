@@ -1,0 +1,37 @@
+/* ============================================================
+   MPL — mpl-radar-desligar-antigo.js  (arquivo NOVO)
+   ADICIONE no index.html, DEPOIS de mpl-radar-avcombat-v3.js:
+     <script src="js/mpl-radar-desligar-antigo.js"></script>
+
+   Resolve: o radar antigo (definido lá dentro do mpl-ui.js, no
+   Patch U original) continuava rodando seu PRÓPRIO loop de animação
+   em paralelo com o novo (v3) — os dois desenhavam na MESMA canvas
+   ao mesmo tempo, um por cima do outro. Não eram "dois radares"
+   morando em lugares diferentes: era um canvas só recebendo dois
+   desenhos concorrentes.
+
+   Este patch neutraliza o loop antigo sem precisar editar o
+   mpl-ui.js na mão — troca as funções antigas por "no-ops" (funções
+   vazias), o que interrompe a cadeia de requestAnimationFrame antiga
+   já no próximo quadro.
+   ============================================================ */
+(function () {
+  "use strict";
+
+  var desligados = [];
+
+  if (typeof window.cicloRadarAviao === "function") {
+    window.cicloRadarAviao = function () { /* desligado — v3 assumiu o radar */ };
+    desligados.push("cicloRadarAviao");
+  }
+  if (typeof window.desenharRadarAviao === "function") {
+    window.desenharRadarAviao = function () { /* desligado — v3 assumiu o radar */ };
+    desligados.push("desenharRadarAviao");
+  }
+
+  if (desligados.length) {
+    console.log("MPL Radar: loop(s) antigo(s) desligado(s) — " + desligados.join(", ") + ". Só o v3 está ativo agora.");
+  } else {
+    console.log("MPL Radar: nenhum loop antigo encontrado para desligar (talvez já não existisse, ou os nomes mudaram).");
+  }
+})();

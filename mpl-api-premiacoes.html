@@ -1,0 +1,60 @@
+/* ============================================================
+   MPL — mpl-api-premiacoes.js  (Fase 8, parte 1/3)
+   ADICIONE no index.html, depois de js/mpl-api.js (e depois de
+   qualquer patch de API que já exista lá):
+     <script src="js/mpl-api-premiacoes.js"></script>
+
+   Captura os dados de premiação que a API oficial da Caixa já
+   devolve junto com o resultado (campo comum: listaRateioPremio,
+   com faixa/descricaoFaixa/numeroDeGanhadores/valorPremio), além
+   de "acumulado" e o valor estimado do próximo concurso — e faz
+   isso persistir na base local (antes esses campos chegavam na
+   resposta da API mas eram descartados ao salvar o concurso).
+
+   Observação honesta: nomes de campo de APIs de terceiros variam;
+   por isso sempre guardamos também o JSON bruto (bruto: json) —
+   se algum dia os nomes abaixo não baterem com a fonte que você
+   estiver usando, dá pra inspecionar bruto no console e ajustar.
+   ============================================================ */
+(function () {
+  "use strict";
+
+  var __origNormalizeFase8 = normalizeCaixaResponse;
+  normalizeCaixaResponse = function (json, manterOrdem) {
+    var base = __origNormalizeFase8(json, manterOrdem);
+    var lista = json.listaRateioPremio || json.premiacoes || json.rateioPremio || [];
+    base.premiacoes = lista.map(function (p) {
+      return {
+        faixa: p.faixa ?? null,
+        descricao: p.descricaoFaixa || p.descricao || ("Faixa " + (p.faixa || "?")),
+        ganhadores: Number(p.numeroDeGanhadores ?? p.ganhadores ?? 0),
+        valorPremio: Number(p.valorPremio ?? 0)
+      };
+    });
+    base.acumulado = !!(json.acumulado);
+    base.valorArrecadado = json.valorArrecadadoTotal ?? json.valorArrecadado ?? null;
+    base.valorAcumuladoProximo = json.valorAcumuladoProximoConcurso ?? json.valorEstimadoProximoConcurso ?? null;
+    return base;
+  };
+
+  /* Propaga os campos de premiação para o concurso salvo na base —
+     mesma técnica já usada para o 2º sorteio da Dupla Sena: refaz
+     uma busca pontual (barata, cai no cache) para recuperar os
+     campos que o fluxo padrão de "novos concursos" descartava. */
+  var __origAtualizarBasePorAPIFase8 = atualizarBasePorAPI;
+  atualizarBasePorAPI = async function (modalidadeKey, baseAtual, modalidade, onProgress) {
+    var r = await __origAtualizarBasePorAPIFase8(modalidadeKey, baseAtual, modalidade, onProgress);
+    if (r.novos && r.novos.length) {
+      for (var i = 0; i < r.novos.length; i++) {
+        try {
+          var completo = await getConcursoPorNumeroAPI(modalidadeKey, r.novos[i].numero);
+          if (completo.premiacoes) r.novos[i].premiacoes = completo.premiacoes;
+          if (completo.acumulado !== undefined) r.novos[i].acumulado = completo.acumulado;
+          if (completo.valorAcumuladoProximo) r.novos[i].valorAcumuladoProximo = completo.valorAcumuladoProximo;
+          if (completo.valorArrecadado) r.novos[i].valorArrecadado = completo.valorArrecadado;
+        } catch (e) { /* silencioso: fica sem dado de premiação, resto do concurso é salvo normalmente */ }
+      }
+    }
+    return r;
+  };
+})();

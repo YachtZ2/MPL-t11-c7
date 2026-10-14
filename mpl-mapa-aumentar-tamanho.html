@@ -1,0 +1,37 @@
+/* ============================================================
+   MPL — mpl-mapa-aumentar-tamanho.js  (arquivo NOVO e independente)
+   ADICIONE no index.html, depois de mpl-mapa-inicial-fix.js:
+     <script src="js/mpl-mapa-aumentar-tamanho.js"></script>
+
+   Resolve: "o mapa/globo ficou muito pequeno". Aumenta a RESOLUÇÃO
+   real dos canvases (não só o CSS) do globo e da timeline — como as
+   funções de desenho do Patch T já leem canvas.width/height a cada
+   frame (não usam valores fixos "hardcoded"), elas se adaptam sozinhas
+   ao novo tamanho, sem precisar tocar no código de desenho.
+   ============================================================ */
+(function () {
+  "use strict";
+
+  function aumentarGlobo() {
+    var c = document.getElementById("mapaGloboCanvas");
+    if (c && c.width !== 460) {
+      c.width = 460; c.height = 460;
+      c.style.maxWidth = "460px";
+    }
+  }
+  function aumentarTimeline() {
+    var c = document.getElementById("mapaTimelineCanvas");
+    if (c && c.height !== 120) {
+      c.width = 1000; c.height = 120;
+      c.style.height = "120px";
+    }
+  }
+
+  var tentativas = 0;
+  var vigia = setInterval(function () {
+    tentativas++;
+    aumentarGlobo();
+    aumentarTimeline();
+    if (tentativas > 40) clearInterval(vigia);
+  }, 150);
+})();

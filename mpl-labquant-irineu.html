@@ -1,0 +1,1034 @@
+/* ============================================================
+   #pessoal
+   MPL — mpl-labquant-irineu.js — Lab Quant › Fechamentos
+   DESDOBRAMENTO IRINEU v2
+   ARQUIVO NOVO. No index.html, carregue DEPOIS de mpl-labquant-oca.js.
+
+   A · Entrada: RR (Radar, Target Lock, manual/arquivo) + coringas
+       opcionais (forma mista / isolada / avulsa; máx. por jogo).
+   B · Grupos: duplas, triplas ou misto; SEMPRE exclusivos; critérios
+       combináveis com % livre (afinidade, anti-afinidade,
+       ausência+ciclo, força STF, equilíbrio) ou montagem manual.
+   📐 Contagem ao vivo: grupos, sobras, combinações, cobertura, custo.
+   C · Montagem: combinações completas ou cobertura mínima (N×).
+   D · Resultado: jogos por grupo, custo, cobertura, garantia
+       condicional, teste no passado (rápido ou honesto) × acaso,
+       enviar ao Ranking/Conferidor, TXT, presets.
+
+   Não altera o radar oficial nem o cache de análise.
+   Super Sete: não se aplica (posicional).
+   ============================================================ */
+(function () {
+  "use strict";
+
+  var IR = { ativo: false, pk: null, f: null, ent: null, ctx: null, grupos: null, chaveGrupos: null,
+             jogos: null, meta: null, teste: null, testando: false, cancelar: false, sel: null };
+  window.MPL_IRINEU = IR;
+  var PRESETS_KEY = "mplIrineuPresets";
+  var CRITS = ["af", "anti", "mat", "stf", "eq"];
+  var NOMES_CRIT = { af: "Afinidade (saem juntas)", anti: "Anti-afinidade (separa as que saem juntas)",
+                     mat: "Ausência + Ciclo (maduras juntas)", stf: "Força STF (fortes com fortes)",
+                     eq: "Equilíbrio (alta+baixa, par+ímpar)" };
+
+  /* ---------------- utilidades ---------------- */
+  function M() { return MPL_STATE.modalidade; }
+  function ehSS() { var m = M(); return !!(m && typeof isSuperSete === "function" && isSuperSete(m)); }
+  function ehDS() { var m = M(); return !!(m && typeof isDuplaSena === "function" && isDuplaSena(m)); }
+  function corMod() { return (M() && typeof obterCorModalidade === "function") ? obterCorModalidade(M()).principal : "#22d3ee"; }
+  function C(n, k) { if (k < 0 || k > n) return 0; k = Math.min(k, n - k); var r = 1; for (var i = 1; i <= k; i++) r = r * (n - k + i) / i; return Math.round(r); }
+  function pad(d) { return String(d).padStart(2, "0"); }
+  function pad3(d) { return String(d).padStart(3, "0"); }
+  function fmt(v) { return "R$ " + Number(v || 0).toLocaleString("pt-BR", { minimumFractionDigits: 2, maximumFractionDigits: 2 }); }
+  function rep(v, n) { var a = []; for (var i = 0; i < n; i++) a.push(v); return a; }
+  function nums(t) { return (String(t || "").match(/\d+/g) || []).map(Number); }
+  function uniq(a) { var s = {}, o = []; a.forEach(function (x) { if (!s[x]) { s[x] = 1; o.push(x); } }); return o; }
+  function hue(i) { return "hsl(" + ((i * 137) % 360) + ",70%,62%)"; }
+  function num(n) { return Number(n || 0).toLocaleString("pt-BR"); }
+  function setPath(o, p, v) { var k = p.split("."); for (var i = 0; i < k.length - 1; i++) o = o[k[i]]; o[k[k.length - 1]] = v; }
+  function getPath(o, p) { return p.split(".").reduce(function (a, k) { return a == null ? a : a[k]; }, o); }
+  function baseAtual() {
+    var b = ((typeof baseEfetiva === "function") ? baseEfetiva() : MPL_STATE.base) || [];
+    return b.slice().sort(function (x, y) { return x.numero - y.numero; });
+  }
+  function universo() {
+    var s = {}, m = M();
+    (MPL_STATE.base || []).forEach(function (c) { (c.dezenas || []).forEach(function (d) { s[Number(d)] = 1; }); });
+    var vistos = Object.keys(s).map(Number);
+    if (m && m.universo) {
+      var ini = (vistos.length && Math.min.apply(null, vistos) === 0) ? 0 : 1;
+      for (var d = ini; d < ini + m.universo; d++) s[d] = 1;
+    }
+    return Object.keys(s).map(Number).sort(function (a, b) { return a - b; });
+  }
+  function shuffle(a) { for (var i = a.length - 1; i > 0; i--) { var j = Math.floor(Math.random() * (i + 1)); var t = a[i]; a[i] = a[j]; a[j] = t; } return a; }
+
+  /* ---------------- formulário ---------------- */
+  function padraoForm() {
+    var m = M(), S = m.dezenasSorteadas;
+    return {
+      origem: "radar", lista: "",
+      corOn: false, corQtd: 6, corOrigem: "stf", corForma: "mista", corMax: 1, corManual: "",
+      tipo: "duplas", misto: "", sobra: "descartar",
+      crit: { af: { on: true, w: 40 }, anti: { on: false, w: 0 }, mat: { on: true, w: 40 }, stf: { on: false, w: 0 }, eq: { on: true, w: 20 } },
+      manual: false, gruposTxt: "", afJanela: 300,
+      A: S, avulsa: "stf", avulsaManual: "", modo: "cobertura", rep: 1, limite: 0,
+      tN: 100, tModo: "rapido", tSorteio: "1"
+    };
+  }
+  function garantirForm() {
+    if (!M()) return false;
+    if (!IR.f || IR.pk !== M().presetKey) {
+      IR.f = padraoForm(); IR.pk = M().presetKey;
+      IR.ent = IR.ctx = IR.grupos = IR.chaveGrupos = IR.jogos = IR.meta = IR.teste = IR.sel = null;
+    }
+    return true;
+  }
+
+  /* ---------------- dados de análise ---------------- */
+  var dadosCache = { chave: null, d: null };
+  function dadosDezenas(base) {
+    var ult = base.length ? base[base.length - 1].numero : 0;
+    var chave = M().presetKey + "|" + base.length + "|" + ult + "|" + JSON.stringify(MPL_STATE.config.pesosPerfil);
+    if (dadosCache.chave === chave) return dadosCache.d;
+    var rk = [];
+    try { rk = gerarRankingDezenas(base, M(), MPL_STATE.config).ranking || []; }
+    catch (e) { rk = MPL_STATE.cache.scoresDezenas || []; }
+    var d = {};
+    rk.forEach(function (r) {
+      var g = function (k) { return r[k] != null ? Number(r[k]) : (r.scores && r.scores[k] != null ? Number(r.scores[k]) : null); };
+      var sa = g("SA"), sc = g("SC");
+      d[Number(r.dezena)] = { stf: Number(r.STF) || 0, sa: sa == null ? 50 : sa, sc: sc == null ? 50 : sc };
+    });
+    dadosCache = { chave: chave, d: d };
+    return d;
+  }
+  function coocorrencia(base, janela) {
+    var b = janela > 0 ? base.slice(-janela) : base, f = {}, p = {};
+    b.forEach(function (c) {
+      var dz = (c.dezenas || []).map(Number);
+      dz.forEach(function (d) { f[d] = (f[d] || 0) + 1; });
+      for (var i = 0; i < dz.length; i++) for (var j = i + 1; j < dz.length; j++) {
+        var a = dz[i], bb = dz[j], k = a < bb ? a + "-" + bb : bb + "-" + a;
+        p[k] = (p[k] || 0) + 1;
+      }
+    });
+    return { n: b.length, f: f, p: p };
+  }
+  function lift(co, a, b) {
+    if (!co.n) return 0;
+    var k = a < b ? a + "-" + b : b + "-" + a;
+    var pab = (co.p[k] || 0) / co.n, pa = (co.f[a] || 0) / co.n, pb = (co.f[b] || 0) / co.n;
+    return (pa && pb) ? pab / (pa * pb) : 0;
+  }
+
+  /* ---------------- nota de um grupo ---------------- */
+  function bruto(ctx, g) {
+    var L = 0, np = 0, mat = 0, stf = 0;
+    for (var i = 0; i < g.length; i++) for (var j = i + 1; j < g.length; j++) { L += lift(ctx.co, g[i], g[j]); np++; }
+    g.forEach(function (d) { var x = ctx.dados[d] || { sa: 50, sc: 50, stf: 0 }; mat += (x.sa + x.sc) / 2; stf += x.stf; });
+    var af = np ? L / np : 0;
+    var alta = g.some(function (d) { return d > ctx.meio; }), baixa = g.some(function (d) { return d <= ctx.meio; });
+    var par = g.some(function (d) { return d % 2 === 0; }), imp = g.some(function (d) { return d % 2 !== 0; });
+    return { af: af, anti: -af, mat: mat / g.length, stf: stf / g.length, eq: (alta && baixa ? 0.5 : 0) + (par && imp ? 0.5 : 0) };
+  }
+  function nota(ctx, g) {
+    var b = bruto(ctx, g), r = ctx.ranges[g.length] || ctx.ranges[2], s = 0;
+    Object.keys(ctx.w).forEach(function (k) {
+      var mn = r[k].min, mx = r[k].max, v = mx > mn ? (b[k] - mn) / (mx - mn) : 0.5;
+      s += ctx.w[k] * Math.max(0, Math.min(1, v));
+    });
+    return s * 100;
+  }
+  function amostra(l, sz) {
+    var out = [], n = l.length, i, j, k;
+    if (sz === 2) { for (i = 0; i < n; i++) for (j = i + 1; j < n; j++) out.push([l[i], l[j]]); return out; }
+    if (C(n, 3) <= 4000) { for (i = 0; i < n; i++) for (j = i + 1; j < n; j++) for (k = j + 1; k < n; k++) out.push([l[i], l[j], l[k]]); return out; }
+    for (var t = 0; t < 4000; t++) {
+      i = Math.floor(Math.random() * n); j = Math.floor(Math.random() * n); k = Math.floor(Math.random() * n);
+      if (i !== j && j !== k && i !== k) out.push([l[i], l[j], l[k]]);
+    }
+    return out;
+  }
+  function faixas(ctx, lista) {
+    var r = {};
+    CRITS.forEach(function (c) { r[c] = { min: Infinity, max: -Infinity }; });
+    lista.forEach(function (g) {
+      var b = bruto(ctx, g);
+      CRITS.forEach(function (c) { if (b[c] < r[c].min) r[c].min = b[c]; if (b[c] > r[c].max) r[c].max = b[c]; });
+    });
+    CRITS.forEach(function (c) { if (!isFinite(r[c].min)) { r[c].min = 0; r[c].max = 1; } });
+    return r;
+  }
+  function criarCtx(base, todas, f) {
+    f = f || IR.f;
+    var uni = universo(), ctx = { dados: dadosDezenas(base), co: coocorrencia(base, Number(f.afJanela) || 0),
+      meio: uni[Math.floor(uni.length / 2)], w: {}, ranges: {} };
+    var soma = 0;
+    Object.keys(f.crit).forEach(function (k) { var c = f.crit[k]; if (c.on && c.w > 0) { ctx.w[k] = Number(c.w); soma += Number(c.w); } });
+    if (!soma) { ctx.w = { eq: 1 }; soma = 1; }
+    Object.keys(ctx.w).forEach(function (k) { ctx.w[k] /= soma; });
+    var amos = todas.length >= 2 ? todas : uni;
+    ctx.ranges[2] = faixas(ctx, amostra(amos, 2));
+    ctx.ranges[3] = amos.length >= 3 ? faixas(ctx, amostra(amos, 3)) : ctx.ranges[2];
+    return ctx;
+  }
+
+  /* ---------------- entrada ---------------- */
+  function rrDaOrigem(f) {
+    f = f || IR.f;
+    var uset = {}; universo().forEach(function (d) { uset[d] = 1; });
+    var l = [];
+    if (f.origem === "radar") {
+      var r = MPL_STATE.cache && MPL_STATE.cache.radar && MPL_STATE.cache.radar.reduzido;
+      if (!r || !r.length) return { erro: "O Radar oficial ainda não tem RR. Gere o radar na aba Radar ou escolha outra origem." };
+      l = r.map(function (x) { return Number(x && x.dezena != null ? x.dezena : x); });
+    } else if (f.origem === "target") {
+      var V = window.MPL_VCA;
+      if (!V || !V.resultado || V.resultado.erro || !V.resultado.dezRR) return { erro: "O Target Lock não tem RR calculado. Ative e recalcule na aba Radar." };
+      l = V.resultado.dezRR.map(Number);
+    } else {
+      l = nums(f.lista);
+      if (!l.length) return { erro: "Informe a lista de dezenas (manual ou arquivo)." };
+    }
+    l = uniq(l).filter(function (d) { return uset[d]; }).sort(function (a, b) { return a - b; });
+    return { lista: l };
+  }
+  function opcoesMisto(n) {
+    var r = [];
+    for (var t = 1; 3 * t < n; t++) { var rest = n - 3 * t; if (rest >= 2 && rest % 2 === 0) r.push({ t: t, d: rest / 2 }); }
+    return r.reverse();   /* mais triplas primeiro */
+  }
+  function tamanhos(n, tipo, esc) {
+    if (tipo === "duplas") return { sizes: rep(2, Math.floor(n / 2)), sobra: n % 2 };
+    if (tipo === "triplas") return { sizes: rep(3, Math.floor(n / 3)), sobra: n % 3 };
+    var ops = opcoesMisto(n), o = ops.filter(function (x) { return x.t + "-" + x.d === esc; })[0] || ops[0];
+    if (!o) return { sizes: rep(2, Math.floor(n / 2)), sobra: n % 2 };
+    return { sizes: rep(3, o.t).concat(rep(2, o.d)), sobra: 0, t: o.t, d: o.d };
+  }
+  function escolherCoringas(rr, f, dados) {
+    var s = {}; rr.forEach(function (d) { s[d] = 1; });
+    var fora = universo().filter(function (d) { return !s[d]; }), lst;
+    if (f.corOrigem === "manual") lst = uniq(nums(f.corManual)).filter(function (d) { return fora.indexOf(d) >= 0; });
+    else if (f.corOrigem === "aleatoria") lst = shuffle(fora.slice());
+    else {
+      var key = f.corOrigem === "mat"
+        ? function (d) { var x = dados[d] || {}; return ((x.sa || 0) + (x.sc || 0)) / 2; }
+        : function (d) { return (dados[d] || {}).stf || 0; };
+      lst = fora.slice().sort(function (a, b) { return key(b) - key(a); });
+    }
+    return lst.slice(0, Math.max(0, Number(f.corQtd) || 0));
+  }
+  function construirEntrada(dados, f) {
+    f = f || IR.f;
+    var o = rrDaOrigem(f); if (o.erro) return o;
+    var rr = o.lista.slice(), cor = [], avulsa = [], descart = [], extras = [];
+    var forma = f.corOn ? f.corForma : "mista";
+    var stfOf = function (d) { return (dados[d] || {}).stf || 0; };
+    if (f.corOn && Number(f.corQtd) > 0) cor = escolherCoringas(rr, f, dados);
+    var corAgr = cor;
+    if (f.corOn && forma === "avulsa") { avulsa = cor.slice(); corAgr = []; }
+    if (f.corOn && forma === "isolada") {
+      var gc = f.tipo === "triplas" ? 3 : 2, r = corAgr.length % gc;
+      if (r) { avulsa = avulsa.concat(corAgr.slice(corAgr.length - r)); corAgr = corAgr.slice(0, corAgr.length - r); }
+    }
+    var nBase = (forma === "mista") ? rr.length + corAgr.length : rr.length;
+    var sobra = tamanhos(nBase, f.tipo, f.misto).sobra;
+    if (sobra) {
+      if (f.sobra === "coringa") {
+        var g = f.tipo === "triplas" ? 3 : 2, faltam = g - sobra, usados = {};
+        rr.concat(cor).forEach(function (d) { usados[d] = 1; });
+        extras = universo().filter(function (d) { return !usados[d]; }).sort(function (a, b) { return stfOf(b) - stfOf(a); }).slice(0, faltam);
+        rr = rr.concat(extras);
+      } else {
+        var piores = rr.slice().sort(function (a, b) { return stfOf(a) - stfOf(b); }).slice(0, sobra);
+        rr = rr.filter(function (d) { return piores.indexOf(d) < 0; });
+        if (f.sobra === "descartar") descart = piores; else avulsa = avulsa.concat(piores);
+      }
+    }
+    return { rr: rr, cor: corAgr, coringasTodas: cor, forma: forma, avulsa: uniq(avulsa), descart: descart, extras: extras,
+             todas: uniq(rr.concat(corAgr).concat(avulsa)) };
+  }
+
+  /* ---------------- formação dos grupos ---------------- */
+  function melhorGrupo(ctx, rest, sz, obrig) {
+    var best = null, bs = -Infinity, n = rest.length, i, j, k, s;
+    if (obrig != null) {
+      if (sz === 2) { for (i = 0; i < n; i++) { s = nota(ctx, [obrig, rest[i]]); if (s > bs) { bs = s; best = [obrig, rest[i]]; } } }
+      else for (i = 0; i < n; i++) for (j = i + 1; j < n; j++) { s = nota(ctx, [obrig, rest[i], rest[j]]); if (s > bs) { bs = s; best = [obrig, rest[i], rest[j]]; } }
+      return best;
+    }
+    if (sz === 2) { for (i = 0; i < n; i++) for (j = i + 1; j < n; j++) { s = nota(ctx, [rest[i], rest[j]]); if (s > bs) { bs = s; best = [rest[i], rest[j]]; } } return best; }
+    if (C(n, 3) <= 20000) {
+      for (i = 0; i < n; i++) for (j = i + 1; j < n; j++) for (k = j + 1; k < n; k++) {
+        s = nota(ctx, [rest[i], rest[j], rest[k]]); if (s > bs) { bs = s; best = [rest[i], rest[j], rest[k]]; }
+      }
+      return best;
+    }
+    for (var t = 0; t < 20000; t++) {
+      i = Math.floor(Math.random() * n); j = Math.floor(Math.random() * n); k = Math.floor(Math.random() * n);
+      if (i === j || j === k || i === k) continue;
+      s = nota(ctx, [rest[i], rest[j], rest[k]]); if (s > bs) { bs = s; best = [rest[i], rest[j], rest[k]]; }
+    }
+    return best;
+  }
+  function particionar(ctx, S, sizes) {
+    var rest = S.slice(), out = [];
+    sizes.slice().sort(function (a, b) { return b - a; }).forEach(function (sz) {
+      if (rest.length < sz) return;
+      var g = melhorGrupo(ctx, rest, sz, null); if (!g) return;
+      out.push(g); rest = rest.filter(function (d) { return g.indexOf(d) < 0; });
+    });
+    return { grupos: out, resto: rest };
+  }
+  function mkGrupo(ctx, d, corSet, pool) {
+    d = d.slice().sort(function (a, b) { return a - b; });
+    return { d: d, pool: pool || "rr", temCor: d.some(function (x) { return corSet[x]; }), score: nota(ctx, d) };
+  }
+  function podeTrocar(A, B, x, y, corSet) {
+    var cx = !!corSet[x], cy = !!corSet[y];
+    if (cx !== cy) return false;
+    if (cx) return A.pool === "cor" && B.pool === "cor";
+    return true;
+  }
+  function otimizar(ctx, gs, corSet) {
+    var melhorou = true, passes = 0;
+    while (melhorou && passes < 6) {
+      melhorou = false; passes++;
+      for (var i = 0; i < gs.length; i++) for (var j = i + 1; j < gs.length; j++) {
+        var A = gs[i], B = gs[j];
+        for (var a = 0; a < A.d.length; a++) for (var b = 0; b < B.d.length; b++) {
+          var x = A.d[a], y = B.d[b];
+          if (!podeTrocar(A, B, x, y, corSet)) continue;
+          var na = A.d.slice(), nb = B.d.slice(); na[a] = y; nb[b] = x;
+          var sa = nota(ctx, na), sb = nota(ctx, nb);
+          if (sa + sb > A.score + B.score + 1e-9) { A.d = na; B.d = nb; A.score = sa; B.score = sb; melhorou = true; }
+        }
+      }
+    }
+    gs.forEach(function (g) { g.d.sort(function (a, b) { return a - b; }); g.temCor = g.d.some(function (x) { return corSet[x]; }); });
+  }
+  function agrupar(ctx, ent, f) {
+    f = f || IR.f;
+    var corSet = {}; ent.cor.forEach(function (d) { corSet[d] = 1; });
+    var out = [];
+    if (f.manual) {
+      var usados = {}, erro = null;
+      String(f.gruposTxt || "").split(/\r?\n/).forEach(function (l) {
+        var g = uniq(nums(l)); if (!g.length) return;
+        if (g.length < 2 || g.length > 3) { erro = "Cada linha deve ter 2 ou 3 dezenas."; return; }
+        g.forEach(function (d) { if (usados[d]) erro = "A dezena " + pad(d) + " aparece em mais de um grupo."; usados[d] = 1; });
+        out.push(mkGrupo(ctx, g, corSet, "rr"));
+      });
+      if (erro) return { erro: erro };
+      if (!out.length) return { erro: "Nenhum grupo informado no modo manual (uma linha por grupo)." };
+      return { grupos: out, resto: [] };
+    }
+    var tipoSz = f.tipo === "triplas" ? 3 : 2;
+    if (ent.forma === "mista" && ent.cor.length) {
+      var plan = tamanhos(ent.rr.length + ent.cor.length, f.tipo, f.misto).sizes.slice(), rest = ent.rr.slice();
+      ent.cor.slice().sort(function (a, b) {
+        var x = ctx.dados[a] || {}, y = ctx.dados[b] || {};
+        return ((y.sa || 0) + (y.sc || 0)) - ((x.sa || 0) + (x.sc || 0));
+      }).forEach(function (c) {
+        var i = plan.indexOf(tipoSz); if (i < 0) i = 0;
+        var sz = plan.splice(i, 1)[0] || tipoSz;
+        if (rest.length < sz - 1) return;
+        var g = melhorGrupo(ctx, rest, sz, c); if (!g) return;
+        out.push(mkGrupo(ctx, g, corSet, "mix")); rest = rest.filter(function (d) { return g.indexOf(d) < 0; });
+      });
+      var p = particionar(ctx, rest, plan);
+      p.grupos.forEach(function (g) { out.push(mkGrupo(ctx, g, corSet, "rr")); });
+      otimizar(ctx, out, corSet);
+      return { grupos: out, resto: p.resto };
+    }
+    var pr = particionar(ctx, ent.rr, tamanhos(ent.rr.length, f.tipo, f.misto).sizes);
+    pr.grupos.forEach(function (g) { out.push(mkGrupo(ctx, g, corSet, "rr")); });
+    var resto = pr.resto;
+    if (ent.forma === "isolada" && ent.cor.length) {
+      var pc = particionar(ctx, ent.cor, rep(tipoSz, Math.floor(ent.cor.length / tipoSz)));
+      pc.grupos.forEach(function (g) { out.push(mkGrupo(ctx, g, corSet, "cor")); });
+      resto = resto.concat(pc.resto);
+    }
+    otimizar(ctx, out, corSet);
+    return { grupos: out, resto: resto };
+  }
+  function chaveConfig() {
+    var f = IR.f, o = rrDaOrigem(f);
+    return JSON.stringify({ o: f.origem, l: f.lista, rr: o.lista || null, c: [f.corOn, f.corQtd, f.corOrigem, f.corForma, f.corManual],
+      t: f.tipo, m: f.misto, s: f.sobra, cr: f.crit, man: f.manual, gt: f.gruposTxt, aj: f.afJanela });
+  }
+  function formarGrupos() {
+    if (ehSS()) return;
+    var base = baseAtual();
+    if (base.length < 30) { alert("Base insuficiente (mínimo ~30 concursos)."); return; }
+    var dados = dadosDezenas(base);
+    var ent = construirEntrada(dados); if (ent.erro) { alert(ent.erro); return; }
+    if (ent.todas.length < 4) { alert("Poucas dezenas de entrada."); return; }
+    var ctx = criarCtx(base, ent.todas);
+    var r = agrupar(ctx, ent);
+    if (r.erro) { alert(r.erro); return; }
+    if (r.resto && r.resto.length) ent.avulsa = uniq(ent.avulsa.concat(r.resto));
+    IR.ent = ent; IR.ctx = ctx; IR.grupos = r.grupos; IR.chaveGrupos = chaveConfig();
+    IR.jogos = null; IR.meta = null; IR.teste = null; IR.sel = null;
+    renderTudo();
+  }
+
+  /* ---------------- montagem dos jogos ---------------- */
+  function seletorAvulsa(ent, ctx, f) {
+    var uso = {}, uni = universo(), stf = function (d) { return (ctx.dados[d] || {}).stf || 0; }, lista = null;
+    if (f.avulsa === "manual") lista = uniq(nums(f.avulsaManual));
+    else if (f.avulsa === "coringa") {
+      lista = uniq(ent.avulsa.concat(ent.coringasTodas || []));
+      if (!lista.length) {
+        var s = {}; ent.todas.forEach(function (d) { s[d] = 1; });
+        lista = uni.filter(function (d) { return !s[d]; }).sort(function (a, b) { return stf(b) - stf(a); }).slice(0, 10);
+      }
+    }
+    return function (jogoSet, qtd) {
+      var out = [];
+      for (var q = 0; q < qtd; q++) {
+        var livre = function (d) { return !jogoSet[d] && out.indexOf(d) < 0; }, cand;
+        if (lista && lista.length) cand = lista.filter(livre).sort(function (a, b) { return (uso[a] || 0) - (uso[b] || 0); });
+        else cand = ent.todas.filter(livre).sort(function (a, b) { return stf(b) - stf(a); });
+        if (!cand.length) cand = uni.filter(livre).sort(function (a, b) { return stf(b) - stf(a); });
+        if (!cand.length) break;
+        out.push(cand[0]); uso[cand[0]] = (uso[cand[0]] || 0) + 1;
+      }
+      return out;
+    };
+  }
+  function* combos(n, k) {
+    if (k > n || k < 0) return;
+    if (k === 0) { yield []; return; }
+    var idx = []; for (var i = 0; i < k; i++) idx.push(i);
+    while (true) {
+      yield idx.slice();
+      var p = k - 1; while (p >= 0 && idx[p] === n - k + p) p--;
+      if (p < 0) return;
+      idx[p]++; for (var j = p + 1; j < k; j++) idx[j] = idx[j - 1] + 1;
+    }
+  }
+  function gerarJogos(grupos, ent, ctx, f, cap) {
+    var A = Number(f.A), maxCor = Math.max(0, Number(f.corMax) || 0), G = grupos.length;
+    var sizes = grupos.map(function (g) { return g.d.length; });
+    var homog = sizes.every(function (s) { return s === sizes[0]; }), g0 = sizes[0] || 2;
+    var k = homog ? Math.floor(A / g0) : null;
+    if (homog && k < 1) return { erro: "O jogo (" + A + " dezenas) é menor que o grupo (" + g0 + ")." };
+    var jogos = [], vistos = {}, sel = seletorAvulsa(ent, ctx, f), truncado = false;
+    var lim = Number(f.limite) > 0 ? Number(f.limite) : cap;
+
+    function addJogo(idx, nav) {
+      var set = {}, d = [];
+      idx.forEach(function (i) { grupos[i].d.forEach(function (x) { if (!set[x]) { set[x] = 1; d.push(x); } }); });
+      var av = nav > 0 ? sel(set, nav) : [];
+      av.forEach(function (x) { set[x] = 1; d.push(x); });
+      d.sort(function (a, b) { return a - b; });
+      var key = d.join(",");
+      if (vistos[key] || d.length !== A) return false;
+      vistos[key] = 1;
+      jogos.push({ d: d, grupos: idx.slice(), av: av });
+      return true;
+    }
+
+    if (f.modo === "completo") {
+      if (homog) {
+        var it = combos(G, k), r;
+        while (!(r = it.next()).done) {
+          var nc = 0; r.value.forEach(function (i) { if (grupos[i].temCor) nc++; });
+          if (nc > maxCor) continue;
+          addJogo(r.value, A - k * g0);
+          if (jogos.length >= lim) { truncado = !it.next().done; break; }
+        }
+      } else {
+        var T = [], D = [];
+        grupos.forEach(function (g, i) { (g.d.length === 3 ? T : D).push(i); });
+        var pares = [], melhorFill = -1;
+        for (var a = 0; 3 * a <= A; a++) for (var b = 0; 3 * a + 2 * b <= A; b++) {
+          var fill = 3 * a + 2 * b;
+          if (a > T.length || b > D.length || (a + b) === 0) continue;
+          if (fill > melhorFill) { melhorFill = fill; pares = [[a, b]]; } else if (fill === melhorFill) pares.push([a, b]);
+        }
+        fora:
+        for (var pi = 0; pi < pares.length; pi++) {
+          var ta = combos(T.length, pares[pi][0]), rt;
+          while (!(rt = ta.next()).done) {
+            var tb = combos(D.length, pares[pi][1]), rd;
+            while (!(rd = tb.next()).done) {
+              var idx = rt.value.map(function (x) { return T[x]; }).concat(rd.value.map(function (x) { return D[x]; }));
+              var nc2 = 0; idx.forEach(function (i) { if (grupos[i].temCor) nc2++; });
+              if (nc2 > maxCor) continue;
+              addJogo(idx, A - melhorFill);
+              if (jogos.length >= lim) { truncado = true; break fora; }
+            }
+          }
+        }
+      }
+    } else {
+      var reps = Math.max(1, Number(f.rep) || 1), uso = rep(0, G), junto = {};
+      var conta = function (i) { return !(grupos[i].temCor && maxCor === 0); };
+      var falta = function () { for (var i = 0; i < G; i++) if (conta(i) && uso[i] < reps) return true; return false; };
+      var alvo = Number(f.limite) > 0 ? Number(f.limite) : Infinity, guard = 0;
+      while (guard++ < 20000 && jogos.length < alvo) {
+        if (!falta() && !(Number(f.limite) > 0)) break;
+        var s = [], tam = 0, nc3 = 0;
+        while (true) {
+          var best = -1, bk = Infinity;
+          for (var i = 0; i < G; i++) {
+            if (s.indexOf(i) >= 0) continue;
+            var gi = grupos[i], sz = gi.d.length;
+            if (tam + sz > A) continue;
+            if (homog && s.length >= k) continue;
+            if (gi.temCor && nc3 >= maxCor) continue;
+            var pen = 0; s.forEach(function (x) { pen += junto[x < i ? x + "-" + i : i + "-" + x] || 0; });
+            var key = uso[i] * 1000 + pen * 10 - gi.score / 100;
+            if (key < bk) { bk = key; best = i; }
+          }
+          if (best < 0) break;
+          s.push(best); tam += grupos[best].d.length; if (grupos[best].temCor) nc3++;
+          if (tam === A || (homog && s.length === k)) break;
+        }
+        if (!s.length) break;
+        var ok = addJogo(s, A - tam);
+        s.forEach(function (x) { uso[x]++; });
+        for (var p1 = 0; p1 < s.length; p1++) for (var p2 = p1 + 1; p2 < s.length; p2++) {
+          var a1 = Math.min(s[p1], s[p2]), b1 = Math.max(s[p1], s[p2]); junto[a1 + "-" + b1] = (junto[a1 + "-" + b1] || 0) + 1;
+        }
+        if (!ok && !falta()) break;
+      }
+    }
+    return { jogos: jogos, truncado: truncado, homog: homog, g0: g0, k: k };
+  }
+
+  /* ---------------- contagem ao vivo ---------------- */
+  function contagem() {
+    var f = IR.f, m = M(), A = Number(f.A), info = {};
+    var formado = IR.grupos && chaveConfig() === IR.chaveGrupos;
+    var maxCor = Math.max(0, Number(f.corMax) || 0), G, cG, T = 0, D = 0, homog, g0, sobra = 0, nEnt;
+    if (formado) {
+      G = IR.grupos.length; cG = IR.grupos.filter(function (g) { return g.temCor; }).length;
+      IR.grupos.forEach(function (g) { if (g.d.length === 3) T++; else D++; });
+      homog = !(T && D); g0 = T && !D ? 3 : 2; nEnt = IR.ent.todas.length;
+    } else {
+      var o = rrDaOrigem(f), nRR = o.erro ? 0 : o.lista.length;
+      var forma = f.corOn ? f.corForma : "mista", nCor = f.corOn ? Number(f.corQtd) || 0 : 0;
+      var g = f.tipo === "triplas" ? 3 : 2, corAgr = forma === "avulsa" ? 0 : nCor, corIso = 0;
+      if (f.corOn && forma === "isolada") corAgr -= corAgr % g;
+      var n = forma === "mista" ? nRR + corAgr : nRR;
+      nEnt = nRR + nCor;
+      if (f.manual) {
+        var linhas = String(f.gruposTxt || "").split(/\r?\n/).map(nums).filter(function (x) { return x.length; });
+        T = linhas.filter(function (x) { return x.length === 3; }).length; D = linhas.length - T;
+        G = T + D; cG = 0; homog = !(T && D); g0 = T && !D ? 3 : 2;
+      } else if (f.tipo === "misto") {
+        var ops = opcoesMisto(n), op = ops.filter(function (x) { return x.t + "-" + x.d === f.misto; })[0] || ops[0];
+        if (op) { T = op.t; D = op.d; } else { D = Math.floor(n / 2); sobra = n % 2; }
+        G = T + D; homog = false; g0 = 2;
+        cG = (f.corOn && forma === "mista") ? corAgr : 0;
+      } else {
+        G = Math.floor(n / g); sobra = n % g; g0 = g; homog = true;
+        if (g === 3) T = G; else D = G;
+        if (sobra && f.sobra === "coringa") { G += 1; sobra = 0; }
+        if (f.corOn && forma === "isolada") { corIso = corAgr / g; G += corIso; cG = corIso; }
+        else cG = (f.corOn && forma === "mista") ? corAgr : 0;
+      }
+    }
+    var k = homog ? Math.floor(A / g0) : null, av = homog ? A - k * g0 : 0, completos = 0;
+    if (homog && k > 0) { for (var j = 0; j <= Math.min(maxCor, cG, k); j++) completos += C(cG, j) * C(G - cG, k - j); }
+    else if (!homog) { for (var a = 0; 3 * a <= A; a++) { var rb = A - 3 * a; if (rb % 2 === 0) completos += C(T, a) * C(D, rb / 2); } }
+    var cob = function (r) {
+      if (homog && k > 0) { var lb = Math.ceil(G * r / k); if (cG > 0 && maxCor > 0) lb = Math.max(lb, Math.ceil(cG * r / maxCor)); return lb; }
+      return Math.ceil((3 * T + 2 * D) * r / Math.max(1, A));
+    };
+    var unit = (typeof mplCustoDoJogo === "function") ? mplCustoDoJogo(A, m) : null;
+    return { formado: formado, nEnt: nEnt, G: G, cG: cG, T: T, D: D, homog: homog, g0: g0, k: k, av: av, sobra: sobra,
+             completos: completos, cob1: cob(1), cobR: cob(Math.max(1, Number(f.rep) || 1)), unit: unit };
+  }
+
+  /* ---------------- teste no passado ---------------- */
+  function sorteiosDe(c) {
+    var d1 = (c.dezenas || []).map(Number);
+    if (!ehDS()) return [d1];
+    var d2 = c.dezenas2 ? c.dezenas2.map(Number) : null, s = IR.f.tSorteio;
+    if (s === "2") return d2 ? [d2] : [];
+    if (s === "melhor") return d2 ? [d1, d2] : [d1];
+    return [d1];
+  }
+  function melhorAcerto(jogos, draws) {
+    var best = 0;
+    jogos.forEach(function (j) {
+      var s = {}; j.forEach(function (d) { s[d] = 1; });
+      draws.forEach(function (dz) { var h = 0; dz.forEach(function (d) { if (s[d]) h++; }); if (h > best) best = h; });
+    });
+    return best;
+  }
+  function aleatorios(pool, qtd, A) {
+    var out = [];
+    for (var i = 0; i < qtd; i++) out.push(shuffle(pool.slice()).slice(0, A));
+    return out;
+  }
+  function rodarTeste() {
+    if (IR.testando) return;
+    if (!IR.jogos || !IR.jogos.length) { alert("Gere os jogos primeiro."); return; }
+    var base = baseAtual(), f = IR.f, N = Math.max(5, Number(f.tN) || 100), A = Number(f.A);
+    var honesto = f.tModo === "honesto";
+    if (honesto && N > 60 && !confirm("O modo honesto refaz os grupos a cada concurso e é lento. Rodar " + N + " concursos?")) return;
+    var idxs = []; for (var i = Math.max(30, base.length - N); i < base.length; i++) idxs.push(i);
+    var qtd = IR.jogos.length, jogosAtuais = IR.jogos.map(function (j) { return j.d; });
+    var pool = IR.ent.todas.length >= A ? IR.ent.todas : universo();
+    var res = { n: 0, somaM: 0, somaA: 0, distM: {}, distA: {}, modo: f.tModo };
+    IR.testando = true; IR.cancelar = false; IR.teste = null; renderResultado();
+    var p = 0;
+    function passo() {
+      if (IR.cancelar) { IR.testando = false; renderResultado(); return; }
+      var t0 = performance.now();
+      while (p < idxs.length && performance.now() - t0 < 40) {
+        var c = base[idxs[p]], draws = sorteiosDe(c);
+        if (draws.length) {
+          var js = jogosAtuais, poolT = pool;
+          if (honesto) {
+            try {
+              var hist = base.slice(0, idxs[p]), dados = dadosDezenas(hist);
+              var ent = construirEntrada(dados);
+              if (!ent.erro) {
+                var ctx = criarCtx(hist, ent.todas), gr = agrupar(ctx, ent);
+                if (!gr.erro) { var gj = gerarJogos(gr.grupos, ent, ctx, f, 3000); if (!gj.erro && gj.jogos.length) js = gj.jogos.map(function (j) { return j.d; }); }
+                poolT = ent.todas.length >= A ? ent.todas : universo();
+              }
+            } catch (e) { console.warn("Irineu teste honesto:", e); }
+          }
+          var bm = melhorAcerto(js, draws), ba = 0, TR = 15;
+          for (var t = 0; t < TR; t++) ba += melhorAcerto(aleatorios(poolT, js.length || qtd, A), draws);
+          ba /= TR;
+          res.n++; res.somaM += bm; res.somaA += ba;
+          res.distM[bm] = (res.distM[bm] || 0) + 1;
+          var bar = Math.round(ba); res.distA[bar] = (res.distA[bar] || 0) + 1;
+        }
+        p++;
+        if (honesto) break;
+      }
+      var pg = document.getElementById("ir_tprog");
+      if (pg) pg.textContent = "Concurso " + p + " de " + idxs.length + "…";
+      if (p < idxs.length) setTimeout(passo, 0);
+      else { IR.testando = false; IR.teste = res; renderResultado(); }
+    }
+    setTimeout(passo, 20);
+  }
+
+  /* ---------------- ações ---------------- */
+  function gerar() {
+    if (ehSS()) return;
+    if (!IR.grupos || chaveConfig() !== IR.chaveGrupos) {
+      formarGrupos();
+      if (!IR.grupos || chaveConfig() !== IR.chaveGrupos) return;
+    }
+    var f = IR.f, m = M(), A = Number(f.A);
+    var min = m.apostaMinima || m.dezenasSorteadas, max = m.apostaMaxima || m.dezenasSorteadas;
+    if (A < min || A > max) { alert("Dezenas por jogo deve ficar entre " + min + " e " + max + " nesta modalidade."); return; }
+    var info = contagem();
+    if (f.modo === "completo" && !(Number(f.limite) > 0) && info.completos > 20000 &&
+        !confirm(num(info.completos) + " combinações. Serão geradas no máximo 100.000. Continuar?")) return;
+    var r = gerarJogos(IR.grupos, IR.ent, IR.ctx, f, 100000);
+    if (r.erro) { alert(r.erro); return; }
+    IR.jogos = r.jogos; IR.meta = r; IR.teste = null;
+    renderResultado();
+    var el = document.getElementById("ir_res"); if (el) el.scrollIntoView({ behavior: "smooth", block: "start" });
+  }
+  function enviarRanking() {
+    var js = IR.jogos.map(function (j) { return j.d.slice(); }), ok = false;
+    MPL_STATE.cache.jogos = js; MPL_STATE.cache.jogosAprovados = js.slice(); MPL_STATE.config.A = Number(IR.f.A);
+    try {
+      if (typeof ranquearJogos === "function") {
+        var r = ranquearJogos(js, MPL_STATE.cache.scoresDezenas, MPL_STATE.cache.teia, M(), baseAtual(), MPL_STATE.config.su, MPL_STATE.config.stjPesos);
+        MPL_STATE.cache.ranking = r; MPL_STATE.cache.rankingExibicao = r.slice(); ok = true;
+      }
+    } catch (e) { console.warn("Irineu: ranqueamento falhou", e); }
+    var t = document.querySelector('.tab-btn[data-tab="ranking"]') || document.querySelector('.tab-btn[data-tab="gerador"]');
+    if (t) t.click();
+    setTimeout(function () { if (ok && typeof renderRankingJogos === "function") try { renderRankingJogos(MPL_STATE.cache.rankingExibicao); } catch (e) { } }, 250);
+    alert(js.length + " jogo(s) enviados" + (ok ? " e ranqueados pelo STJ (aba Ranking)." : " ao Gerador.") +
+      "\nUse a Poda & Polimento se quiser filtrar.");
+  }
+  function enviarConferidor() {
+    var js = IR.jogos.map(function (j) { return j.d.slice(); });
+    window.__mplJogosArquivoConferidor = js;
+    var t = document.querySelector('.tab-btn[data-tab*="confer"]'); if (t) t.click();
+    setTimeout(function () {
+      var r = document.querySelector('input[name="confOrigem"][value="arquivo"]');
+      if (r) { r.checked = true; r.dispatchEvent(new Event("change", { bubbles: true })); }
+      var i = document.getElementById("confArquivoInfo");
+      if (i) i.innerHTML = '<span style="color:#10b981;">✓ ' + js.length + ' jogo(s) recebidos do Desdobramento Irineu.</span>';
+    }, 350);
+  }
+  function exportarTXT() {
+    var m = M(), linhas = ["# MPL - Desdobramento Irineu v2", "# Modalidade: " + m.nome, "# Lab Quant - Fechamentos"];
+    IR.jogos.forEach(function (j, i) { linhas.push("Jogo " + pad3(i + 1) + ": " + j.d.map(pad).join(" ")); });
+    var nome = "MPL_IRINEU_" + (m.sigla || "MOD") + "_" + IR.jogos.length + "jogos.txt";
+    if (typeof baixarArquivo === "function") baixarArquivo(linhas.join("\n"), nome, "text/plain");
+    else { var a = document.createElement("a"); a.href = URL.createObjectURL(new Blob([linhas.join("\n")], { type: "text/plain" })); a.download = nome; a.click(); }
+  }
+  function lerPresets() { try { return JSON.parse(localStorage.getItem(PRESETS_KEY) || "[]"); } catch (e) { return []; } }
+  function salvarPresetIrineu() {
+    var nome = prompt("Nome do preset Irineu:", "Irineu · " + (M().sigla || M().nome) + " · " + IR.f.tipo);
+    if (!nome) return;
+    var l = lerPresets();
+    l.push({ id: "ir_" + Date.now(), nome: nome, modalidade: M().presetKey, criadoEm: new Date().toISOString(), f: JSON.parse(JSON.stringify(IR.f)) });
+    try { localStorage.setItem(PRESETS_KEY, JSON.stringify(l)); alert("Preset salvo."); renderTudo(); }
+    catch (e) { alert("Não foi possível salvar: " + e.message); }
+  }
+  function aplicarPresetIrineu(id) {
+    var p = lerPresets().filter(function (x) { return x.id === id; })[0]; if (!p) return;
+    var base = padraoForm(), merged = JSON.parse(JSON.stringify(p.f));
+    Object.keys(base).forEach(function (k) { if (merged[k] == null) merged[k] = base[k]; });
+    IR.f = merged; IR.grupos = IR.jogos = IR.meta = IR.teste = IR.chaveGrupos = null;
+    renderTudo();
+  }
+  function apagarPresetIrineu(id) {
+    if (!confirm("Apagar este preset?")) return;
+    localStorage.setItem(PRESETS_KEY, JSON.stringify(lerPresets().filter(function (x) { return x.id !== id; })));
+    renderTudo();
+  }
+
+  /* ---------------- RENDER ---------------- */
+  function radio(nome, path, val, rotulo, re) {
+    return '<label style="display:inline-flex;align-items:center;gap:5px;margin:0 14px 6px 0;font-size:12.5px;">' +
+      '<input type="radio" name="' + nome + '" value="' + val + '" data-ir="' + path + '"' + (re ? " data-ir-re" : "") +
+      (getPath(IR.f, path) === val ? " checked" : "") + ' style="width:auto;margin:0;">' + rotulo + '</label>';
+  }
+  function chk(path, rotulo, re) {
+    return '<label style="display:inline-flex;align-items:center;gap:5px;margin:0 14px 6px 0;font-size:12.5px;">' +
+      '<input type="checkbox" data-ir="' + path + '"' + (re ? " data-ir-re" : "") + (getPath(IR.f, path) ? " checked" : "") +
+      ' style="width:auto;margin:0;">' + rotulo + '</label>';
+  }
+  function inp(path, rotulo, tipo, extra) {
+    return '<div><label>' + rotulo + '</label><input type="' + (tipo || "number") + '" data-ir="' + path + '" value="' +
+      String(getPath(IR.f, path)).replace(/"/g, "&quot;") + '" ' + (extra || "") + '></div>';
+  }
+  function card(l, v, c) {
+    return '<div class="stat-card"' + (c ? ' style="border-top:3px solid ' + c + ';"' : '') + '><div class="label">' + l + '</div><div class="value">' + v + '</div></div>';
+  }
+
+  function renderTudo() {
+    var el = document.getElementById("lqIrineu");
+    if (!el || !IR.ativo) return;
+    if (!garantirForm()) { el.innerHTML = '<div class="card"><p class="muted">Escolha uma modalidade primeiro.</p></div>'; return; }
+    var m = M(), f = IR.f, c = corMod();
+    var head = '<div class="card"><h3 style="margin:0 0 4px;">🔗 Fechamentos — Desdobramento Irineu v2</h3>' +
+      '<p class="muted" style="margin:0;">Agrupa as dezenas em duplas ou triplas exclusivas e monta jogos combinando grupos inteiros. ' +
+      'Reduz drasticamente o volume; o acerto depende de como as sorteadas caem nos grupos.</p></div>';
+    if (ehSS()) { el.innerHTML = head + '<div class="card"><div class="info-box">O Desdobramento Irineu não se aplica ao Super Sete (estrutura posicional por coluna).</div></div>'; return; }
+
+    /* A · ENTRADA */
+    var o = rrDaOrigem(f);
+    var listaHtml = o.erro ? '<div class="alert alert-warn" style="font-size:12px;">' + o.erro + '</div>'
+      : '<div style="margin:6px 0;line-height:1.9;">' + o.lista.map(function (d) { return '<span class="pill" style="padding:2px 7px;font-size:11px;">' + pad(d) + '</span>'; }).join(" ") + '</div>';
+    var A1 = '<div class="card"><h3 style="margin-top:0;">A · Entrada</h3>' +
+      '<div style="display:inline-block;padding:5px 12px;border-radius:20px;border:1px solid ' + c + ';color:' + c + ';font-weight:700;margin-bottom:10px;">' +
+      m.nome + ' · U=' + m.universo + ' · S=' + m.dezenasSorteadas + '</div>' +
+      '<label>Origem do RR</label><div>' +
+      radio("ir_or", "origem", "radar", "Radar oficial", true) + radio("ir_or", "origem", "target", "Target Lock (RR do alvo)", true) +
+      radio("ir_or", "origem", "manual", "Lista manual / arquivo", true) +
+      '<span class="muted" style="font-size:12px;">NÚCLEO do Ensemble — em breve</span></div>' +
+      (f.origem === "manual"
+        ? '<textarea data-ir="lista" rows="2" style="width:100%;font-family:monospace;" placeholder="Ex.: 01 02 04 05 06 ...">' + f.lista + '</textarea>' +
+          '<input type="file" id="ir_file" accept=".txt,.csv" style="margin-top:4px;">'
+        : '') +
+      '<div class="muted" style="font-size:11.5px;margin-top:6px;">Dezenas do RR: <b>' + (o.lista ? o.lista.length : 0) + '</b>' +
+      (o.lista && f.origem !== "manual" ? ' · #copiar para lista manual (editar)</a>' : '') + '</div>' + listaHtml +
+      '<hr style="border-color:#1c2434;margin:10px 0;">' + chk("corOn", "<b>Incluir coringas (modo híbrido)</b>", true) +
+      (f.corOn ? '<div class="row-flex">' + inp("corQtd", "Quantidade", "number", 'min="0"') + inp("corMax", "Máx. grupos com coringa por jogo", "number", 'min="0"') + '</div>' +
+        '<label>Origem das coringas</label><div>' +
+        radio("ir_co", "corOrigem", "aleatoria", "Aleatória (fora do RR)", true) + radio("ir_co", "corOrigem", "stf", "Por STF (mais fortes fora)", true) +
+        radio("ir_co", "corOrigem", "mat", "Por ausência + ciclo", true) + radio("ir_co", "corOrigem", "manual", "Escolha manual", true) + '</div>' +
+        (f.corOrigem === "manual" ? inp("corManual", "Coringas (fora do RR)", "text", 'placeholder="Ex.: 49 52 58"') : '') +
+        '<label>Forma</label><div>' +
+        radio("ir_cf", "corForma", "mista", "Mista — coringa + dezena do RR (padrão)", true) +
+        radio("ir_cf", "corForma", "isolada", "Isolada — grupos só de coringas", true) +
+        radio("ir_cf", "corForma", "avulsa", "Avulsa — só completa jogos", true) + '</div>' : '') +
+      '</div>';
+
+    /* B · GRUPOS */
+    var soma = 0; CRITS.forEach(function (k) { if (f.crit[k].on) soma += Number(f.crit[k].w) || 0; });
+    var critHtml = CRITS.map(function (k) {
+      return '<div style="display:flex;align-items:center;gap:8px;margin:3px 0;">' +
+        '<input type="checkbox" data-ir="crit.' + k + '.on"' + (f.crit[k].on ? " checked" : "") + ' style="width:auto;margin:0;">' +
+        '<span style="flex:1;font-size:12.5px;">' + NOMES_CRIT[k] + '</span>' +
+        '<input type="number" data-ir="crit.' + k + '.w" value="' + f.crit[k].w + '" min="0" max="100" style="width:80px;margin:0;"> %</div>';
+    }).join("");
+    var nMisto = (function () { var oo = rrDaOrigem(f), n = oo.lista ? oo.lista.length : 0; if (f.corOn && f.corForma === "mista") n += Number(f.corQtd) || 0; return n; })();
+    var opsM = opcoesMisto(nMisto);
+    var B1 = '<div class="card"><h3 style="margin-top:0;">B · Formação dos grupos</h3>' +
+      '<label>Tipo</label><div>' + radio("ir_tp", "tipo", "duplas", "Duplas", true) + radio("ir_tp", "tipo", "triplas", "Triplas", true) +
+      radio("ir_tp", "tipo", "misto", "Misto (triplas + duplas)", true) + '</div>' +
+      (f.tipo === "misto" ? '<label>Combinação do misto</label><select data-ir="misto" data-ir-re>' +
+        (opsM.length ? opsM.map(function (x) { var v = x.t + "-" + x.d; return '<option value="' + v + '"' + (f.misto === v ? " selected" : "") + '>' + x.t + ' triplas + ' + x.d + ' duplas (sem sobra)</option>'; }).join("")
+          : '<option value="">Sem combinação exata para ' + nMisto + ' dezenas</option>') + '</select>' : '') +
+      '<div class="info-box" style="font-size:11.5px;margin:6px 0;">✔ Grupos exclusivos: cada dezena entra em um único grupo e todas as dezenas de entrada são usadas.</div>' +
+      chk("manual", "Montar os grupos manualmente", true) +
+      (f.manual ? '<textarea data-ir="gruposTxt" rows="5" style="width:100%;font-family:monospace;" placeholder="Uma linha por grupo&#10;12 49&#10;04 33&#10;07 15 58">' + f.gruposTxt + '</textarea>'
+        : '<label style="margin-top:8px;">Critérios (combine quantos quiser)</label>' + critHtml +
+          '<div id="ir_wsum" style="font-size:12px;margin:4px 0;"></div>' +
+          '<div class="row-flex">' + inp("afJanela", "Afinidade: concursos considerados (0 = todos)", "number", 'min="0"') + '</div>') +
+      '<button id="ir_formar" class="btn-primary" style="margin-top:8px;">Formar grupos</button>' +
+      '<div id="ir_prev" style="margin-top:10px;"></div></div>';
+
+    /* CONTAGEM */
+    var CT = '<div class="card"><h3 style="margin-top:0;">📐 Contagem</h3><div id="ir_cont"></div></div>';
+
+    /* C · MONTAGEM */
+    var min = m.apostaMinima || m.dezenasSorteadas, max = m.apostaMaxima || m.dezenasSorteadas;
+    var C1 = '<div class="card"><h3 style="margin-top:0;">C · Montagem dos jogos</h3>' +
+      '<div class="row-flex">' + inp("A", "Dezenas por jogo (" + min + " a " + max + ")", "number", 'min="' + min + '" max="' + max + '"') +
+      inp("limite", "Limite de jogos (0 = sem limite)", "number", 'min="0"') + '</div>' +
+      '<label>Quando o jogo não fecha só com grupos, a dezena avulsa vem de</label><div>' +
+      radio("ir_av", "avulsa", "stf", "Maior STF fora do jogo", true) + radio("ir_av", "avulsa", "coringa", "Coringa", true) +
+      radio("ir_av", "avulsa", "manual", "Escolha manual", true) + '</div>' +
+      (f.avulsa === "manual" ? inp("avulsaManual", "Dezenas avulsas", "text", 'placeholder="Ex.: 10 20 30"') : '') +
+      '<label>Modo</label><div>' + radio("ir_md", "modo", "completo", "Combinações completas", true) +
+      radio("ir_md", "modo", "cobertura", "Cobertura mínima — todos os grupos aparecem", true) + '</div>' +
+      (f.modo === "cobertura" ? '<div class="row-flex">' + inp("rep", "Cada grupo aparece pelo menos (vezes)", "number", 'min="1"') + '</div>' : '') +
+      '<button id="ir_gerar" class="btn-primary" style="margin-top:8px;">▶ Gerar jogos</button></div>';
+
+    /* PRESETS */
+    var pres = lerPresets().filter(function (p) { return p.modalidade === m.presetKey; });
+    var P1 = '<div class="card"><h3 style="margin-top:0;">💾 Presets Irineu</h3>' +
+      '<button id="ir_psalvar" class="btn-secondary" style="margin:0 0 8px;">Salvar configuração atual</button>' +
+      (pres.length ? pres.map(function (p) {
+        return '<div style="display:flex;gap:6px;align-items:center;margin:4px 0;"><span style="flex:1;font-size:12.5px;">' + p.nome + '</span>' +
+          '<button class="btn-secondary" data-irpa="' + p.id + '" style="margin:0;font-size:11px;padding:4px 10px;">Aplicar</button>' +
+          '<button class="btn-danger" data-irpd="' + p.id + '" style="margin:0;font-size:11px;padding:4px 8px;">✕</button></div>';
+      }).join("") : '<p class="muted" style="font-size:12px;">Nenhum preset salvo para esta modalidade.</p>') + '</div>';
+
+    el.innerHTML = head + A1 + B1 + CT + C1 + '<div id="ir_res"></div>' + P1;
+    ligar(); atualizarVivo(); renderResultado();
+  }
+
+  function htmlPreview() {
+    if (!IR.grupos) return '<p class="muted" style="font-size:12px;">Clique em "Formar grupos" para ver a prévia.</p>';
+    var stale = chaveConfig() !== IR.chaveGrupos;
+    var cs = {}, ex = {};
+    IR.ent.cor.forEach(function (d) { cs[d] = 1; }); (IR.ent.extras || []).forEach(function (d) { ex[d] = 1; });
+    var media = IR.grupos.reduce(function (s, g) { return s + g.score; }, 0) / IR.grupos.length;
+    return (stale ? '<div class="alert alert-warn" style="font-size:12px;">A configuração mudou depois da formação. Clique em "Formar grupos" de novo.</div>' : '') +
+      '<div class="muted" style="font-size:11px;margin-bottom:6px;">' + IR.grupos.length + ' grupos · nota média ' + media.toFixed(0) +
+      ' · clique numa dezena e depois noutra (de outro grupo) para trocá-las · ★ coringa · ☆ adicionada para fechar sobra</div>' +
+      '<div style="display:flex;flex-wrap:wrap;gap:6px;">' + IR.grupos.map(function (g, i) {
+        var c = hue(i);
+        return '<div style="border:1px solid ' + c + ';border-radius:8px;padding:4px 7px;font-size:12px;">' +
+          '<b style="color:' + c + ';">' + (g.d.length === 3 ? "T" : "D") + pad(i + 1) + '</b> ' +
+          g.d.map(function (d) {
+            var s = IR.sel && IR.sel.g === i && IR.sel.d === d;
+            return '<span data-irg="' + i + '" data-ird="' + d + '" style="cursor:pointer;padding:1px 4px;border-radius:4px;' + (s ? 'background:#334155;outline:1px solid #fff;' : '') + '">' +
+              pad(d) + (cs[d] ? "★" : "") + (ex[d] ? "☆" : "") + '</span>';
+          }).join("") + ' <span class="muted" style="font-size:10px;">' + g.score.toFixed(0) + '</span></div>';
+      }).join("") + '</div>' +
+      (IR.ent.avulsa.length ? '<div class="muted" style="font-size:11.5px;margin-top:6px;">Avulsas (fora dos grupos): ' + IR.ent.avulsa.map(pad).join(" ") + '</div>' : '') +
+      (IR.ent.descart.length ? '<div class="muted" style="font-size:11.5px;">Descartadas (sobra, menor STF): ' + IR.ent.descart.map(pad).join(" ") + '</div>' : '');
+  }
+
+  function atualizarVivo() {
+    var f = IR.f;
+    var ws = document.getElementById("ir_wsum");
+    if (ws) {
+      var s = 0; CRITS.forEach(function (k) { if (f.crit[k].on) s += Number(f.crit[k].w) || 0; });
+      ws.innerHTML = s === 100 ? '<span style="color:#10b981;">Soma: 100% ✓</span>'
+        : '<span style="color:#eab308;">Soma: ' + s + '% — os pesos serão usados proporcionalmente.</span>';
+    }
+    var pv = document.getElementById("ir_prev"); if (pv) pv.innerHTML = htmlPreview();
+    var el = document.getElementById("ir_cont"); if (!el) return;
+    var i = contagem(), A = Number(f.A);
+    var porJogo = i.homog ? (i.k + (i.g0 === 3 ? " triplas" : " duplas") + (i.av ? " + " + i.av + " avulsa(s)" : ""))
+      : "triplas + duplas somando " + A;
+    var custo = function (n) { return i.unit != null ? fmt(n * i.unit) : "—"; };
+    var aviso = "";
+    if (i.sobra > 0) aviso = '<div class="alert alert-warn" style="font-size:12px;margin-top:8px;">⚠ Sobra de ' + i.sobra + ' dezena(s). O que fazer?<div style="margin-top:6px;">' +
+      radio("ir_sb", "sobra", "descartar", "Descartar a de menor STF", true) + radio("ir_sb", "sobra", "avulsa", "Tornar avulsa", true) +
+      radio("ir_sb", "sobra", "coringa", "Adicionar dezena(s) para fechar", true) + '</div></div>';
+    el.innerHTML = '<div class="grid-cards">' +
+      card("Dezenas de entrada", i.nEnt) +
+      card("Grupos", i.G + (i.T && i.D ? " (" + i.T + "T + " + i.D + "D)" : "") + (i.cG ? " · " + i.cG + " c/ coringa" : "")) +
+      card("Por jogo (" + A + ")", porJogo) +
+      card("Combinações completas", num(i.completos), i.completos > 20000 ? "#eab308" : null) +
+      card("Cobertura mínima 1×", num(i.cob1) + " jogos") +
+      (Number(f.rep) > 1 ? card("Cobertura mínima " + f.rep + "×", num(i.cobR) + " jogos") : "") +
+      card("Custo — completo", custo(i.completos)) +
+      card("Custo — cobertura", custo(i.cobR)) + '</div>' +
+      (i.unit == null ? '<div class="muted" style="font-size:11px;">Custo indisponível (módulo de preços não carregado).</div>' : '') +
+      (!i.formado ? '<div class="muted" style="font-size:11px;margin-top:4px;">Estimativa antes de formar os grupos.</div>' : '') +
+      aviso;
+    ligar();
+  }
+
+  function renderResultado() {
+    var el = document.getElementById("ir_res"); if (!el) return;
+    if (!IR.jogos) { el.innerHTML = ""; return; }
+    var j = IR.jogos, m = M(), A = Number(IR.f.A), c = corMod(), meta = IR.meta || {};
+    var unit = (typeof mplCustoDoJogo === "function") ? mplCustoDoJogo(A, m) : null;
+    var cs = {}; IR.ent.cor.forEach(function (d) { cs[d] = 1; });
+    var usoG = rep(0, IR.grupos.length), dez = {};
+    j.forEach(function (x) { x.grupos.forEach(function (g) { usoG[g]++; }); x.d.forEach(function (d) { dez[d] = 1; }); });
+    var usados = usoG.filter(function (u) { return u > 0; }).length;
+    var minU = Math.min.apply(null, usoG), maxU = Math.max.apply(null, usoG);
+
+    var g0 = meta.g0 || 2, k = meta.k;
+    var garantia;
+    if (meta.homog && IR.f.modo === "completo" && !meta.truncado)
+      garantia = 'Modo completo: <b>se</b> as sorteadas completarem x grupos inteiros (até ' + k + '), algum jogo contém esses x grupos → pelo menos ' + g0 + '·x acertos.';
+    else if (IR.f.modo === "completo" && meta.truncado)
+      garantia = 'Lista truncada pelo limite: a garantia do modo completo <b>não vale</b>.';
+    else
+      garantia = 'Cobertura mínima: <b>se</b> ao menos 1 grupo sair inteiro, algum jogo contém esse grupo → pelo menos ' + g0 + ' acertos.';
+    garantia += ' Se as sorteadas caírem espalhadas pelos grupos, não há garantia.';
+    if (Number(IR.f.corMax) === 0 && IR.grupos.some(function (g) { return g.temCor; }))
+      garantia += ' Grupos com coringa ficaram de fora (máximo por jogo = 0).';
+
+    var lista = j.slice(0, 200).map(function (x, ix) {
+      return '<div style="font-size:12px;margin:3px 0;"><b style="display:inline-block;width:44px;">J' + pad3(ix + 1) + '</b>' +
+        x.grupos.map(function (gi) {
+          var cc = hue(gi);
+          return '<span style="border:1px solid ' + cc + ';border-radius:5px;padding:1px 5px;margin-right:4px;color:' + cc + ';">' +
+            IR.grupos[gi].d.map(function (d) { return pad(d) + (cs[d] ? "★" : ""); }).join("·") + '</span>';
+        }).join("") +
+        x.av.map(function (d) { return '<span style="border:1px dashed #64748b;border-radius:5px;padding:1px 5px;margin-right:4px;color:#cbd5e1;">' + pad(d) + '</span>'; }).join("") + '</div>';
+    }).join("");
+
+    var T = IR.teste, testeHtml;
+    if (IR.testando) testeHtml = '<div class="muted" id="ir_tprog">Iniciando…</div><button id="ir_tcancel" class="btn-danger" style="margin-top:6px;">Cancelar</button>';
+    else if (T && T.n) {
+      var S = m.dezenasSorteadas, ks = {};
+      Object.keys(T.distM).concat(Object.keys(T.distA)).forEach(function (x) { ks[x] = 1; });
+      var linhas = Object.keys(ks).map(Number).sort(function (a, b) { return b - a; }).map(function (h) {
+        return '<tr><td>' + h + ' acertos</td><td>' + ((T.distM[h] || 0) / T.n * 100).toFixed(1) + '%</td><td>' + ((T.distA[h] || 0) / T.n * 100).toFixed(1) + '%</td></tr>';
+      }).join("");
+      var mm = T.somaM / T.n, ma = T.somaA / T.n, cor2 = mm > ma + 0.05 ? "#10b981" : (mm < ma - 0.05 ? "#ef4444" : "#eab308");
+      testeHtml = '<div style="font-size:13px;margin-bottom:6px;">Melhor jogo por concurso (' + T.n + ' concursos): <b style="color:' + cor2 + ';">' + mm.toFixed(2) +
+        '</b> acertos · mesmo nº de jogos ao acaso, com as mesmas dezenas: <b>' + ma.toFixed(2) + '</b></div>' +
+        '<div class="table-wrap" style="max-height:220px;"><table style="font-size:12px;"><tr><th>Melhor jogo</th><th>Irineu</th><th>Acaso</th></tr>' + linhas + '</table></div>' +
+        '<p class="muted" style="font-size:11px;">' + (T.modo === "rapido"
+          ? 'Modo rápido: usa os grupos atuais em concursos passados. Como os grupos foram formados com dados que já incluem esses concursos, o resultado tende a ser <b>otimista</b>.'
+          : 'Modo honesto: refaz coringas, grupos e jogos a cada concurso usando só o histórico anterior. É o resultado mais confiável.') + '</p>';
+    } else testeHtml = '<p class="muted" style="font-size:12px;">Compare o melhor jogo de cada concurso com o mesmo número de jogos montados ao acaso.</p>';
+
+    el.innerHTML = '<div class="card"><h3 style="margin-top:0;">D · Resultado</h3>' +
+      '<div class="grid-cards">' +
+      card("Jogos", num(j.length) + (meta.truncado ? " (truncado)" : ""), c) +
+      card("Custo total", unit != null ? fmt(j.length * unit) : "—") +
+      card("Dezenas cobertas", Object.keys(dez).length + " / " + IR.ent.todas.length) +
+      card("Grupos usados", usados + " / " + IR.grupos.length + " (" + minU + "× a " + maxU + "×)") + '</div>' +
+      '<div class="info-box" style="font-size:12px;margin:8px 0;">' + garantia + '</div>' +
+      '<div style="max-height:360px;overflow:auto;border:1px solid #1c2434;border-radius:8px;padding:6px 8px;">' + lista + '</div>' +
+      (j.length > 200 ? '<div class="muted" style="font-size:11px;">Exibindo 200 de ' + num(j.length) + ' jogos. Use Exportar para a lista completa.</div>' : '') +
+      '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px;">' +
+      '<button id="ir_rank" class="btn-primary" style="margin:0;">➜ Enviar ao Ranking</button>' +
+      '<button id="ir_conf" class="btn-secondary" style="margin:0;">➜ Enviar ao Conferidor</button>' +
+      '<button id="ir_txt" class="btn-secondary" style="margin:0;">Exportar TXT</button></div>' +
+      '<h4 style="margin:16px 0 6px;">🔁 Teste no passado</h4>' +
+      '<div class="row-flex">' + inp("tN", "Últimos N concursos", "number", 'min="5"') +
+      '<div><label>Modo</label><select data-ir="tModo"><option value="rapido"' + (IR.f.tModo === "rapido" ? " selected" : "") + '>Rápido (grupos atuais)</option>' +
+      '<option value="honesto"' + (IR.f.tModo === "honesto" ? " selected" : "") + '>Honesto (refaz a cada concurso — lento)</option></select></div>' +
+      (ehDS() ? '<div><label>Sorteio</label><select data-ir="tSorteio"><option value="1"' + (IR.f.tSorteio === "1" ? " selected" : "") + '>1º</option>' +
+        '<option value="2"' + (IR.f.tSorteio === "2" ? " selected" : "") + '>2º</option><option value="melhor"' + (IR.f.tSorteio === "melhor" ? " selected" : "") + '>Melhor dos dois</option></select></div>' : '') +
+      '</div><button id="ir_teste" class="btn-secondary" style="margin:6px 0;"' + (IR.testando ? " disabled" : "") + '>▶ Rodar teste</button>' +
+      '<div>' + testeHtml + '</div></div>';
+    ligar();
+  }
+
+  /* ---------------- eventos ---------------- */
+  function ligar() {
+    var root = document.getElementById("lqIrineu"); if (!root) return;
+    root.querySelectorAll("[data-ir]").forEach(function (el) {
+      if (el.__b) return; el.__b = true;
+      var ev = (el.type === "checkbox" || el.type === "radio" || el.tagName === "SELECT") ? "change" : "input";
+      el.addEventListener(ev, function () {
+        var p = el.getAttribute("data-ir"), v;
+        if (el.type === "checkbox") v = el.checked;
+        else if (el.type === "radio") { if (!el.checked) return; v = el.value; }
+        else if (el.type === "number") v = Number(el.value) || 0;
+        else v = el.value;
+        setPath(IR.f, p, v);
+        if (el.hasAttribute("data-ir-re")) renderTudo(); else atualizarVivo();
+      });
+    });
+    var on = function (id, fn) { var b = document.getElementById(id); if (b && !b.__b) { b.__b = true; b.addEventListener("click", fn); } };
+    on("ir_formar", function () { var b = document.getElementById("ir_formar"); b.textContent = "Formando…"; b.disabled = true; setTimeout(formarGrupos, 30); });
+    on("ir_gerar", function () { var b = document.getElementById("ir_gerar"); b.textContent = "Gerando…"; b.disabled = true; setTimeout(function () { gerar(); var bb = document.getElementById("ir_gerar"); if (bb) { bb.textContent = "▶ Gerar jogos"; bb.disabled = false; } }, 30); });
+    on("ir_rank", enviarRanking);
+    on("ir_conf", enviarConferidor);
+    on("ir_txt", exportarTXT);
+    on("ir_teste", rodarTeste);
+    on("ir_tcancel", function () { IR.cancelar = true; });
+    on("ir_psalvar", salvarPresetIrineu);
+    on("ir_copiar", function (e) { e.preventDefault(); var o = rrDaOrigem(); if (o.lista) { IR.f.lista = o.lista.map(pad).join(" "); IR.f.origem = "manual"; renderTudo(); } });
+    root.querySelectorAll("[data-irpa]").forEach(function (b) { if (!b.__b) { b.__b = true; b.addEventListener("click", function () { aplicarPresetIrineu(b.getAttribute("data-irpa")); }); } });
+    root.querySelectorAll("[data-irpd]").forEach(function (b) { if (!b.__b) { b.__b = true; b.addEventListener("click", function () { apagarPresetIrineu(b.getAttribute("data-irpd")); }); } });
+    var fi = document.getElementById("ir_file");
+    if (fi && !fi.__b) {
+      fi.__b = true;
+      fi.addEventListener("change", function (e) {
+        var file = e.target.files[0]; if (!file) return;
+        var rd = new FileReader();
+        rd.onload = function () { IR.f.lista = uniq(nums(String(rd.result))).map(pad).join(" "); IR.f.origem = "manual"; renderTudo(); };
+        rd.readAsText(file);
+      });
+    }
+  }
+  document.addEventListener("click", function (e) {
+    var s = e.target && e.target.closest ? e.target.closest("[data-irg]") : null;
+    if (!s || !IR.grupos) return;
+    var g = Number(s.getAttribute("data-irg")), d = Number(s.getAttribute("data-ird"));
+    if (!IR.sel) { IR.sel = { g: g, d: d }; }
+    else if (IR.sel.g === g) { IR.sel = null; }
+    else {
+      var A = IR.grupos[IR.sel.g], B = IR.grupos[g], cs = {};
+      IR.ent.cor.forEach(function (x) { cs[x] = 1; });
+      if (!podeTrocar(A, B, IR.sel.d, d, cs)) { alert("Troca não permitida: coringas só trocam entre grupos de coringas, e a regra da forma mista precisa ser mantida."); IR.sel = null; }
+      else {
+        A.d[A.d.indexOf(IR.sel.d)] = d; B.d[B.d.indexOf(d)] = IR.sel.d;
+        [A, B].forEach(function (x) { x.d.sort(function (a, b) { return a - b; }); x.score = nota(IR.ctx, x.d); x.temCor = x.d.some(function (y) { return cs[y]; }); });
+        IR.sel = null; IR.jogos = null; IR.meta = null; IR.teste = null;
+        renderResultado();
+      }
+    }
+    var pv = document.getElementById("ir_prev"); if (pv) pv.innerHTML = htmlPreview();
+  });
+
+  /* ---------------- integração com a aba Lab Quant ---------------- */
+  function botoesNav() {
+    var root = document.getElementById("lqRoot"), out = { oca: null, fech: null };
+    if (!root) return out;
+    root.querySelectorAll("button").forEach(function (b) {
+      var t = b.textContent || "";
+      if (/OCA/.test(t) && !b.id) out.oca = b;
+      if (/Fechamentos/.test(t) && !b.id) out.fech = b;
+    });
+    return out;
+  }
+  function aplicarVis() {
+    var oca = document.getElementById("lqOca"), ir = document.getElementById("lqIrineu"), nb = botoesNav();
+    if (oca) oca.style.display = IR.ativo ? "none" : "";
+    if (ir) ir.style.display = IR.ativo ? "" : "none";
+    if (nb.oca) nb.oca.className = IR.ativo ? "btn-secondary" : "btn-primary";
+    if (nb.fech) nb.fech.className = IR.ativo ? "btn-primary" : "btn-secondary";
+  }
+  function integrar() {
+    var root = document.getElementById("lqRoot"); if (!root) return;
+    var nb = botoesNav(); if (!nb.fech) return;
+    if (!nb.fech.__ir) {
+      nb.fech.__ir = true; nb.fech.disabled = false; nb.fech.style.opacity = ""; nb.fech.style.cursor = "pointer";
+      nb.fech.textContent = "🔗 Fechamentos";
+      nb.fech.addEventListener("click", function () { IR.ativo = true; aplicarVis(); renderTudo(); });
+    }
+    if (nb.oca && !nb.oca.__ir) { nb.oca.__ir = true; nb.oca.addEventListener("click", function () { IR.ativo = false; aplicarVis(); }); }
+    var cont = document.getElementById("lqIrineu");
+    if (!cont) {
+      cont = document.createElement("div"); cont.id = "lqIrineu"; root.appendChild(cont);
+      if (IR.ativo) renderTudo();
+    }
+    aplicarVis();
+  }
+  setInterval(function () {
+    integrar();
+    if (IR.ativo && M() && IR.pk !== M().presetKey && !IR.testando) renderTudo();
+  }, 500);
+
+  console.log("MPL Lab Quant: Fechamentos › Desdobramento Irineu v2 ativo.");
+})();

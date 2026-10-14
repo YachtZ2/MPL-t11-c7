@@ -1,0 +1,480 @@
+/* ============================================================
+   MPL — mpl-cockpit-pesos-fix.js  (arquivo NOVO)
+   ADICIONE no index.html, DEPOIS de mpl-cockpit-pesos.js:
+     <script src="js/mpl-cockpit-pesos-fix.js"></script>
+
+   Corrige dois bugs do ícone "ⓘ" do Cockpit de Pesos:
+   1) O atributo title="O que é isso?" era só a dica nativa do
+      navegador (aparece no hover) e se confundia com a explicação
+      real (que só deveria aparecer no clique) — removido.
+   2) O ícone estava DENTRO do <label> do checkbox do módulo, então
+      clicar nele também alternava o checkbox por engano — o ícone
+      passa a ser um botão independente, fora do label.
+   ============================================================ */
+(function () {
+  "use strict";
+
+  var EXPLICACOES = {
+    SIC: { nome: "SIC — Score Inicial de Camadas", texto: "Mede a presença da dezena em janelas recentes (5, 8, 10, 13, 17 concursos). Aumentar demais faz o radar reagir só ao curtíssimo prazo, ignorando frequência e ciclo de longo prazo — o radar fica \"nervoso\", mudando muito a cada concurso novo. Zerar faz o radar perder sensibilidade a rajadas recentes de uma dezena." },
+    SF: { nome: "SF — Score de Frequência", texto: "Compara a frequência observada com a esperada estatisticamente. Aumentar demais valoriza dezenas \"quentes\" de forma desproporcional. Zerar faz o radar ignorar completamente a frequência histórica." },
+    SA: { nome: "SA — Score de Ausência", texto: "Mede o atraso da dezena sem premiar ausências infinitas. Aumentar demais faz o radar perseguir dezenas atrasadas mesmo sem evidência de que estão \"prestes\" a sair. Zerar remove qualquer efeito de atraso no cálculo." },
+    SC: { nome: "SC — Score de Ciclo", texto: "Mede o ritmo histórico de reaparição da dezena. Aumentar demais faz o radar depender de um padrão cíclico que pode não se repetir. Zerar ignora completamente o ritmo/ciclo." },
+    SRT: { nome: "SRT — Score de Relevância na Teia", texto: "Mede a força relacional da dezena com outras (duplas/triplas que saem juntas historicamente). Aumentar demais faz o radar priorizar dezenas \"bem conectadas\" mesmo que fracas individualmente. Zerar faz o radar ignorar toda relação entre dezenas." },
+    SEI: { nome: "SEI — Score Estrutural Individual", texto: "Mede contribuição estrutural leve (paridade, faixa, extremos). Tem peso baixo por padrão — aumentar muito pode enviesar o radar por características superficiais da dezena, não por evidência estatística real." },
+    SU: { nome: "SU — Score do Usuário", texto: "Reflete suas preferências manuais (fixas, proibidas, preferenciais). Aumentar demais faz o radar refletir mais sua opinião do que o cálculo estatístico — válido se for intencional, mas muda a natureza do método." }
+  };
+
+  function reconstruirLinha(k) {
+    var linhaAntiga = document.getElementById("cockSlider_" + k);
+    if (!linhaAntiga) return;
+    var linhaWrap = linhaAntiga.closest("div").parentElement; // div externo daquele módulo
+    if (!linhaWrap || linhaWrap.__fixado) return;
+    linhaWrap.__fixado = true;
+
+    var labelAntigo = linhaWrap.querySelector("label");
+    if (!labelAntigo) return;
+    var iconeAntigo = labelAntigo.querySelector(".cockInfoBtn");
+    if (iconeAntigo) iconeAntigo.remove(); // tira o ícone de dentro do label
+
+    // cria um botão de ícone NOVO, fora do label, sem title nativo
+    var btnInfo = document.createElement("button");
+    btnInfo.type = "button";
+    btnInfo.className = "cockInfoBtnFix";
+    btnInfo.dataset.score = k;
+    btnInfo.textContent = "ⓘ";
+    btnInfo.style.cssText = "border:1px solid #eab308;background:transparent;color:#eab308;border-radius:50%;width:20px;height:20px;font-size:12px;line-height:1;cursor:pointer;margin-left:6px;";
+    labelAntigo.parentNode.insertBefore(btnInfo, labelAntigo.nextSibling);
+
+    btnInfo.addEventListener("click", function (e) {
+      e.preventDefault();
+      e.stopPropagation();
+      var info = EXPLICACOES[k];
+      var caixa = document.getElementById("cockpitExplicacao");
+      if (!info || !caixa) return;
+      caixa.style.display = "block";
+      caixa.innerHTML = "<b style=\"color:#eab308;\">" + info.nome + "</b><br><span style=\"font-size:12px;\">" + info.texto + "</span>";
+      caixa.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    });
+  }
+
+  function aplicarFix() {
+    ["SIC", "SF", "SA", "SC", "SRT", "SEI", "SU"].forEach(reconstruirLinha);
+  }
+
+  var tentativas = 0;
+  var vigia = setInterval(function () {
+    tentativas++;
+    aplicarFix();
+    if (tentativas > 40) clearInterval(vigia);
+  }, 200);
+})();
+/* ============================================================
+   #pessoal
+   MPL — t11-C6 — Cockpit: ⓘ com popover flutuante (hover + clique)
+   COLE NO FINAL DE js/mpl-cockpit-pesos-fix.js.
+
+   Problemas corrigidos:
+   1) O ⓘ ficava dentro do <label> do checkbox: clicar nele também
+      ligava/desligava o módulo. Agora o clique no ⓘ é interceptado
+      na fase de CAPTURA e nunca chega ao label.
+   2) O texto aparecia abaixo do cockpit, exigindo rolar a página.
+      Agora abre num cartão flutuante ao lado do item, sobre o radar.
+
+   Texto: mantém o ORIGINAL do cockpit sempre que for possível lê-lo;
+   só usa o texto de reserva se não encontrar o original.
+   ============================================================ */
+(function () {
+  "use strict";
+
+  var MODULOS = ["SIC", "SF", "SA", "SC", "SRT", "SEI", "SU"];
+  var OFICIAL = { SIC: 28, SF: 17, SA: 13, SC: 10, SRT: 22, SEI: 5, SU: 5 };
+  var NOMES = {
+    SIC: "Score Inicial de Camadas", SF: "Score de Frequência", SA: "Score de Ausência",
+    SC: "Score de Ciclo", SRT: "Score de Relevância na Teia",
+    SEI: "Score Estrutural Individual", SU: "Score do Usuário"
+  };
+  var DICAS = {
+    SIC: "presença nas janelas recentes", SF: "frequência comparada ao esperado",
+    SA: "ausência atual, sem premiar atraso infinito", SC: "ritmo histórico de reaparição",
+    SRT: "força das relações com outras dezenas", SEI: "contribuição ao equilíbrio estrutural",
+    SU: "preferências manuais do usuário"
+  };
+
+  /* textos de RESERVA — só usados se o original não for encontrado */
+  var RESERVA = {
+    SIC: "Mede a presença da dezena em janelas recentes (5, 8, 10, 13, 17 concursos). Aumentar demais faz o radar reagir só ao curtíssimo prazo, ignorando frequência e ciclo de longo prazo — o radar fica \"nervoso\", mudando muito a cada concurso novo. Zerar faz o radar perder sensibilidade a rajadas recentes de uma dezena.",
+    SF: "Mede se a dezena aparece mais ou menos que o esperado, em janelas curta, média, longa e histórica. Aumentar demais favorece dezenas \"quentes\" e pode repetir sempre o mesmo núcleo. Zerar ignora o comportamento de frequência da dezena.",
+    SA: "Mede a ausência atual comparada ao histórico da própria dezena, com curva de maturação que não premia atraso infinito. Aumentar demais puxa dezenas atrasadas para o radar. Zerar ignora o tempo desde a última aparição.",
+    SC: "Mede se o ciclo atual da dezena está alinhado ao seu ritmo histórico de reaparição. Aumentar demais privilegia dezenas \"no ponto\" do ciclo, mesmo com pouca frequência. Zerar ignora o ritmo de retorno da dezena.",
+    SRT: "Mede a força relacional da dezena: com quem ela costuma sair junto (duplas, triplas, centralidade). Aumentar demais favorece dezenas bem conectadas, podendo concentrar o radar em grupos. Zerar trata cada dezena como isolada.",
+    SEI: "Mede a contribuição da dezena para o equilíbrio estrutural (faixas, paridade, extremos). Aumentar demais força equilíbrio artificial no radar. Zerar ignora a estrutura na escolha das dezenas.",
+    SU: "Aplica suas preferências manuais (preferenciais, evitar, pesos, grupos). Aumentar demais faz sua opinião dominar a estatística. Zerar deixa o radar puramente estatístico. Fixas e proibidas continuam valendo como regra."
+  };
+
+  var CACHE = {}, FONTE = {};
+
+  /* ---------- localiza o card do cockpit ---------- */
+  function cardCockpit() {
+    var h = Array.prototype.find.call(document.querySelectorAll("h3,h2"), function (x) {
+      return /Cockpit de Pesos/i.test(x.textContent);
+    });
+    return h ? (h.closest(".card") || h.parentNode) : null;
+  }
+
+  /* ---------- localiza o ⓘ de cada módulo ---------- */
+  function iconeDe(k) {
+    var sl = document.getElementById("cockSlider_" + k);
+    if (!sl) return null;
+    var zona = sl.parentNode;
+    for (var n = 0; n < 3 && zona; n++) {
+      var achado = Array.prototype.find.call(zona.querySelectorAll("*"), function (e) {
+        return !e.children.length && /^[ⓘℹi]$/.test((e.textContent || "").trim());
+      });
+      if (achado) return achado;
+      zona = zona.parentNode;
+    }
+    return null;
+  }
+
+  /* ---------- obtém o texto ORIGINAL ---------- */
+  function textoOriginal(k) {
+    if (CACHE[k]) return CACHE[k];
+    var ic = iconeDe(k);
+    if (ic) {
+      var attr = ic.getAttribute("title") || ic.getAttribute("data-info") ||
+        ic.getAttribute("data-texto") || ic.getAttribute("aria-label");
+      if (attr && attr.length > 40) { CACHE[k] = attr.replace(new RegExp("^" + k + "\\s*[—-]\\s*[^.]*?\\n"), ""); FONTE[k] = "atributo do ⓘ"; return CACHE[k]; }
+    }
+    var card = cardCockpit();
+    if (card) {
+      var cx = Array.prototype.find.call(card.querySelectorAll("div,p"), function (e) {
+        var t = (e.innerText || "").trim();
+        return t.indexOf(k + " —") === 0 && t.length > 60 && e.children.length <= 3;
+      });
+      if (cx) {
+        var t = cx.innerText.trim().replace(/^[^\n]*\n/, "").trim();
+        if (t.length > 40) { CACHE[k] = t; FONTE[k] = "caixa original do cockpit"; return t; }
+      }
+    }
+    FONTE[k] = "texto de reserva";
+    return RESERVA[k];
+  }
+
+  /* ---------- divide em O que mede / Aumentar / Zerar ---------- */
+  function dividir(txt) {
+    var frases = txt.match(/[^.]+(\.|$)/g) || [txt];
+    var b = { mede: [], aum: [], zer: [] };
+    frases.forEach(function (f) {
+      var s = f.trim(); if (!s) return;
+      if (/^aumentar|aumentar demais/i.test(s)) b.aum.push(s);
+      else if (/^zerar|zerar faz|zerar /i.test(s)) b.zer.push(s);
+      else if (b.aum.length && !b.zer.length) b.aum.push(s);
+      else if (b.zer.length) b.zer.push(s);
+      else b.mede.push(s);
+    });
+    if (!b.aum.length && !b.zer.length) b.mede = [txt];
+    return b;
+  }
+
+  function pesoAtual(k) {
+    var v = document.getElementById("cockValor_" + k);
+    var n = v ? parseFloat(v.textContent) : NaN;
+    if (isNaN(n) && MPL_STATE.config.pesosPerfil[k] != null) n = MPL_STATE.config.pesosPerfil[k] * 100;
+    return isNaN(n) ? null : Math.round(n);
+  }
+
+  /* ---------- popover ---------- */
+  var pop = null, tip = null;
+
+  function fechar() { if (pop) { pop.remove(); pop = null; } }
+
+  function abrir(k, ancora) {
+    fechar();
+    var cor = (MPL_STATE.modalidade && typeof obterCorModalidade === "function")
+      ? obterCorModalidade(MPL_STATE.modalidade).principal : "#22d3ee";
+    var b = dividir(textoOriginal(k));
+    var at = pesoAtual(k), of = OFICIAL[k];
+    var dif = at == null ? null : at - of;
+    var difTxt = dif == null ? "" : (dif === 0 ? "= oficial"
+      : (dif > 0 ? "▲ +" : "▼ ") + dif + " p.p.");
+    var difCor = dif == null || dif === 0 ? "#8fa3c4" : (Math.abs(dif) >= 15 ? "#eab308" : "#8fa3c4");
+
+    function bloco(ic, tit, arr) {
+      if (!arr.length) return "";
+      return '<div style="margin-top:9px;"><div style="font-size:10px;letter-spacing:.06em;color:' + cor +
+        ';font-weight:700;">' + ic + " " + tit + '</div><div style="font-size:12px;line-height:1.5;color:#dbe4f2;">' +
+        arr.join(" ") + '</div></div>';
+    }
+
+    pop = document.createElement("div");
+    pop.id = "mplCockPop";
+    pop.style.cssText = "position:fixed;z-index:10000;width:320px;max-width:calc(100vw - 24px);" +
+      "background:#0d1526;border:1px solid " + cor + ";border-radius:10px;padding:12px 14px;" +
+      "box-shadow:0 10px 30px rgba(0,0,0,.55);";
+    pop.innerHTML =
+      '<div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px;">' +
+      '<div style="font-size:13px;font-weight:700;color:' + cor + ';">' + k + ' — ' + NOMES[k] + '</div>' +
+      '<button id="mplCockPopX" style="background:none;border:none;color:#8fa3c4;font-size:16px;cursor:pointer;margin:0;padding:0 2px;">✕</button></div>' +
+      bloco("📊", "O QUE MEDE", b.mede) +
+      bloco("⬆", "AUMENTAR DEMAIS", b.aum) +
+      bloco("⬇", "ZERAR", b.zer) +
+      '<div style="margin-top:11px;padding-top:8px;border-top:1px solid #243049;font-size:11px;color:#8fa3c4;">' +
+      'Atual: <b style="color:#e6edf7;">' + (at == null ? "—" : at + "%") + '</b> · Oficial: <b style="color:#e6edf7;">' +
+      of + '%</b> <span style="color:' + difCor + ';margin-left:4px;">' + difTxt + '</span></div>';
+    document.body.appendChild(pop);
+
+    /* posiciona à direita do cockpit, alinhado ao ícone */
+    var r = ancora.getBoundingClientRect();
+    var card = cardCockpit();
+    var cr = card ? card.getBoundingClientRect() : r;
+    var x = cr.right + 10, y = r.top - 12;
+    if (x + 330 > window.innerWidth) x = Math.max(12, r.left - 330);
+    var h = pop.offsetHeight;
+    if (y + h > window.innerHeight - 12) y = window.innerHeight - h - 12;
+    pop.style.left = x + "px";
+    pop.style.top = Math.max(12, y) + "px";
+
+    document.getElementById("mplCockPopX").addEventListener("click", fechar);
+  }
+
+  function mostrarDica(k, ancora) {
+    esconderDica();
+    tip = document.createElement("div");
+    tip.style.cssText = "position:fixed;z-index:10001;background:#1c2434;color:#dbe4f2;font-size:11px;" +
+      "padding:5px 9px;border-radius:6px;border:1px solid #33415c;pointer-events:none;white-space:nowrap;";
+    tip.textContent = k + " — " + DICAS[k] + " · clique para detalhes";
+    document.body.appendChild(tip);
+    var r = ancora.getBoundingClientRect();
+    tip.style.left = Math.min(r.right + 8, window.innerWidth - tip.offsetWidth - 8) + "px";
+    tip.style.top = (r.top - 4) + "px";
+  }
+  function esconderDica() { if (tip) { tip.remove(); tip = null; } }
+
+  /* ---------- prepara os ícones ---------- */
+  function preparar() {
+    var card = cardCockpit();
+    if (!card) return;
+    MODULOS.forEach(function (k) {
+      var ic = iconeDe(k);
+      if (!ic || ic.__mplPop) return;
+      textoOriginal(k);                 /* lê o original ANTES de esconder a caixa */
+      ic.__mplPop = true;
+      ic.setAttribute("data-mpl-info", k);
+      ic.removeAttribute("title");      /* evita tooltip nativo duplicado */
+      ic.style.cursor = "help";
+      ic.style.display = "inline-block";
+      ic.style.position = "static";
+      ic.style.marginLeft = "5px";
+      ic.style.verticalAlign = "middle";
+      ic.addEventListener("mouseenter", function () { mostrarDica(k, ic); });
+      ic.addEventListener("mouseleave", esconderDica);
+    });
+
+    /* esconde a caixa de explicação antiga abaixo do cockpit */
+    Array.prototype.forEach.call(card.querySelectorAll("div,p"), function (e) {
+      var t = (e.innerText || "").trim();
+      if (MODULOS.some(function (k) { return t.indexOf(k + " —") === 0; }) && t.length > 60 && e.children.length <= 3) {
+        e.style.display = "none";
+      }
+    });
+
+    if (!window.__mplCockLog) {
+      window.__mplCockLog = true;
+      console.log("MPL t11-C6: fonte dos textos do cockpit →",
+        MODULOS.map(function (k) { return k + ": " + (FONTE[k] || "—"); }).join(" | "));
+    }
+  }
+
+  /* ---------- intercepta o clique no ⓘ (fase de captura) ---------- */
+  document.addEventListener("click", function (e) {
+    var ic = e.target && e.target.closest ? e.target.closest("[data-mpl-info]") : null;
+    if (ic) {
+      e.stopImmediatePropagation();
+      e.preventDefault();          /* impede o label de ligar/desligar o módulo */
+      esconderDica();
+      var k = ic.getAttribute("data-mpl-info");
+      if (pop && pop.__k === k) { fechar(); return; }
+      abrir(k, ic);
+      pop.__k = k;
+      return;
+    }
+    if (pop && !pop.contains(e.target)) fechar();
+  }, true);
+
+  document.addEventListener("keydown", function (e) { if (e.key === "Escape") fechar(); });
+  window.addEventListener("scroll", fechar, true);
+  window.addEventListener("resize", fechar);
+
+  /* ---------- montagem ---------- */
+  if (typeof mplOn === "function") mplOn("radar:form", function () { setTimeout(preparar, 120); }, 45);
+  document.addEventListener("DOMContentLoaded", function () { setTimeout(preparar, 1200); });
+  var t = 0, vig = setInterval(function () {
+    t++; preparar();
+    if (t > 20) clearInterval(vig);
+  }, 700);
+
+  window.mplCockpitTextos = function () { return { textos: CACHE, fonte: FONTE }; };
+  console.log("MPL t11-C6: popover do cockpit ativo (hover = dica, clique = detalhes).");
+})();
+/* ============================================================
+   #pessoal
+   MPL — t11-C6 — Cockpit: PESOS EFETIVOS (soma ≠ 100)
+   COLE NO FINAL DE js/mpl-cockpit-pesos-fix.js (após o popover).
+
+   Problema: cada slider vai de 0 a 100 de forma independente.
+   Ex.: SIC 50 + SRT 50 + cinco em 10 = 150. O STF reescalona
+   (RAP) e aplica a PROPORÇÃO de cada peso no total ativo — então
+   o SIC "50%" vale de fato 33,3%. A tela mostrava um número que
+   não era o aplicado.
+
+   Solução (sem travar os sliders):
+   • ao lado de cada slider: "50 → 33%" (valor efetivo)
+   • barra de soma no topo, amarela quando ≠ 100
+   • botão "Normalizar para 100" — alinha a tela ao cálculo,
+     sem alterar o resultado do radar (as proporções se mantêm)
+   • popover passa a comparar o EFETIVO com o oficial
+   ============================================================ */
+(function () {
+  "use strict";
+
+  var MODULOS = ["SIC", "SF", "SA", "SC", "SRT", "SEI", "SU"];
+  var OFICIAL = { SIC: 28, SF: 17, SA: 13, SC: 10, SRT: 22, SEI: 5, SU: 5 };
+
+  function valorSlider(k) {
+    var s = document.getElementById("cockSlider_" + k);
+    if (s) return Number(s.value) || 0;
+    var p = MPL_STATE.config.pesosPerfil[k];
+    return p != null ? p * 100 : 0;
+  }
+  function ativo(k) {
+    var c = document.getElementById("cockAtivo_" + k);
+    if (c) return c.checked;
+    return !!MPL_STATE.config.modulosAtivos[k];
+  }
+
+  /* efetivo = proporção do peso no total dos módulos ATIVOS */
+  function calcular() {
+    var soma = 0, val = {};
+    MODULOS.forEach(function (k) {
+      val[k] = ativo(k) ? valorSlider(k) : 0;
+      soma += val[k];
+    });
+    var ef = {};
+    MODULOS.forEach(function (k) { ef[k] = soma > 0 ? (val[k] / soma) * 100 : 0; });
+    return { soma: soma, val: val, ef: ef };
+  }
+  window.mplPesosEfetivos = calcular;
+
+  function cardCockpit() {
+    var h = Array.prototype.find.call(document.querySelectorAll("h3,h2"), function (x) {
+      return /Cockpit de Pesos/i.test(x.textContent);
+    });
+    return h ? (h.closest(".card") || h.parentNode) : null;
+  }
+
+  /* ---------- barra de soma no topo ---------- */
+  function barra() {
+    var card = cardCockpit();
+    if (!card) return null;
+    var b = document.getElementById("cockSomaBar");
+    if (!b) {
+      b = document.createElement("div");
+      b.id = "cockSomaBar";
+      b.style.cssText = "margin:6px 0 12px;padding:8px 10px;border-radius:8px;font-size:11.5px;";
+      var ancora = card.querySelector("p") || card.querySelector("h3");
+      if (ancora && ancora.nextSibling) ancora.parentNode.insertBefore(b, ancora.nextSibling);
+      else card.insertBefore(b, card.firstChild);
+    }
+    return b;
+  }
+
+  function render() {
+    var r = calcular();
+    var b = barra();
+    if (b) {
+      var ok = Math.abs(r.soma - 100) < 0.5;
+      b.style.background = ok ? "rgba(16,185,129,.10)" : "rgba(234,179,8,.12)";
+      b.style.border = "1px solid " + (ok ? "#10b981" : "#eab308");
+      b.innerHTML = ok
+        ? '<b style="color:#10b981;">Soma dos pesos: 100 ✓</b><br><span class="muted" style="font-size:10.5px;">O valor de cada slider é o peso aplicado.</span>'
+        : '<b style="color:#eab308;">Soma dos pesos: ' + Math.round(r.soma) + '</b><br>' +
+          '<span style="font-size:10.5px;color:#dbe4f2;">Os pesos são <b>proporcionais</b>: o valor aplicado é o indicado após a seta (→).</span>' +
+          '<button id="cockNormalizar" class="btn-secondary" style="width:100%;margin:7px 0 0;font-size:11px;padding:5px;">Normalizar para 100</button>';
+      var bn = document.getElementById("cockNormalizar");
+      if (bn && !bn.__n) { bn.__n = true; bn.addEventListener("click", normalizar); }
+    }
+
+    /* valor efetivo ao lado de cada slider */
+    MODULOS.forEach(function (k) {
+      var v = document.getElementById("cockValor_" + k);
+      if (!v) return;
+      var bruto = Math.round(r.val[k] || valorSlider(k));
+      var efe = r.ef[k];
+      if (!ativo(k)) {
+        v.innerHTML = '<span class="muted">' + Math.round(valorSlider(k)) + '% · desl.</span>';
+      } else if (Math.abs(r.soma - 100) < 0.5) {
+        v.textContent = bruto + "%";
+      } else {
+        var dif = efe - OFICIAL[k];
+        var cor = Math.abs(dif) >= 15 ? "#eab308" : "#22d3ee";
+        v.innerHTML = '<span class="muted">' + bruto + '</span> → <b style="color:' + cor + ';">' +
+          efe.toFixed(0) + '%</b>';
+      }
+      v.title = "Aplicado: " + efe.toFixed(1) + "% · Oficial: " + OFICIAL[k] + "%";
+    });
+  }
+
+  /* ---------- normalizar: mantém proporções, soma = 100 ---------- */
+  function normalizar() {
+    var r = calcular();
+    if (r.soma <= 0) return;
+    var novos = {}, acum = 0, ativosK = MODULOS.filter(ativo);
+    ativosK.forEach(function (k, i) {
+      var v = (i === ativosK.length - 1) ? 100 - acum : Math.round(r.ef[k]);
+      novos[k] = Math.max(0, v); acum += novos[k];
+    });
+    ativosK.forEach(function (k) {
+      MPL_STATE.config.pesosPerfil[k] = novos[k] / 100;
+      var s = document.getElementById("cockSlider_" + k);
+      if (s) s.value = novos[k];
+    });
+    if (typeof agendarRAE === "function") agendarRAE("normalizar-pesos", 300);
+    render();
+    console.log("MPL t11-C6: pesos normalizados para 100 (proporções preservadas).", novos);
+  }
+  window.mplNormalizarPesos = normalizar;
+
+  /* ---------- popover: compara EFETIVO com oficial ---------- */
+  var obs = new MutationObserver(function () {
+    var pop = document.getElementById("mplCockPop");
+    if (!pop || pop.__ef) return;
+    pop.__ef = true;
+    var k = pop.__k;
+    if (!k) return;
+    var r = calcular();
+    var rod = pop.lastElementChild;
+    if (!rod) return;
+    var efe = r.ef[k], dif = efe - OFICIAL[k];
+    var difTxt = Math.abs(dif) < 0.5 ? "= oficial" : (dif > 0 ? "▲ +" : "▼ ") + dif.toFixed(0) + " p.p.";
+    var cor = Math.abs(dif) >= 15 ? "#eab308" : "#8fa3c4";
+    rod.innerHTML = 'Aplicado: <b style="color:#e6edf7;">' + efe.toFixed(0) + '%</b>' +
+      (Math.abs(r.soma - 100) >= 0.5 ? ' <span class="muted">(slider ' + Math.round(r.val[k]) + ')</span>' : '') +
+      ' · Oficial: <b style="color:#e6edf7;">' + OFICIAL[k] + '%</b> <span style="color:' + cor +
+      ';margin-left:4px;">' + difTxt + '</span>';
+  });
+  obs.observe(document.body, { childList: true });
+
+  /* ---------- atualização ao vivo ---------- */
+  document.addEventListener("input", function (e) {
+    if (e.target && /^cockSlider_/.test(e.target.id)) render();
+  }, true);
+  document.addEventListener("change", function (e) {
+    if (e.target && /^cockAtivo_/.test(e.target.id)) setTimeout(render, 50);
+  }, true);
+
+  if (typeof mplOn === "function") mplOn("radar:form", function () { setTimeout(render, 200); }, 46);
+  document.addEventListener("DOMContentLoaded", function () { setTimeout(render, 1300); });
+  setInterval(function () { if (cardCockpit()) render(); }, 2500); /* ressincroniza após presets */
+
+  console.log("MPL t11-C6: pesos efetivos visíveis no cockpit (barra de soma + normalizar).");
+})();

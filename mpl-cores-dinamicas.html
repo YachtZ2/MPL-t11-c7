@@ -1,0 +1,25 @@
+/* ============================================================
+   #pessoal
+   MPL — mpl-cores-dinamicas.js (t11-C3 — migrado para hooks)
+   SUBSTITUI a versão anterior. Não embrulha mais renderDashboard.
+   ============================================================ */
+(function () {
+  "use strict";
+
+  function atualizarCor() {
+    var cor = (MPL_STATE.modalidade && typeof obterCorModalidade === "function")
+      ? obterCorModalidade(MPL_STATE.modalidade) : { principal: "#22d3ee" };
+    document.documentElement.style.setProperty("--mpl-cor-modalidade", cor.principal);
+  }
+
+  var estilo = document.createElement("style");
+  estilo.id = "mplCoresDinamicas";
+  estilo.textContent =
+    ":root { --mpl-cor-modalidade: #22d3ee; }" +
+    ".stat-card .value { color: var(--mpl-cor-modalidade) !important; transition: color .3s; }";
+  document.head.appendChild(estilo);
+
+  /* prioridade 10 = roda cedo, antes dos módulos que desenham cards */
+  if (typeof mplOn === "function") mplOn("dashboard", atualizarCor, 10);
+  document.addEventListener("DOMContentLoaded", function () { setTimeout(atualizarCor, 200); });
+})();

@@ -1,0 +1,55 @@
+/* ============================================================
+   MPL — mpl-filtros-arquivo-ponte.js  (arquivo NOVO, pequeno)
+   ADICIONE no index.html, ANTES de
+   mpl-filtros-excluir-arquivo-subconjunto.js (mas depois de
+   mpl-filtros-excluir-arquivo.js):
+     <script src="js/mpl-filtros-arquivo-ponte.js"></script>
+
+   Só uma ponte: o arquivo carregado pelo usuário ficava guardado
+   numa variável interna do mpl-filtros-excluir-arquivo.js, invisível
+   para outros arquivos. Este patch escuta o MESMO input de arquivo
+   e também guarda a lista em window.__mplJogosArquivoFiltroCarregados,
+   que o mpl-filtros-excluir-arquivo-subconjunto.js já sabe usar.
+   ============================================================ */
+(function () {
+  "use strict";
+  window.__mplJogosArquivoFiltroCarregados = [];
+
+  function religar() {
+    var input = document.getElementById("exclArquivoInput");
+    if (!input || input.__pontePronta) return;
+    input.__pontePronta = true;
+
+    input.addEventListener("change", async function (e) {
+      var file = e.target.files[0];
+      if (!file) return;
+      try {
+        var texto = await file.text();
+        var jogos;
+        if (file.name.toLowerCase().endsWith(".json")) {
+          var dados = JSON.parse(texto);
+          jogos = (Array.isArray(dados) ? dados : []).map(function (item) {
+            var arr = Array.isArray(item) ? item : (item.jogo || item.dezenas || []);
+            return arr.map(Number).filter(function (n) { return !isNaN(n); });
+          }).filter(function (j) { return j.length; });
+        } else {
+          var linhas = texto.trim().split(/\r?\n/).filter(function (l) { return l.trim().length; });
+          jogos = linhas.map(function (l) {
+            return l.split(/[\s,;]+/).map(Number).filter(function (n) { return !isNaN(n); });
+          }).filter(function (j) { return j.length; });
+        }
+        window.__mplJogosArquivoFiltroCarregados = jogos;
+        console.log("MPL Filtros: ponte carregou " + jogos.length + " jogo(s) do arquivo para uso na exclusão por subconjunto.");
+      } catch (err) {
+        console.warn("MPL Filtros (ponte): erro ao ler arquivo — " + err.message);
+      }
+    });
+  }
+
+  var tentativas = 0;
+  var vigia = setInterval(function () {
+    tentativas++;
+    religar();
+    if (tentativas > 40) clearInterval(vigia);
+  }, 200);
+})();

@@ -1,0 +1,108 @@
+/* ============================================================
+   MPL — mpl-mapa-inicial-fix.js  (arquivo NOVO e independente)
+   ADICIONE no index.html, depois de js/mpl-ui.js:
+     <script src="js/mpl-mapa-inicial-fix.js"></script>
+
+   Resolve: "seletor de período ficou vago demais" no Mapa Inicial.
+   Acrescenta botões rápidos e bem visíveis (Base Completa / Últimos
+   50/100/200/500 / Intervalo Personalizado), com estado ativo claro
+   na cor da modalidade — em vez de depender só do arraste na timeline
+   ou dos campos numéricos escondidos. A timeline (Patch T) continua
+   funcionando exatamente igual, só ganhou companhia.
+   ============================================================ */
+(function () {
+  "use strict";
+
+  var PRESETS_RAPIDOS = [
+    { label: "Base Completa", modo: "completa" },
+    { label: "Últimos 50", modo: "ultimosN", qtd: 50 },
+    { label: "Últimos 100", modo: "ultimosN", qtd: 100 },
+    { label: "Últimos 200", modo: "ultimosN", qtd: 200 },
+    { label: "Últimos 500", modo: "ultimosN", qtd: 500 }
+  ];
+
+  function corAtual() {
+    return (MPL_STATE.modalidade && typeof obterCorModalidade === "function")
+      ? obterCorModalidade(MPL_STATE.modalidade) : { principal: "#22d3ee", texto: "#03121a" };
+  }
+
+  function montarBotoesRapidos() {
+    var timelineCard = document.getElementById("mapaTimelineCard");
+    if (!timelineCard || document.getElementById("mapaPresetsRapidos")) return;
+
+    var wrap = document.createElement("div");
+    wrap.id = "mapaPresetsRapidos";
+    wrap.style.cssText = "display:flex;flex-wrap:wrap;gap:8px;margin-bottom:14px;";
+    wrap.innerHTML = PRESETS_RAPIDOS.map(function (p, i) {
+      return '<button type="button" class="mpl-preset-rapido" data-idx="' + i + '" ' +
+        'style="border-radius:20px;padding:8px 16px;font-size:12.5px;font-weight:600;border:1px solid #233256;background:#1c2434;color:#e6edf7;cursor:pointer;transition:.15s;">' +
+        p.label + '</button>';
+    }).join("") +
+      '<button type="button" id="mplPresetPersonalizado" style="border-radius:20px;padding:8px 16px;font-size:12.5px;font-weight:600;border:1px dashed #8fa3c4;background:transparent;color:#8fa3c4;cursor:pointer;">' +
+      '✎ Intervalo Personalizado (arraste na linha do tempo)</button>';
+
+    var h3 = timelineCard.querySelector("h3");
+    timelineCard.insertBefore(wrap, h3 ? h3.nextSibling : timelineCard.firstChild);
+
+    atualizarEstadoBotoes();
+
+    wrap.querySelectorAll(".mpl-preset-rapido").forEach(function (btn) {
+      btn.addEventListener("click", function () {
+        var p = PRESETS_RAPIDOS[Number(btn.dataset.idx)];
+        MPL_STATE.escopo.modo = p.modo;
+        if (p.qtd) MPL_STATE.escopo.qtd = p.qtd;
+
+        var selModo = document.getElementById("escopoModo");
+        if (selModo) selModo.value = p.modo;
+        var inN = document.getElementById("escopoN");
+        if (inN && p.qtd) inN.value = p.qtd;
+
+        var efetiva = (typeof aplicarEscopo === "function") ? aplicarEscopo(MPL_STATE.base, MPL_STATE.escopo) : [];
+        var info = document.getElementById("escopoInfo");
+        if (info) info.textContent = "Escopo atual: " + p.label + " · " + efetiva.length + " concursos selecionados de " + MPL_STATE.base.length + " totais.";
+
+        atualizarEstadoBotoes();
+        if (typeof desenharTimeline === "function") desenharTimeline();
+      });
+    });
+
+    document.getElementById("mplPresetPersonalizado").addEventListener("click", function () {
+      atualizarEstadoBotoes(); // nenhum preset fica "ativo"; o usuário vai usar o arraste
+      var info = document.getElementById("mapaTimelineInfo");
+      if (info) info.textContent = "Arraste sobre a linha do tempo abaixo para escolher o intervalo exato.";
+    });
+  }
+
+  function atualizarEstadoBotoes() {
+    var wrap = document.getElementById("mapaPresetsRapidos");
+    if (!wrap) return;
+    var cor = corAtual();
+    var escopo = MPL_STATE.escopo;
+
+    wrap.querySelectorAll(".mpl-preset-rapido").forEach(function (btn) {
+      var p = PRESETS_RAPIDOS[Number(btn.dataset.idx)];
+      var ativo = (p.modo === "completa" && escopo.modo === "completa") ||
+        (p.modo === "ultimosN" && escopo.modo === "ultimosN" && escopo.qtd === p.qtd);
+      if (ativo) {
+        btn.style.background = cor.principal;
+        btn.style.color = cor.texto;
+        btn.style.borderColor = cor.principal;
+        btn.style.boxShadow = "0 2px 10px " + cor.principal + "55";
+      } else {
+        btn.style.background = "#1c2434";
+        btn.style.color = "#e6edf7";
+        btn.style.borderColor = "#233256";
+        btn.style.boxShadow = "none";
+      }
+    });
+  }
+
+  var __origRenderEscopoFormFix = renderEscopoForm;
+  renderEscopoForm = function () {
+    var r = __origRenderEscopoFormFix();
+    setTimeout(montarBotoesRapidos, 30); // aguarda o Patch T terminar de montar a timeline
+    return r;
+  };
+
+  document.addEventListener("DOMContentLoaded", function () { setTimeout(montarBotoesRapidos, 350); });
+})();

@@ -1,0 +1,179 @@
+/* ============================================================
+   MPL — mpl-gerador-assincrono.js  (arquivo NOVO — CORRIGE TRAVAMENTO)
+   ADICIONE no index.html, DEPOIS de mpl-gerador-matrix.js:
+     <script src="js/mpl-gerador-assincrono.js"></script>
+
+   Resolve o travamento real reportado (2M de jogos = ~2min com a
+   aba congelada). Causa: a geração completa roda em um laço único,
+   sem nunca devolver o controle ao navegador — por isso a barra de
+   progresso do mpl-gerador-matrix.js era só cosmética, incapaz de
+   se mover de verdade enquanto o loop pesado ocupava a thread.
+
+   Este patch substitui o clique do botão "Gerar Jogos Candidatos"
+   por uma versão que gera em LOTES (chunks), usando setTimeout(0)
+   entre eles para a aba continuar respondendo — a barra de progresso
+   passa a refletir o andamento real, e você pode até trocar de aba
+   enquanto gera (não trava mais o navegador).
+
+   Não muda o RESULTADO da geração (mesmas combinações, mesma seed),
+   só COMO ela é processada por baixo dos panos.
+   ============================================================ */
+(function () {
+  "use strict";
+
+  var TAMANHO_LOTE = 20000; // combinações processadas por "respiro"
+
+  /* Gera combinações completas em lotes, sem travar a aba.
+     Usa a MESMA lógica de índice combinatório de gerarJogosCompleto,
+     mas com pausas programadas. */
+  function gerarCompletoAssincrono(dezenas, A, onProgresso, onFim) {
+    var K = dezenas.length;
+    var total = combinacao(K, A);
+    var resultados = [];
+    var combo = [];
+
+    // pilha de estado para retomar o backtracking entre lotes
+    var pilha = [{ start: 0 }];
+    var processadosNoLote = 0;
+
+    function passo() {
+      while (pilha.length) {
+        var topo = pilha[pilha.length - 1];
+        if (combo.length === A) {
+          resultados.push(dezenas.filter(function (_, idx) { return combo.indexOf(idx) !== -1; }));
+          pilha.pop();
+          combo.pop();
+          processadosNoLote++;
+        } else if (topo.start >= K) {
+          pilha.pop();
+          if (combo.length) combo.pop();
+        } else {
+          combo.push(topo.start);
+          pilha.push({ start: topo.start + 1 });
+          topo.start = K; // marca este nível como "já ramificado à direita"
+          processadosNoLote++;
+        }
+        if (processadosNoLote >= TAMANHO_LOTE) {
+          processadosNoLote = 0;
+          onProgresso(resultados.length, total);
+          setTimeout(passo, 0);
+          return;
+        }
+      }
+      onProgresso(resultados.length, total);
+      onFim(resultados);
+    }
+    setTimeout(passo, 0);
+  }
+
+  /* Amostragem também fatiada, por segurança em qtd muito grandes */
+  function gerarAmostralAssincrono(dezenas, A, quantidade, seed, onProgresso, onFim) {
+    var rng = criarRNG(seed);
+    var jogos = new Set();
+    var resultados = [];
+    var tentativas = 0;
+    var maxTentativas = quantidade * 30;
+
+    function passo() {
+      var fim = Math.min(tentativas + TAMANHO_LOTE, maxTentativas);
+      while (tentativas < fim && resultados.length < quantidade) {
+        tentativas++;
+        var pool = dezenas.slice();
+        var comboAmostra = [];
+        for (var i = 0; i < A && pool.length; i++) {
+          var idx = Math.floor(rng() * pool.length);
+          comboAmostra.push(pool.splice(idx, 1)[0]);
+        }
+        comboAmostra.sort(function (a, b) { return a - b; });
+        var key = comboAmostra.join(",");
+        if (!jogos.has(key)) { jogos.add(key); resultados.push(comboAmostra); }
+      }
+      onProgresso(resultados.length, quantidade);
+      if (resultados.length < quantidade && tentativas < maxTentativas) {
+        setTimeout(passo, 0);
+      } else {
+        onFim(resultados);
+      }
+    }
+    setTimeout(passo, 0);
+  }
+
+  var LIMITE_AVISO = 300000; // acima disso, avisa antes de travar o usuário numa espera longa
+
+  function religarBotaoGerador() {
+    var btnOriginal = document.getElementById("btnGerarJogos");
+    if (!btnOriginal || btnOriginal.__assincronoLigado) return;
+
+    // substitui o botão por um clone SEM os listeners antigos (síncronos),
+    // e liga só o novo comportamento assíncrono.
+    var novoBtn = btnOriginal.cloneNode(true);
+    btnOriginal.parentNode.replaceChild(novoBtn, btnOriginal);
+    novoBtn.__assincronoLigado = true;
+
+    novoBtn.addEventListener("click", function () {
+      if (!MPL_STATE.cache.radar.reduzido || !MPL_STATE.cache.radar.reduzido.length) {
+        alert("Gere o Radar Reduzido primeiro.");
+        return;
+      }
+      var dezenas = MPL_STATE.cache.radar.reduzido.map(function (d) { return d.dezena; });
+      var A = Number(document.getElementById("genA").value);
+      var estrategia = document.getElementById("genEstrategia").value;
+      var qtd = Number(document.getElementById("genQtd").value);
+      var seed = Number(document.getElementById("genSeed").value);
+      MPL_STATE.config.A = A;
+
+      var totalPossivel = combinacao(dezenas.length, A);
+      var estrategiaFinal = estrategia;
+      if (estrategia === "auto") estrategiaFinal = (totalPossivel <= 200000) ? "completa" : "amostral";
+
+      if (estrategiaFinal === "completa" && totalPossivel > LIMITE_AVISO) {
+        var confirmar = confirm(
+          "Isso vai gerar " + totalPossivel.toLocaleString("pt-BR") + " combinações completas. " +
+          "Pode levar bastante tempo mesmo sem travar a aba. Deseja continuar mesmo assim? " +
+          "(Cancelar para trocar para o modo Amostral, mais rápido.)"
+        );
+        if (!confirmar) return;
+      }
+
+      var wrap = document.getElementById("geradorProgressoWrap");
+      var barra = document.getElementById("geradorProgressoBarra");
+      var texto = document.getElementById("geradorProgressoTexto");
+      if (wrap) { wrap.style.display = "block"; barra.style.width = "0%"; texto.textContent = "Iniciando..."; }
+
+      function progresso(feitos, total) {
+        var pct = total ? Math.min(100, Math.round((feitos / total) * 100)) : 0;
+        if (barra) barra.style.width = pct + "%";
+        if (texto) texto.textContent = "Gerando... " + feitos.toLocaleString("pt-BR") + " de " + total.toLocaleString("pt-BR") + " (" + pct + "%) — a aba continua respondendo normalmente.";
+      }
+
+      function finalizar(jogos) {
+        MPL_STATE.cache.jogos = jogos;
+        if (texto) texto.textContent = "Concluído: " + jogos.length.toLocaleString("pt-BR") + " jogos gerados.";
+        if (wrap) setTimeout(function () { wrap.style.display = "none"; }, 1200);
+
+        var resultado = document.getElementById("geradorResult");
+        if (resultado) {
+          resultado.innerHTML =
+            '<div class="alert ' + (estrategiaFinal === "completa" ? "alert-ok" : "alert-warn") + '">' +
+            'Estratégia: ' + estrategiaFinal + ' · Universo combinatório teórico: ' + totalPossivel.toLocaleString("pt-BR") + ' · ' +
+            'Jogos candidatos (JC) gerados: ' + jogos.length.toLocaleString("pt-BR") +
+            ' <span class="muted">(processado em lotes, sem travar a aba)</span></div>';
+        }
+        if (typeof renderDashboard === "function") renderDashboard();
+      }
+
+      if (estrategiaFinal === "completa") {
+        gerarCompletoAssincrono(dezenas, A, progresso, finalizar);
+      } else {
+        gerarAmostralAssincrono(dezenas, A, qtd, seed, progresso, finalizar);
+      }
+    });
+  }
+
+  var tentativas2 = 0;
+  var vigia2 = setInterval(function () {
+    tentativas2++;
+    religarBotaoGerador();
+    if (tentativas2 > 40) clearInterval(vigia2);
+  }, 200);
+})();

@@ -1,0 +1,131 @@
+/* ============================================================
+   MPL — mpl-filtros-excluir-arquivo.js  (arquivo NOVO, independente)
+   ADICIONE no index.html, depois de js/mpl-ui.js:
+     <script src="js/mpl-filtros-excluir-arquivo.js"></script>
+
+   Acrescenta, na aba Filtros, a opção de carregar um arquivo com
+   jogos próprios do usuário (TXT/CSV/JSON, 1 jogo por linha) e
+   excluir da lapidação qualquer jogo gerado que seja IDÊNTICO
+   (mesmas dezenas, independente da ordem) a algum jogo do arquivo.
+
+   Não substitui nada do pipeline de filtros existente — roda como
+   um passo ADICIONAL, depois que "Aplicar Pipeline de Filtros" já
+   terminou o trabalho normal (paridade, soma, PIN, linha/coluna,
+   histórico etc.). Funciona clicando no MESMO botão de sempre.
+
+   Super Sete: como a ordem das posições importa (é por coluna),
+   a comparação NÃO ordena as dezenas antes de comparar — preserva
+   a posição, então só considera "igual" se bater dígito a dígito
+   na mesma coluna.
+   ============================================================ */
+(function () {
+  "use strict";
+
+  var jogosArquivoFiltro = [];
+
+  function ehSuperSeteAtivo() {
+    return typeof isSuperSete === "function" && MPL_STATE.modalidade && isSuperSete(MPL_STATE.modalidade);
+  }
+
+  function chaveJogo(jogo) {
+    var arr = jogo.slice().map(Number);
+    if (!ehSuperSeteAtivo()) arr = arr.sort(function (a, b) { return a - b; });
+    return arr.join(",");
+  }
+
+  /* ---------- Injeta a UI dentro da aba Filtros ---------- */
+  function montarCardExclusao() {
+    var form = document.getElementById("filtrosForm");
+    if (!form || document.getElementById("exclusaoArquivoCard")) return;
+
+    var card = document.createElement("div");
+    card.className = "card";
+    card.id = "exclusaoArquivoCard";
+    card.innerHTML =
+      '<h3>Excluir Jogos de um Arquivo Próprio</h3>' +
+      '<p class="muted">Carregue um arquivo com jogos que você já possui (1 jogo por linha, TXT/CSV/JSON). Qualquer jogo gerado que seja idêntico a um jogo do arquivo será descartado na lapidação — evita repetir apostas que você já fez ou já salvou.</p>' +
+      '<input type="file" id="exclArquivoInput" accept=".txt,.csv,.json">' +
+      '<div id="exclArquivoInfo" class="muted" style="margin-top:4px;"></div>' +
+      '<div class="checkbox-row">' +
+      '<input type="checkbox" id="exclArquivoAtivo" checked style="width:auto;">' +
+      '<label style="margin:0;">Ativar exclusão de jogos do arquivo ao aplicar os filtros</label>' +
+      '</div>';
+
+    form.parentNode.insertBefore(card, form.nextSibling);
+
+    document.getElementById("exclArquivoInput").addEventListener("change", async function (e) {
+      var file = e.target.files[0];
+      if (!file) return;
+      try {
+        var texto = await file.text();
+        var jogos;
+        if (file.name.toLowerCase().endsWith(".json")) {
+          var dados = JSON.parse(texto);
+          jogos = (Array.isArray(dados) ? dados : []).map(function (item) {
+            var arr = Array.isArray(item) ? item : (item.jogo || item.dezenas || []);
+            return arr.map(Number).filter(function (n) { return !isNaN(n); });
+          }).filter(function (j) { return j.length; });
+        } else {
+          var linhas = texto.trim().split(/\r?\n/).filter(function (l) { return l.trim().length; });
+          jogos = linhas.map(function (l) {
+            return l.split(/[\s,;]+/).map(Number).filter(function (n) { return !isNaN(n); });
+          }).filter(function (j) { return j.length; });
+        }
+        jogosArquivoFiltro = jogos;
+        document.getElementById("exclArquivoInfo").textContent =
+          jogos.length + " jogo(s) carregado(s) de " + file.name + ". Serão excluídos automaticamente ao aplicar os filtros.";
+      } catch (err) {
+        document.getElementById("exclArquivoInfo").textContent = "Erro ao ler o arquivo: " + err.message;
+      }
+    });
+  }
+
+  /* ---------- Passo adicional após o pipeline normal de filtros ---------- */
+  function religarBotaoFiltros() {
+    var btn = document.getElementById("btnAplicarFiltros");
+    if (!btn || btn.__exclArquivoLigado) return;
+    btn.__exclArquivoLigado = true;
+
+    btn.addEventListener("click", function () {
+      // roda DEPOIS do listener original (que já populou MPL_STATE.cache.jogosAprovados)
+      setTimeout(function () {
+        var ativo = document.getElementById("exclArquivoAtivo");
+        if (!ativo || !ativo.checked || !jogosArquivoFiltro.length) return;
+        if (!MPL_STATE.cache.jogosAprovados || !MPL_STATE.cache.jogosAprovados.length) return;
+
+        var chavesArquivo = {};
+        jogosArquivoFiltro.forEach(function (j) { chavesArquivo[chaveJogo(j)] = true; });
+
+        var antes = MPL_STATE.cache.jogosAprovados.length;
+        MPL_STATE.cache.jogosAprovados = MPL_STATE.cache.jogosAprovados.filter(function (j) {
+          return !chavesArquivo[chaveJogo(j)];
+        });
+        var depois = MPL_STATE.cache.jogosAprovados.length;
+        var removidos = antes - depois;
+
+        var resultado = document.getElementById("filtrosResult");
+        if (resultado) {
+          var aviso = document.createElement("div");
+          aviso.className = "alert " + (removidos > 0 ? "alert-warn" : "alert-ok");
+          aviso.textContent = removidos > 0
+            ? removidos + " jogo(s) removido(s) por já existirem no arquivo carregado. Restaram " + depois + " jogos aprovados."
+            : "Nenhum jogo gerado coincidiu com o arquivo carregado (" + jogosArquivoFiltro.length + " jogos comparados).";
+          resultado.appendChild(aviso);
+        }
+        if (typeof renderDashboard === "function") renderDashboard();
+      }, 30); // pequeno atraso garante que o listener original já terminou
+    });
+  }
+
+  /* t11-C3 Fase 4 */
+  if (typeof mplOn === "function") {
+    mplOn("filtros:form", function () {
+      montarCardExclusao();
+      religarBotaoFiltros();
+    }, 50);
+  }
+
+  document.addEventListener("DOMContentLoaded", function () {
+    setTimeout(function () { montarCardExclusao(); religarBotaoFiltros(); }, 300);
+  });
+})();

@@ -1,0 +1,173 @@
+/* ============================================================
+   MPL — mpl-filtros-excluir-arquivo-subconjunto.js  (SUBSTITUI a
+   lógica de comparação do mpl-filtros-excluir-arquivo.js)
+   ADICIONE no index.html, DEPOIS de mpl-filtros-excluir-arquivo.js:
+     <script src="js/mpl-filtros-excluir-arquivo-subconjunto.js"></script>
+   (pode deixar o arquivo anterior — ele continua cuidando de montar
+   a UI de upload; este aqui só troca a REGRA de comparação usada
+   no clique do botão de filtros.)
+
+   Antes: só excluía jogo gerado se fosse EXATAMENTE igual (mesma
+   quantidade e mesmas dezenas) a um jogo do arquivo.
+
+   Agora: exclui o jogo gerado se ele for um SUBCONJUNTO de algum
+   jogo do arquivo (todas as dezenas do jogo gerado já aparecem
+   dentro de um jogo maior salvo) OU vice-versa (o jogo do arquivo
+   é subconjunto do jogo gerado). Cobre o cenário real de "bolão":
+   se você já tem uma aposta de 20 dezenas, qualquer combinação de
+   15 contida nela já está coberta e não precisa ser sugerida de novo.
+
+   Processado em LOTES (mesmo princípio do gerador assíncrono) para
+   não travar a aba quando houver muitos jogos gerados — a exclusão
+   por subconjunto é mais pesada de calcular que a comparação exata.
+
+   Não se aplica ao Super Sete (estrutura posicional — comparação
+   de "subconjunto" não faz sentido lá; mantém exclusão exata).
+   ============================================================ */
+(function () {
+  "use strict";
+
+  var TAMANHO_LOTE = 5000;
+
+  function ehSuperSeteAtivo() {
+    return typeof isSuperSete === "function" && MPL_STATE.modalidade && isSuperSete(MPL_STATE.modalidade);
+  }
+
+  function ehSubconjunto(menor, maiorSet) {
+    for (var i = 0; i < menor.length; i++) if (!maiorSet.has(menor[i])) return false;
+    return true;
+  }
+
+  /* Substitui window.__mplExecutarExclusaoArquivo se o arquivo anterior
+     expôs esse gancho; caso não tenha exposto, religa o próprio botão
+     de novo (sobrepondo o listener anterior) para garantir controle
+     total da regra de comparação. */
+  function religarComRegraDeSubconjunto() {
+    var btn = document.getElementById("btnAplicarFiltros");
+    if (!btn || btn.__subconjuntoLigado) return;
+    btn.__subconjuntoLigado = true;
+
+    var novoBtn = btn.cloneNode(true);
+    btn.parentNode.replaceChild(novoBtn, btn);
+
+    // reanexa o comportamento ORIGINAL do pipeline de filtros (paridade,
+    // soma, PIN, linha/coluna, histórico) chamando a função que a aba já
+    // usa internamente — como não temos acesso direto a ela por nome
+    // (está fechada dentro do mpl-ui.js), reproduzimos aqui a mesma
+    // sequência de leitura de campos + aplicarPipelineFiltros, que SÃO
+    // funções globais expostas em mpl-games.js.
+    novoBtn.addEventListener("click", function () {
+      if (!MPL_STATE.cache.jogos.length) { alert("Gere os jogos candidatos primeiro."); return; }
+      var f = MPL_STATE.config.filtrosDuros;
+
+      f.paridade.min = document.getElementById("fParMin").value ? Number(document.getElementById("fParMin").value) : null;
+      f.paridade.max = document.getElementById("fParMax").value ? Number(document.getElementById("fParMax").value) : null;
+      f.soma.min = document.getElementById("fSomaMin").value ? Number(document.getElementById("fSomaMin").value) : null;
+      f.soma.max = document.getElementById("fSomaMax").value ? Number(document.getElementById("fSomaMax").value) : null;
+      f.consecutivas.max = Number(document.getElementById("fCons").value);
+      f.repetidas.min = document.getElementById("fRepMin").value ? Number(document.getElementById("fRepMin").value) : null;
+      f.repetidas.max = document.getElementById("fRepMax").value ? Number(document.getElementById("fRepMax").value) : null;
+      f.classesSTF.minA = Number(document.getElementById("fClasseA").value);
+      f.classesSTF.ativo = f.classesSTF.minA > 0;
+      f.pin.ativo = document.getElementById("fPinAtivo").checked;
+      f.pin.dezenas = document.getElementById("fPin").value.split(",").map(function (s) { return Number(s.trim()); }).filter(function (n) { return !isNaN(n); });
+
+      if (!ehSuperSeteAtivo()) {
+        f.porLinha.forEach(function (fl, i) {
+          var chk = document.getElementById("fLinha_" + i + "_ativo");
+          if (!chk) return;
+          fl.ativo = chk.checked;
+          fl.min = Number(document.getElementById("fLinha_" + i + "_min").value);
+          fl.max = Number(document.getElementById("fLinha_" + i + "_max").value);
+        });
+        f.porColuna.forEach(function (fc, i) {
+          var chk = document.getElementById("fColuna_" + i + "_ativo");
+          if (!chk) return;
+          fc.ativo = chk.checked;
+          fc.min = Number(document.getElementById("fColuna_" + i + "_min").value);
+          fc.max = Number(document.getElementById("fColuna_" + i + "_max").value);
+        });
+      }
+
+      var base = (typeof baseEfetiva === "function") ? baseEfetiva() : MPL_STATE.base;
+      var concursoAnterior = base.length ? base[base.length - 1].dezenas : null;
+      var pipeline = aplicarPipelineFiltros(MPL_STATE.cache.jogos, f, {
+        universo: MPL_STATE.modalidade.universo, concursoAnterior: concursoAnterior,
+        rankingDezenas: MPL_STATE.cache.scoresDezenas,
+        fixas: MPL_STATE.config.su.fixas, proibidas: MPL_STATE.config.su.proibidas,
+        layout: (typeof obterLayoutVolante === "function") ? obterLayoutVolante(MPL_STATE.modalidade) : null
+      });
+
+      var aprovados = pipeline.aprovados;
+      var removidosHistorico = 0;
+      var chkHist = document.getElementById("fHistorico");
+      if (chkHist && chkHist.checked) {
+        var r = filtrarResultadosHistoricos(aprovados, base);
+        aprovados = r.mantidos; removidosHistorico = r.removidos;
+      }
+
+      var chkArquivo = document.getElementById("exclArquivoAtivo");
+      var jogosArq = window.__mplJogosArquivoFiltroCarregados || [];
+
+      function mostrarResultadoFinal(finalJogos, removidosArquivo) {
+        MPL_STATE.cache.jogosAprovados = finalJogos;
+        var resultado = document.getElementById("filtrosResult");
+        if (resultado) {
+          resultado.innerHTML =
+            '<div class="alert alert-ok">Jogos aprovados: ' + finalJogos.length.toLocaleString("pt-BR") + ' de ' + MPL_STATE.cache.jogos.length.toLocaleString("pt-BR") + ' candidatos.</div>' +
+            '<div class="muted">Eliminados por filtros duros: ' + pipeline.eliminados.total.toLocaleString("pt-BR") + ' · Motivos: ' + Object.entries(pipeline.eliminados.motivos).map(function (e) { return e[0] + "(" + e[1] + ")"; }).join(", ") + '</div>' +
+            '<div class="muted">Removidos por resultado histórico idêntico: ' + removidosHistorico + '</div>' +
+            (jogosArq.length ? '<div class="muted">Removidos por subconjunto/coincidência com o arquivo carregado: <b>' + removidosArquivo + '</b> (comparados com ' + jogosArq.length + ' jogo(s) do arquivo)</div>' : '');
+        }
+        if (typeof renderDashboard === "function") renderDashboard();
+      }
+
+      if (!chkArquivo || !chkArquivo.checked || !jogosArq.length) {
+        mostrarResultadoFinal(aprovados, 0);
+        return;
+      }
+
+      // pré-computa os jogos do arquivo como Sets (uma vez só)
+      var arquivoSets = jogosArq.map(function (j) { return { arr: j, set: new Set(j) }; });
+
+      var mantidos = [];
+      var removidosArquivo = 0;
+      var idx = 0;
+
+      function loteExclusao() {
+        var fim = Math.min(idx + TAMANHO_LOTE, aprovados.length);
+        for (; idx < fim; idx++) {
+          var jogo = aprovados[idx];
+          var jogoSet = new Set(jogo);
+          var coincide = false;
+
+          for (var k = 0; k < arquivoSets.length; k++) {
+            var fArr = arquivoSets[k].arr, fSet = arquivoSets[k].set;
+            if (jogo.length <= fArr.length) {
+              if (ehSubconjunto(jogo, fSet)) { coincide = true; break; }
+            } else {
+              if (ehSubconjunto(fArr, jogoSet)) { coincide = true; break; }
+            }
+          }
+
+          if (coincide) removidosArquivo++;
+          else mantidos.push(jogo);
+        }
+
+        if (idx < aprovados.length) {
+          setTimeout(loteExclusao, 0);
+        } else {
+          mostrarResultadoFinal(mantidos, removidosArquivo);
+        }
+      }
+      loteExclusao();
+    });
+  }
+
+  var tentativas = 0;
+  var vigia = setInterval(function () {
+    tentativas++;
+    religarComRegraDeSubconjunto();
+    if (tentativas > 40) clearInterval(vigia);
+  }, 250);
+})();

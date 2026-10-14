@@ -1,0 +1,321 @@
+/* ============================================================
+   #pessoal
+   MPL — mpl-presets.js v2 — Presets (VCA Fase B)
+   SUBSTITUI a v1 inteira. ★ Premium
+
+   Correções v2:
+   1) FIM DO TRAVAMENTO — a v1 tentava abrir MPL_DB na versão 2
+      enquanto o mpl-core.js mantinha conexão aberta na versão 1.
+      Isso gera deadlock de upgrade (o navegador congela esperando
+      a conexão antiga fechar). Presets são objetos pequenos:
+      localStorage resolve, sem upgrade e sem risco.
+   2) POSIÇÃO — o painel agora é renderizado DENTRO do card do
+      Target Lock (seção separada por divisor), em vez de um card
+      irmão que estourava a largura do flex e quebrava linha.
+   ============================================================ */
+(function () {
+  "use strict";
+
+  var CHAVE = "mplPresets";
+  var cache = [];
+
+  /* ---------- Persistência (localStorage) ---------- */
+  function ler() {
+    try { return JSON.parse(localStorage.getItem(CHAVE) || "[]"); }
+    catch (e) { console.warn("Presets: storage corrompido, reiniciando."); return []; }
+  }
+  function gravar(lista) {
+    try { localStorage.setItem(CHAVE, JSON.stringify(lista)); return true; }
+    catch (e) { alert("Não foi possível salvar (storage cheio?): " + e.message); return false; }
+  }
+
+  /* ---------- Modelo ---------- */
+  function capturar(nome) {
+    var c = MPL_STATE.config, m = MPL_STATE.modalidade;
+    var v = window.MPL_VCA || {}, r = v.resultado;
+    return {
+      id: "p_" + Date.now() + "_" + Math.random().toString(36).slice(2, 7),
+      nome: nome,
+      modalidade: m ? m.presetKey : null,
+      modalidadeNome: m ? m.nome : "—",
+      criadoEm: new Date().toISOString(),
+      config: {
+        pesosPerfil: JSON.parse(JSON.stringify(c.pesosPerfil)),
+        modulosAtivos: JSON.parse(JSON.stringify(c.modulosAtivos)),
+        camadas: JSON.parse(JSON.stringify(c.camadas)),
+        janelasFrequencia: JSON.parse(JSON.stringify(c.janelasFrequencia)),
+        caixaJanela: c.caixaJanela,
+        K: (v.kOverride || c.K),
+        su: JSON.parse(JSON.stringify(c.su))
+      },
+      calibracao: (r && !r.erro) ? {
+        alvo: r.alvo, mapaIni: r.mapaIni, mapaFim: r.mapaFim,
+        janela: r.janela, K: r.K,
+        cobertura: r.cobertura, total: r.total, pct: Number(r.pct.toFixed(1))
+      } : null,
+      validacoes: []
+    };
+  }
+
+  function aplicar(p) {
+    if (!p || !p.config) return false;
+    if (p.modalidade && MPL_STATE.modalidade && p.modalidade !== MPL_STATE.modalidade.presetKey) {
+      if (!confirm("Preset criado para " + p.modalidadeNome + ", mas a modalidade ativa é " +
+        MPL_STATE.modalidade.nome + ".\n\nAplicar mesmo assim?")) return false;
+    }
+    var c = MPL_STATE.config, k = p.config;
+    c.pesosPerfil = JSON.parse(JSON.stringify(k.pesosPerfil));
+    c.modulosAtivos = JSON.parse(JSON.stringify(k.modulosAtivos));
+    if (k.camadas) c.camadas = JSON.parse(JSON.stringify(k.camadas));
+    if (k.janelasFrequencia) c.janelasFrequencia = JSON.parse(JSON.stringify(k.janelasFrequencia));
+    if (k.caixaJanela) { c.caixaJanela = k.caixaJanela; c.caixaConfirmada = true; }
+    if (k.su) c.su = JSON.parse(JSON.stringify(k.su));
+    c.K = k.K;
+    if (window.MPL_VCA) window.MPL_VCA.kOverride = k.K;
+    if (typeof renderPesosForm === "function") renderPesosForm();
+    if (typeof agendarRAE === "function") agendarRAE("preset", 200);
+    return true;
+  }
+
+  /* ---------- UI: dentro do card do Target Lock ---------- */
+  function montarSecao() {
+    var vcaCard = document.getElementById("vcaCard");
+    if (!vcaCard || !MPL_STATE.modalidade) return;
+    if (document.getElementById("presetsSecao")) { render(); return; }
+    var sec = document.createElement("div");
+    sec.id = "presetsSecao";
+    sec.style.cssText = "margin-top:16px;padding-top:14px;border-top:1px solid var(--border);";
+    sec.innerHTML = '<div id="presetsConteudo"></div>';
+    vcaCard.appendChild(sec);
+    cache = ler();
+    render();
+  }
+
+  function render() {
+    var el = document.getElementById("presetsConteudo");
+    if (!el) return;
+    var mk = MPL_STATE.modalidade ? MPL_STATE.modalidade.presetKey : null;
+    var lista = cache.filter(function (p) { return !p.modalidade || p.modalidade === mk; })
+      .sort(function (a, b) { return (b.criadoEm || "").localeCompare(a.criadoEm || ""); });
+
+    el.innerHTML =
+      '<h3 style="margin:0 0 6px;">💾 Presets <span style="font-size:9px;color:#eab308;">★ Premium</span></h3>' +
+      '<p class="muted" style="font-size:11px;margin:0 0 8px;">Salve a configuração e reaplique em outro cenário — é assim que se testa se ela sobrevive fora do mapa onde nasceu.</p>' +
+      '<input type="text" id="presetNome" placeholder="ex.: MS · janela 20 · calib 3057" style="font-size:11.5px;">' +
+      '<button id="btnSalvarPreset" class="btn-primary" style="width:100%;margin:2px 0 10px;font-size:11.5px;">Salvar configuração atual</button>' +
+      (lista.length ? lista.map(linha).join("")
+        : '<p class="muted" style="font-size:11px;">Nenhum preset para esta modalidade.</p>') +
+      '<div style="display:flex;gap:5px;margin-top:10px;">' +
+      '<button id="btnExportPresets" class="btn-secondary" style="flex:1;font-size:10.5px;padding:6px;margin:0;">Exportar</button>' +
+      '<button id="btnImportPresets" class="btn-secondary" style="flex:1;font-size:10.5px;padding:6px;margin:0;">Importar</button>' +
+      '</div><input type="file" id="presetFile" accept=".json" style="display:none;">';
+    ligar();
+  }
+
+  function linha(p) {
+    var c = p.calibracao;
+    var cor = c ? (c.pct >= 80 ? "#10b981" : (c.pct >= 60 ? "#eab308" : "#ef4444")) : "#64748b";
+    return '<div style="background:var(--graphite);border:1px solid var(--border);border-left:3px solid ' + cor +
+      ';border-radius:8px;padding:8px;margin-bottom:7px;">' +
+      '<div style="font-size:11.5px;font-weight:700;color:#e6edf7;">' + p.nome + '</div>' +
+      '<div class="muted" style="font-size:10px;margin:2px 0;">K=' + p.config.K +
+      ' · janela ' + (p.config.caixaJanela || "auto") + ' · ' +
+      new Date(p.criadoEm).toLocaleDateString("pt-BR") + '</div>' +
+      (c ? '<div style="font-size:10px;color:' + cor + ';">Alvo <b>' + c.alvo + '</b> (' + c.mapaIni + '→' + c.mapaFim +
+        '): ' + c.cobertura + '/' + c.total + ' · ' + c.pct + '%</div>'
+        : '<div class="muted" style="font-size:10px;">Sem calibração registrada.</div>') +
+      '<div style="display:flex;gap:4px;margin-top:5px;">' +
+      '<button class="btn-secondary pAplicar" data-id="' + p.id + '" style="flex:1;font-size:10px;padding:4px;margin:0;">Aplicar</button>' +
+      '<button class="btn-danger pApagar" data-id="' + p.id + '" style="font-size:10px;padding:4px 8px;margin:0;">✕</button>' +
+      '</div></div>';
+  }
+
+  function ligar() {
+    var b = document.getElementById("btnSalvarPreset");
+    if (b && !b.__p) {
+      b.__p = true;
+      b.addEventListener("click", function () {
+        var nome = (document.getElementById("presetNome").value || "").trim();
+        if (!nome) return alert("Dê um nome ao preset.");
+        cache.push(capturar(nome));
+        if (gravar(cache)) {
+          document.getElementById("presetNome").value = "";
+          render();
+        }
+      });
+    }
+    document.querySelectorAll(".pAplicar").forEach(function (btn) {
+      if (btn.__p) return; btn.__p = true;
+      btn.addEventListener("click", function () {
+        var p = cache.find(function (x) { return x.id === btn.dataset.id; });
+        if (p && aplicar(p)) {
+          alert("Preset aplicado: " + p.nome +
+            (p.calibracao ? "\n\nCalibrado no alvo " + p.calibracao.alvo +
+              ".\nTestar em OUTRO alvo = validação real (out-of-sample)." : ""));
+        }
+      });
+    });
+    document.querySelectorAll(".pApagar").forEach(function (btn) {
+      if (btn.__p) return; btn.__p = true;
+      btn.addEventListener("click", function () {
+        if (!confirm("Apagar este preset?")) return;
+        cache = cache.filter(function (x) { return x.id !== btn.dataset.id; });
+        gravar(cache); render();
+      });
+    });
+    var ex = document.getElementById("btnExportPresets");
+    if (ex && !ex.__p) {
+      ex.__p = true;
+      ex.addEventListener("click", function () {
+        if (!cache.length) return alert("Nenhum preset para exportar.");
+        var n = (typeof normalizarNomeModalidade === "function" && MPL_STATE.modalidade)
+          ? normalizarNomeModalidade(MPL_STATE.modalidade.nome) : "MPL";
+        baixarArquivo(JSON.stringify(cache, null, 2), "MPL_PRESETS_" + n + ".json", "application/json");
+      });
+    }
+    var im = document.getElementById("btnImportPresets"), f = document.getElementById("presetFile");
+    if (im && !im.__p) { im.__p = true; im.addEventListener("click", function () { f.click(); }); }
+    if (f && !f.__p) {
+      f.__p = true;
+      f.addEventListener("change", function (e) {
+        var file = e.target.files[0];
+        if (!file) return;
+        var rd = new FileReader();
+        rd.onload = function () {
+          try {
+            var lista = JSON.parse(String(rd.result));
+            if (!Array.isArray(lista)) throw new Error("JSON deve ser um array.");
+            lista.forEach(function (p) {
+              p.id = p.id || ("p_" + Date.now() + "_" + Math.random().toString(36).slice(2, 7));
+              cache.push(p);
+            });
+            gravar(cache); render();
+            alert(lista.length + " preset(s) importado(s).");
+          } catch (err) { alert("Arquivo inválido: " + err.message); }
+        };
+        rd.readAsText(file);
+      });
+    }
+  }
+
+  if (typeof mplOn === "function") mplOn("radar:form", montarSecao, 65);
+  document.addEventListener("DOMContentLoaded", function () { setTimeout(montarSecao, 900); });
+
+  window.MPL_PRESETS = { capturar: capturar, aplicar: aplicar, listar: ler };
+  console.log("MPL Presets v2: localStorage (sem upgrade de DB), painel dentro do Target Lock.");
+})();
+/* ============================================================
+   #pessoal
+   MPL — Presets 9.8 — sincroniza os SLIDERS do Cockpit ao aplicar
+   COLE NO FINAL DE js/mpl-presets.js.
+
+   Bug: aplicar() atualizava MPL_STATE.config.pesosPerfil (cálculo
+   correto), mas os sliders do Cockpit continuavam exibindo os
+   valores antigos — e ao tocar em qualquer slider, o valor velho
+   era gravado de volta, corrompendo o preset aplicado.
+
+   Correção: após aplicar, empurra os valores do estado para os
+   controles do Cockpit e da aba Módulos & Pesos. Atribuir .value
+   por código NÃO dispara o evento "input", então não há recálculo
+   em cascata nem risco de loop.
+   ============================================================ */
+(function () {
+  "use strict";
+
+  function sincronizarControles() {
+    var p = MPL_STATE.config.pesosPerfil;
+    var ativos = MPL_STATE.config.modulosAtivos;
+
+    Object.keys(p).forEach(function (k) {
+      var pct = (p[k] * 100).toFixed(0);
+
+      /* Cockpit de Pesos (aba Radar) */
+      var sl = document.getElementById("cockSlider_" + k);
+      var vl = document.getElementById("cockValor_" + k);
+      var ck = document.getElementById("cockAtivo_" + k);
+      if (sl) sl.value = pct;
+      if (vl) vl.textContent = pct + "%";
+      if (ck) ck.checked = !!ativos[k];
+
+      /* Aba Módulos & Pesos */
+      var np = document.getElementById("peso_" + k);
+      var na = document.getElementById("ativo_" + k);
+      if (np) np.value = p[k];
+      if (na) na.checked = !!ativos[k];
+    });
+
+    /* K do Target Lock */
+    var kr = document.getElementById("vcaKRange");
+    var kn = document.getElementById("vcaK");
+    var kAtual = (window.MPL_VCA && window.MPL_VCA.kOverride) || MPL_STATE.config.K;
+    if (kr) kr.value = kAtual;
+    if (kn) kn.value = kAtual;
+
+    var st = document.getElementById("cockpitStatus");
+    if (st) st.textContent = "Preset aplicado às " + new Date().toLocaleTimeString("pt-BR") + " — sliders sincronizados.";
+
+    console.log("MPL 9.8: controles sincronizados com o preset.", p);
+  }
+
+  /* embrulha o aplicar() do módulo de presets */
+  if (window.MPL_PRESETS && typeof MPL_PRESETS.aplicar === "function") {
+    var __orig = MPL_PRESETS.aplicar;
+    MPL_PRESETS.aplicar = function (p) {
+      var ok = __orig(p);
+      if (ok) setTimeout(sincronizarControles, 120); // após renderPesosForm()
+      return ok;
+    };
+  }
+
+  /* rede de segurança: intercepta o clique em "Aplicar" na captura */
+  document.addEventListener("click", function (e) {
+    var b = e.target && e.target.closest ? e.target.closest(".pAplicar") : null;
+    if (b) setTimeout(sincronizarControles, 250);
+  }, true);
+
+  window.mplSincronizarControles = sincronizarControles;
+  console.log("MPL Presets 9.8: sincronização de sliders ativa.");
+})();
+/* ============================================================
+   #pessoal
+   MPL — Presets 9.13 — Recarregar lista ao abrir o Radar
+   COLE NO FINAL DE js/mpl-presets.js.
+
+   Bug: o card guardava a lista na memória ao ser montado. Presets
+   gravados por fora (ex.: pelo OCA no Lab Quant) só apareciam
+   depois de recarregar a página.
+   Agora a lista é relida do armazenamento sempre que a aba Radar
+   é aberta, quando a modalidade muda e a cada 2 s com o card visível.
+   ============================================================ */
+(function () {
+  "use strict";
+
+  var assinatura = null;
+
+  function reler() {
+    var bruto = localStorage.getItem("mplPresets") || "[]";
+    var mk = MPL_STATE.modalidade ? MPL_STATE.modalidade.presetKey : "";
+    var nova = mk + "|" + bruto.length;
+    if (nova === assinatura) return;
+    assinatura = nova;
+
+    var sec = document.getElementById("presetsSecao");
+    if (!sec) return;
+    sec.remove();                                   /* força remontagem com dados novos */
+    if (window.MPL_PRESETS && typeof renderRadarForm === "function") {
+      if (typeof mplEmit === "function") mplEmit("radar:form", []);
+    }
+    console.log("MPL Presets 9.13: lista recarregada (" + mk + ").");
+  }
+
+  document.addEventListener("click", function (e) {
+    var t = e.target && e.target.closest ? e.target.closest('.tab-btn[data-tab="radar"]') : null;
+    if (t) setTimeout(function () { assinatura = null; reler(); }, 250);
+  }, true);
+
+  setInterval(function () {
+    if (document.getElementById("presetsSecao") || document.getElementById("vcaCard")) reler();
+  }, 2000);
+
+  console.log("MPL Presets 9.13: atualização automática da lista ativa.");
+})();

@@ -1,0 +1,98 @@
+/* ============================================================
+   MPL — mpl-perfil-dezena.js  (arquivo NOVO e independente)
+   ADICIONE no index.html, depois de js/mpl-ui.js:
+     <script src="js/mpl-perfil-dezena.js"></script>
+
+   Responde à referência visual anexada pelo usuário: um "mini mapa"
+   ao lado do Radar, mostrando cada dezena do RR(K) com seu perfil
+   estrutural completo — reaproveitando o STF já calculado como
+   "força %", e acrescentando 3 classificações que o MPL ainda não
+   tinha em lugar nenhum: primo, Fibonacci e posição acima/abaixo da
+   média numérica do universo (não é o mesmo que SEI, que mede
+   contribuição estrutural histórica — isto aqui é só a "ficha de
+   identidade" matemática da própria dezena, informativo).
+   ============================================================ */
+(function () {
+  "use strict";
+
+  function ehPrimo(n) {
+    if (n < 2) return false;
+    for (var i = 2; i * i <= n; i++) if (n % i === 0) return false;
+    return true;
+  }
+  function ehFibonacci(n) {
+    var a = 0, b = 1;
+    while (b < n) { var t = a + b; a = b; b = t; }
+    return b === n;
+  }
+
+  function montarCardPerfil() {
+    var radarResult = document.getElementById("radarResult");
+    if (!radarResult || document.getElementById("perfilDezenaCard")) return;
+    var card = document.createElement("div");
+    card.className = "card";
+    card.id = "perfilDezenaCard";
+    card.innerHTML =
+      '<h3>Perfil das Dezenas do Radar Reduzido</h3>' +
+      '<p class="muted">Ficha individual de cada dezena dentro do RR(K) atual: força (STF), classe, e classificações estruturais — para acompanhar em tempo real como cada mexida no método reflete na composição do radar.</p>' +
+      '<div id="perfilDezenaGrid" class="grid-cards"></div>';
+
+    // insere ao lado do radar de avião, se existir; senão, depois do resultado padrão
+    var radarAviaoCard = document.getElementById("radarAviaoCard");
+    var alvo = radarAviaoCard || radarResult;
+    alvo.parentNode.insertBefore(card, alvo.nextSibling);
+  }
+
+  function badgeMini(texto, ativo, corAtivo) {
+    var estilo = ativo
+      ? "background:" + corAtivo + ";color:#03121a;"
+      : "background:#1c2434;color:#4b5a78;";
+    return '<span style="display:inline-block;' + estilo + 'border-radius:10px;padding:2px 7px;font-size:10px;font-weight:700;margin:2px 3px 0 0;">' + texto + '</span>';
+  }
+
+  function renderizarPerfil() {
+    var grid = document.getElementById("perfilDezenaGrid");
+    if (!grid || !MPL_STATE.modalidade) return;
+    var reduzido = (MPL_STATE.cache.radar && MPL_STATE.cache.radar.reduzido) || [];
+    if (!reduzido.length) { grid.innerHTML = '<p class="muted">Gere o Radar Reduzido para ver o perfil das dezenas.</p>'; return; }
+
+    var U = MPL_STATE.modalidade.universo;
+    var media = (U + 1) / 2;
+    var cor = (typeof obterCorModalidade === "function") ? obterCorModalidade(MPL_STATE.modalidade) : { principal: "#22d3ee" };
+
+    var ordenado = reduzido.slice().sort(function (a, b) { return b.STF - a.STF; });
+
+    grid.innerHTML = ordenado.map(function (d) {
+      var par = d.dezena % 2 === 0;
+      var primo = ehPrimo(d.dezena);
+      var fib = ehFibonacci(d.dezena);
+      var acima = d.dezena > media;
+
+      return '<div class="stat-card" style="border-top:3px solid ' + cor.principal + ';">' +
+        '<div style="display:flex;justify-content:space-between;align-items:baseline;">' +
+        '<span style="font-size:20px;font-weight:800;color:' + cor.principal + ';">' + String(d.dezena).padStart(2, "0") + '</span>' +
+        '<span class="badge badge-' + d.classe + '">' + d.classe + '</span>' +
+        '</div>' +
+        '<div style="font-size:11px;color:#8fa3c4;margin-top:2px;">Força (STF): <b style="color:#e6edf7;">' + d.STF.toFixed(1) + '%</b></div>' +
+        '<div style="margin-top:6px;">' +
+        badgeMini(par ? "PAR" : "ÍMPAR", true, "#334155") +
+        badgeMini("PRIMO", primo, "#a855f7") +
+        badgeMini("FIBONACCI", fib, "#f59e0b") +
+        badgeMini(acima ? "ACIMA DA MÉDIA" : "ABAIXO DA MÉDIA", true, "#334155") +
+        '</div>' +
+        '</div>';
+    }).join("");
+  }
+
+  /* t11-C3 Fase 4 */
+  if (typeof mplOn === "function") {
+    mplOn("radar:form", function () {
+      montarCardPerfil();
+      setTimeout(renderizarPerfil, 40);
+    }, 70);
+  }
+
+  // também atualiza sempre que o dashboard for re-renderizado (ex.: após recalcular scores)
+  /* t11-C3: migrado para hooks — não embrulha mais renderDashboard */
+  if (typeof mplOn === "function") mplOn("dashboard", renderizarPerfil, 70);
+})();

@@ -1,0 +1,40 @@
+/* ============================================================
+   MPL — mpl-radar-container.js  (arquivo NOVO)
+   ADICIONE no index.html, ANTES de mpl-radar-avcombat-v3.js e
+   ANTES de mpl-cockpit-pesos.js:
+     <script src="js/mpl-radar-container.js"></script>
+
+   Recria o container/canvas do radar visual, que foi removido
+   junto com o Patch U original (apagado do mpl-ui.js). O cálculo
+   e o desenho (v3) continuavam intactos — só faltava o "lugar" no
+   HTML onde desenhar. Este arquivo devolve exatamente isso, sem
+   depender de nada que foi apagado.
+   ============================================================ */
+(function () {
+  "use strict";
+
+  function montarContainer() {
+    if (document.getElementById("radarAviaoCard")) return;
+    var radarResult = document.getElementById("radarResult");
+    var tab = document.getElementById("tab-radar");
+    if (!radarResult && !tab) return;
+
+    var card = document.createElement("div");
+    card.className = "card";
+    card.id = "radarAviaoCard";
+    card.innerHTML =
+      '<h3>Radar — Visão de Proximidade</h3>' +
+      '<p class="muted">Quanto mais perto da mira (centro), maior o STF da dezena — ou seja, maior a relevância que o método atribuiu a ela dentro da configuração atual. Dezenas fora do anel colorido não entraram no Radar Reduzido RR(K).</p>' +
+      '<canvas id="radarAviaoCanvas" width="520" height="520" style="width:100%;max-width:520px;display:block;margin:0 auto;"></canvas>';
+
+    if (radarResult && radarResult.parentNode) {
+      radarResult.parentNode.insertBefore(card, radarResult.nextSibling);
+    } else {
+      tab.appendChild(card);
+    }
+  }
+
+  /* t11-C3 Fase 4: p30 — cria o card antes do cockpit tentar movê-lo (p40) */
+  if (typeof mplOn === "function") mplOn("radar:form", montarContainer, 30);
+  document.addEventListener("DOMContentLoaded", function () { setTimeout(montarContainer, 350); });
+})();

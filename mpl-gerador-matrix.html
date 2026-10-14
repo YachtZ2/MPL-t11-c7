@@ -1,0 +1,153 @@
+/* ============================================================
+   MPL — mpl-gerador-matrix.js  (arquivo NOVO)
+   ADICIONE no index.html, depois de js/mpl-ui.js:
+     <script src="js/mpl-gerador-matrix.js"></script>
+
+   1) Fundo estilo "chuva de código" (Matrix) na aba Gerador de Jogos
+      — decorativo, atrás do formulário, com opacidade baixa pra não
+      prejudicar a leitura.
+   2) Barra de progresso visual ao clicar em "Gerar Jogos Candidatos".
+      Aviso honesto: como a geração roda de forma síncrona (trava a
+      aba até terminar — é assim que o JavaScript funciona sem
+      reestruturar o gerador em pedaços), a barra dá o sinal visual
+      de "processando" antes e depois, mas não é um percentual real
+      passo a passo enquanto a conta pesada roda. Para virar 100%
+      em tempo real, precisaríamos fatiar a geração em lotes — fica
+      anotado como possível evolução futura, não fiz sozinho agora
+      para não arriscar mudar o motor sem sua validação.
+   3) "Modo Híbrido (DZC)" com tema de cheat code/GameShark.
+   ============================================================ */
+(function () {
+  "use strict";
+
+  /* ---------- 1) Chuva de código de fundo ---------- */
+  function montarMatrixBg() {
+    var form = document.getElementById("geradorForm");
+    if (!form || document.getElementById("matrixBgCanvas")) return;
+    form.style.position = "relative";
+    form.style.overflow = "hidden";
+
+    var canvas = document.createElement("canvas");
+    canvas.id = "matrixBgCanvas";
+    canvas.style.cssText = "position:absolute;top:0;left:0;width:100%;height:100%;z-index:0;opacity:.16;pointer-events:none;";
+    form.insertBefore(canvas, form.firstChild);
+
+    // garante que o conteúdo real fique acima do fundo
+    Array.prototype.forEach.call(form.children, function (child) {
+      if (child !== canvas) { child.style.position = "relative"; child.style.zIndex = "1"; }
+    });
+
+    function redimensionar() {
+      canvas.width = form.clientWidth;
+      canvas.height = form.clientHeight;
+    }
+    redimensionar();
+    window.addEventListener("resize", redimensionar);
+
+    var ctx = canvas.getContext("2d");
+    var chars = "0123456789ABCDEF01ΔΣΩ";
+    var tamanhoFonte = 13;
+    var colunas, gotas;
+
+    function iniciarGotas() {
+      colunas = Math.max(1, Math.floor(canvas.width / tamanhoFonte));
+      gotas = new Array(colunas).fill(0).map(function () { return Math.random() * canvas.height / tamanhoFonte; });
+    }
+    iniciarGotas();
+    window.addEventListener("resize", iniciarGotas);
+
+    function frame() {
+      if (!document.getElementById("matrixBgCanvas")) return; // aba pode ter sido removida
+      var cor = (MPL_STATE.modalidade && typeof obterCorModalidade === "function") ? obterCorModalidade(MPL_STATE.modalidade).principal : "#22d3ee";
+      ctx.fillStyle = "rgba(3,8,10,0.10)";
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      ctx.fillStyle = cor;
+      ctx.font = tamanhoFonte + "px monospace";
+      for (var i = 0; i < gotas.length; i++) {
+        var texto = chars[Math.floor(Math.random() * chars.length)];
+        ctx.fillText(texto, i * tamanhoFonte, gotas[i] * tamanhoFonte);
+        if (gotas[i] * tamanhoFonte > canvas.height && Math.random() > 0.975) gotas[i] = 0;
+        gotas[i]++;
+      }
+      requestAnimationFrame(frame);
+    }
+    requestAnimationFrame(frame);
+  }
+
+  /* ---------- 2) Barra de progresso na geração ---------- */
+  function montarBarraProgresso() {
+    var form = document.getElementById("geradorForm");
+    if (!form || document.getElementById("geradorProgressoWrap")) return;
+    var wrap = document.createElement("div");
+    wrap.id = "geradorProgressoWrap";
+    wrap.style.cssText = "display:none;margin-top:10px;position:relative;z-index:1;";
+    wrap.innerHTML =
+      '<div style="background:#1c2434;border-radius:8px;overflow:hidden;height:10px;">' +
+      '<div id="geradorProgressoBarra" style="height:100%;width:0%;background:linear-gradient(90deg,#22d3ee,#6366f1);transition:width .3s;"></div>' +
+      '</div>' +
+      '<div id="geradorProgressoTexto" class="muted" style="font-size:11px;margin-top:4px;">Processando...</div>';
+    form.appendChild(wrap);
+  }
+
+  function religarBotaoGerar() {
+    var btn = document.getElementById("btnGerarJogos");
+    if (!btn || btn.__matrixLigado) return;
+    btn.__matrixLigado = true;
+    btn.addEventListener("click", function () {
+      var wrap = document.getElementById("geradorProgressoWrap");
+      var barra = document.getElementById("geradorProgressoBarra");
+      var texto = document.getElementById("geradorProgressoTexto");
+      if (!wrap) return;
+      wrap.style.display = "block";
+      barra.style.width = "15%";
+      texto.textContent = "Calculando universo combinatório...";
+      setTimeout(function () {
+        barra.style.width = "60%";
+        texto.textContent = "Gerando jogos candidatos (JC)...";
+      }, 30);
+      setTimeout(function () {
+        barra.style.width = "100%";
+        texto.textContent = "Concluído.";
+        setTimeout(function () { wrap.style.display = "none"; barra.style.width = "0%"; }, 900);
+      }, 60);
+    });
+  }
+
+  /* ---------- 3) Modo Híbrido com tema de cheat code ---------- */
+  function retemarHibrido() {
+    var chk = document.getElementById("dzcAtivo");
+    if (!chk || chk.__retemado) return;
+    chk.__retemado = true;
+    var label = document.querySelector('label[for="dzcAtivo"]');
+    if (label) {
+      label.innerHTML = '💾 <span style="letter-spacing:1px;">CHEAT CODE: RADAR OVERRIDE</span> <span class="muted" style="font-weight:400;">(Modo Híbrido / DZC)</span>';
+    }
+    var painel = document.getElementById("dzcPanel");
+    if (painel && !painel.__retemado) {
+      painel.__retemado = true;
+      var aviso = document.createElement("div");
+      aviso.className = "info-box";
+      aviso.style.marginBottom = "10px";
+      aviso.innerHTML = '⚠️ <b>Ativando o "hack"...</b> Você está reduzindo o radar pra melhorar a organização das suas chances — mas aqui pode inserir dezenas "coringa" de fora do radar, tipo um código secreto pra diversificar a jogada. Não aumenta a chance real de acerto: é uma escolha de diversidade, não uma vantagem estatística contra o sorteio.';
+      painel.insertBefore(aviso, painel.firstChild);
+    }
+  }
+
+  function boot() {
+    montarMatrixBg();
+    montarBarraProgresso();
+    religarBotaoGerar();
+  }
+
+  var tentativas = 0;
+  var vigia = setInterval(function () {
+    tentativas++;
+    boot();
+    retemarHibrido();
+    if (tentativas > 40) clearInterval(vigia);
+  }, 200);
+
+  document.querySelectorAll(".tab-btn").forEach(function (b) {
+    if (b.dataset.tab === "gerador") b.addEventListener("click", function () { setTimeout(retemarHibrido, 60); });
+  });
+})();

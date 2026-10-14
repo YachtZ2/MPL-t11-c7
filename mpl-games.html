@@ -1,0 +1,582 @@
+/* ============================================================
+   MPL — mpl-games.js  (Book 2 — Bilhete Blindado)
+   GJ (Geração), FD (Filtros Duros), SEJ, SUJ, SCOJ, STJ
+   Fórmulas canônicas — Volume 2
+   v1.2 — filtros por linha/coluna agora são detalhados por índice
+   (Linha 1, Linha 2, ... e Coluna 1, Coluna 2, ...), conforme o
+   layout oficial do volante de cada modalidade.
+   ============================================================ */
+
+const LIMITE_GERACAO_COMPLETA = 200000; // acima disso, forçar amostragem
+
+/* Gerador seedável (mulberry32) — reprodutibilidade */
+function criarRNG(seed) {
+  let a = seed >>> 0;
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+/* GJ — Geração Completa: C(K,A) combinações */
+function gerarJogosCompleto(dezenas, A) {
+  const resultados = [];
+  function backtrack(start, combo) {
+    if (combo.length === A) { resultados.push([...combo]); return; }
+    for (let i = start; i < dezenas.length; i++) {
+      combo.push(dezenas[i]);
+      backtrack(i + 1, combo);
+      combo.pop();
+    }
+  }
+  backtrack(0, []);
+  return resultados;
+}
+
+/* GJ — Geração Amostral: amostra aleatória com seed, sem repetição de jogo */
+function gerarJogosAmostral(dezenas, A, quantidade, seed = 42) {
+  const rng = criarRNG(seed);
+  const jogos = new Set();
+  const resultados = [];
+  let tentativas = 0;
+  const maxTentativas = quantidade * 30;
+  while (resultados.length < quantidade && tentativas < maxTentativas) {
+    tentativas++;
+    const pool = [...dezenas];
+    const combo = [];
+    for (let i = 0; i < A && pool.length; i++) {
+      const idx = Math.floor(rng() * pool.length);
+      combo.push(pool.splice(idx, 1)[0]);
+    }
+    combo.sort((a, b) => a - b);
+    const key = combo.join(",");
+    if (!jogos.has(key)) { jogos.add(key); resultados.push(combo); }
+  }
+  return resultados;
+}
+
+/* Decide estratégia de geração conforme volume combinatório estimado (Estratégia Automática) */
+function gerarJogosCandidatos(dezenas, A, opcoes = {}) {
+  const K = dezenas.length;
+  const totalPossivel = combinacao(K, A);
+  if (totalPossivel <= (opcoes.limite || LIMITE_GERACAO_COMPLETA)) {
+    return { jogos: gerarJogosCompleto(dezenas, A), estrategia: "completa", totalPossivel };
+  }
+  const qtd = opcoes.qtdAmostra || 20000;
+  return { jogos: gerarJogosAmostral(dezenas, A, qtd, opcoes.seed || 42), estrategia: "amostral", totalPossivel };
+}
+
+/* ---------------- FD — Filtros Duros ---------------- */
+function contarPares(jogo) { return jogo.filter(d => d % 2 === 0).length; }
+function somaJogo(jogo) { return jogo.reduce((a, b) => a + b, 0); }
+
+function contarConsecutivasMax(jogo) {
+  const s = [...jogo].sort((a, b) => a - b);
+  let maxSeq = 1, atual = 1;
+  for (let i = 1; i < s.length; i++) {
+    if (s[i] === s[i - 1] + 1) { atual++; maxSeq = Math.max(maxSeq, atual); }
+    else atual = 1;
+  }
+  return maxSeq;
+}
+
+function contarRepetidas(jogo, concursoAnteriorDezenas) {
+  if (!concursoAnteriorDezenas) return 0;
+  return jogo.filter(d => concursoAnteriorDezenas.includes(d)).length;
+}
+
+function distribuicaoPorFaixas(jogo, universo, qtdFaixas) {
+  const tamanho = Math.ceil(universo / qtdFaixas);
+  const dist = Array(qtdFaixas).fill(0);
+  jogo.forEach(d => { const f = Math.min(qtdFaixas - 1, Math.floor((d - 1) / tamanho)); dist[f]++; });
+  return dist;
+}
+
+/* Distribuição por linha/coluna do volante oficial — retorna arrays densos
+   (índice 0..N-1), já preenchidos com zero, prontos para filtros detalhados. */
+function distribuicaoPorLinhaColuna(jogo, layout) {
+  const linhas = Array(layout.linhas).fill(0);
+  const colunas = Array(layout.colunas).fill(0);
+  jogo.forEach(d => {
+    const idx = d - 1;
+    const l = Math.floor(idx / layout.colunas);
+    const c = idx % layout.colunas;
+    if (l >= 0 && l < linhas.length) linhas[l]++;
+    if (c >= 0 && c < colunas.length) colunas[c]++;
+  });
+  return { linhas, colunas };
+}
+
+function aplicarFiltrosDuros(jogo, filtros, contexto) {
+  const { universo, concursoAnterior, rankingDezenas, layout } = contexto;
+
+  if (filtros.paridade?.ativo) {
+    const p = contarPares(jogo);
+    if (filtros.paridade.min !== null && p < filtros.paridade.min) return { passou: false, motivo: "paridade-min" };
+    if (filtros.paridade.max !== null && p > filtros.paridade.max) return { passou: false, motivo: "paridade-max" };
+  }
+  if (filtros.soma?.ativo) {
+    const s = somaJogo(jogo);
+    if (filtros.soma.min !== null && s < filtros.soma.min) return { passou: false, motivo: "soma-min" };
+    if (filtros.soma.max !== null && s > filtros.soma.max) return { passou: false, motivo: "soma-max" };
+  }
+  if (filtros.faixas?.ativo) {
+    const dist = distribuicaoPorFaixas(jogo, universo, filtros.faixas.qtd || 3);
+    if (dist.some(v => v < (filtros.faixas.minPorFaixa || 0))) return { passou: false, motivo: "faixas-min" };
+  }
+  if (filtros.consecutivas?.ativo) {
+    if (contarConsecutivasMax(jogo) > (filtros.consecutivas.max ?? 99)) return { passou: false, motivo: "consecutivas" };
+  }
+  if (filtros.repetidas?.ativo && concursoAnterior) {
+    const r = contarRepetidas(jogo, concursoAnterior);
+    if (filtros.repetidas.min !== null && r < filtros.repetidas.min) return { passou: false, motivo: "repetidas-min" };
+    if (filtros.repetidas.max !== null && r > filtros.repetidas.max) return { passou: false, motivo: "repetidas-max" };
+  }
+  if (filtros.classesSTF?.ativo && rankingDezenas) {
+    const mapa = {}; rankingDezenas.forEach(d => mapa[d.dezena] = d.classe);
+    const qtdA = jogo.filter(d => mapa[d] === "A").length;
+    if (qtdA < (filtros.classesSTF.minA || 0)) return { passou: false, motivo: "classeA-min" };
+  }
+  if (filtros.fixas?.ativo && contexto.fixas?.length) {
+    if (!contexto.fixas.every(f => jogo.includes(f))) return { passou: false, motivo: "fixas-ausentes" };
+  }
+  if (filtros.proibidas?.ativo && contexto.proibidas?.length) {
+    if (jogo.some(d => contexto.proibidas.includes(d))) return { passou: false, motivo: "proibida-presente" };
+  }
+  /* PIN — dezenas que devem estar presentes em TODOS os jogos (independente de SU/fixas) */
+  if (filtros.pin?.ativo && filtros.pin.dezenas?.length) {
+    if (!filtros.pin.dezenas.every(p => jogo.includes(p))) return { passou: false, motivo: "pin-ausente" };
+  }
+  /* Filtros DETALHADOS por linha/coluna — não se aplicam a layouts posicionais (Super Sete) */
+  if (layout && !layout.especial && (Array.isArray(filtros.porLinha) && filtros.porLinha.some(f => f?.ativo) ||
+      Array.isArray(filtros.porColuna) && filtros.porColuna.some(f => f?.ativo))) {
+    const { linhas, colunas } = distribuicaoPorLinhaColuna(jogo, layout);
+
+    if (Array.isArray(filtros.porLinha)) {
+      for (let i = 0; i < filtros.porLinha.length; i++) {
+        const f = filtros.porLinha[i];
+        if (f?.ativo) {
+          const contagem = linhas[i] || 0;
+          if (contagem < f.min || contagem > f.max) return { passou: false, motivo: `linha${i + 1}-fora-faixa` };
+        }
+      }
+    }
+    if (Array.isArray(filtros.porColuna)) {
+      for (let i = 0; i < filtros.porColuna.length; i++) {
+        const f = filtros.porColuna[i];
+        if (f?.ativo) {
+          const contagem = colunas[i] || 0;
+          if (contagem < f.min || contagem > f.max) return { passou: false, motivo: `coluna${i + 1}-fora-faixa` };
+        }
+      }
+    }
+  }
+  return { passou: true };
+}
+
+function aplicarPipelineFiltros(jogos, filtros, contexto) {
+  const aprovados = [];
+  const eliminados = { total: 0, motivos: {} };
+  jogos.forEach(j => {
+    const r = aplicarFiltrosDuros(j, filtros, contexto);
+    if (r.passou) aprovados.push(j);
+    else { eliminados.total++; eliminados.motivos[r.motivo] = (eliminados.motivos[r.motivo] || 0) + 1; }
+  });
+  return { aprovados, eliminados };
+}
+
+/* Filtro Histórico Pós-Geração: remove jogos idênticos a resultados já sorteados */
+function filtrarResultadosHistoricos(jogos, base) {
+  const historicos = new Set(base.map(c => [...c.dezenas].sort((a, b) => a - b).join(",")));
+  const mantidos = [];
+  let removidos = 0;
+  jogos.forEach(j => {
+    const key = [...j].sort((a, b) => a - b).join(",");
+    if (historicos.has(key)) removidos++;
+    else mantidos.push(j);
+  });
+  return { mantidos, removidos };
+}
+
+/* Deduplicação por distância de Hamming mínima entre jogos */
+function deduplicarPorHamming(jogos, distanciaMinima = 2) {
+  const mantidos = [];
+  jogos.forEach(j => {
+    const jSet = new Set(j);
+    const duplicadoOuMuitoParecido = mantidos.some(m => {
+      const iguais = m.filter(x => jSet.has(x)).length;
+      const diferenca = j.length - iguais;
+      return diferenca < distanciaMinima;
+    });
+    if (!duplicadoOuMuitoParecido) mantidos.push(j);
+  });
+  return mantidos;
+}
+
+/* ---------------- SEJ — Score Estrutural do Jogo ---------------- */
+function calcularSEJ(jogo, modalidade, base, concursoAnterior) {
+  const A = jogo.length;
+  const universo = modalidade.universo;
+
+  const pares = contarPares(jogo);
+  const propPares = pares / A;
+  const sparj = limitar(100 - Math.abs(propPares - 0.5) * 200, 0, 100);
+
+  const dist = distribuicaoPorFaixas(jogo, universo, 3);
+  const esperadoPorFaixa = A / 3;
+  const desvioFaixas = media(dist.map(v => Math.abs(v - esperadoPorFaixa)));
+  const sfxj = limitar(100 - desvioFaixas * 25, 0, 100);
+
+  const somasHistoricas = base.map(c => somaJogo(c.dezenas.slice(0, A)));
+  const somaMedia = somasHistoricas.length ? media(somasHistoricas) : (universo + 1) * A / 2;
+  const somaDesvio = somasHistoricas.length ? desvioPadrao(somasHistoricas) : somaMedia * 0.15;
+  const sJogo = somaJogo(jogo);
+  const ssomj = somaDesvio > 0 ? limitar(100 * Math.exp(-((sJogo - somaMedia) ** 2) / (2 * somaDesvio ** 2)), 0, 100) : 60;
+
+  const maxSeq = contarConsecutivasMax(jogo);
+  const sconj = limitar(100 - Math.max(0, maxSeq - 2) * 22, 0, 100);
+
+  const rep = contarRepetidas(jogo, concursoAnterior);
+  const repEsperado = A * calcularFE(modalidade.dezenasSorteadas, modalidade.universo);
+  const srepj = limitar(100 - Math.abs(rep - repEsperado) * 18, 0, 100);
+
+  const ordenado = [...jogo].sort((a, b) => a - b);
+  const gaps = [];
+  for (let i = 1; i < ordenado.length; i++) gaps.push(ordenado[i] - ordenado[i - 1]);
+  const gapEsperado = universo / A;
+  const sdisj = gaps.length ? limitar(100 - Math.abs(media(gaps) - gapEsperado) / gapEsperado * 60, 0, 100) : 50;
+
+  const subscores = [sparj, sfxj, ssomj, sconj, srepj, sdisj];
+  const sejBase = 0.20 * sparj + 0.20 * sfxj + 0.20 * ssomj + 0.15 * sconj + 0.15 * srepj + 0.10 * sdisj;
+
+  const scoej = limitar(1 - (desvioPadrao(subscores) / 100), 0.6, 1);
+
+  return { sej: limitar(sejBase * scoej, 0, 100), sparj, sfxj, ssomj, sconj, srepj, sdisj, scoej };
+}
+
+function classeSEJ(valor) {
+  if (valor >= 85) return "A";
+  if (valor >= 70) return "B";
+  if (valor >= 55) return "C";
+  if (valor >= 40) return "D";
+  return "E";
+}
+
+/* ---------------- SUJ — Score do Usuário no Jogo ---------------- */
+function calcularSUJ(jogo, suConfig, rankingDezenas) {
+  const mapaClasse = {}; (rankingDezenas || []).forEach(d => mapaClasse[d.dezena] = d.classe);
+
+  const qtdA = jogo.filter(d => mapaClasse[d] === "A").length;
+  const qtdPreferenciais = jogo.filter(d => (suConfig.preferenciais || []).includes(d)).length;
+  const pco = Math.min(20, qtdA * 3 + qtdPreferenciais * 4);
+
+  const qtdEvitar = jogo.filter(d => (suConfig.evitar || []).includes(d)).length;
+  const resj = Math.min(20, qtdEvitar * 6);
+
+  let sgru = 0;
+  (suConfig.grupos || []).forEach(g => {
+    const presentes = jogo.filter(d => g.dezenas.includes(d)).length;
+    if (g.minimo && presentes >= g.minimo) sgru += 5;
+    if (g.minimo && presentes < g.minimo) sgru -= 5;
+  });
+  sgru = limitar(sgru, -15, 15);
+
+  let perfj = 0;
+  if (suConfig.perfil === "conservador") {
+    const altas = jogo.filter(d => ["A", "B"].includes(mapaClasse[d])).length;
+    perfj = Math.min(15, altas * 2.5);
+  } else if (suConfig.perfil === "agressivo") {
+    const classesUnicas = new Set(jogo.map(d => mapaClasse[d])).size;
+    perfj = Math.min(15, classesUnicas * 3);
+  }
+
+  const suj = limitar(50 + pco - resj + sgru + perfj, 0, 100);
+  return { suj, pco, resj, sgru, perfj };
+}
+
+/* ---------------- SCOJ — Score de Coocorrência do Jogo ---------------- */
+function calcularSCOJ(jogo, teia) {
+  const pares = [];
+  for (let i = 0; i < jogo.length; i++)
+    for (let j = i + 1; j < jogo.length; j++) pares.push([jogo[i], jogo[j]]);
+
+  const liftsPares = pares.map(([a, b]) => {
+    const key = a < b ? `${a}-${b}` : `${b}-${a}`;
+    return teia.liftDuplas[key] || 0;
+  });
+
+  const mdij = liftsPares.length ? limitar(50 * media(liftsPares), 0, 100) : 30;
+  const topN = [...liftsPares].sort((a, b) => b - a).slice(0, Math.min(3, liftsPares.length));
+  const tdj = topN.length ? limitar(40 * media(topN), 0, 100) : 30;
+
+  const triplas = [];
+  for (let i = 0; i < jogo.length; i++)
+    for (let j = i + 1; j < jogo.length; j++)
+      for (let k = j + 1; k < jogo.length; k++) triplas.push([jogo[i], jogo[j], jogo[k]]);
+  const contagensTriplas = triplas.map(([a, b, c]) => {
+    const key = [a, b, c].sort((x, y) => x - y).join("-");
+    return teia.contagemTriplas[key] || 0;
+  });
+  const mtij = contagensTriplas.length ? limitar((media(contagensTriplas) / Math.max(1, teia.totalConcursos)) * 800, 0, 100) : 25;
+  const topTriplas = [...contagensTriplas].sort((a, b) => b - a).slice(0, 2);
+  const ttj = topTriplas.length ? limitar((media(topTriplas) / Math.max(1, teia.totalConcursos)) * 900, 0, 100) : 25;
+
+  const drj = liftsPares.length ? limitar((liftsPares.filter(v => v > 1).length / liftsPares.length) * 100, 0, 100) : 30;
+  const erj = liftsPares.length ? limitar(100 - desvioPadrao(liftsPares) * 25, 0, 100) : 50;
+
+  const scoj = limitar(0.25 * mdij + 0.20 * tdj + 0.15 * mtij + 0.10 * ttj + 0.15 * drj + 0.15 * erj, 0, 100);
+  return { scoj, mdij, tdj, mtij, ttj, drj, erj };
+}
+
+/* ---------------- STJ — Score Total do Jogo (pesos personalizáveis) ---------------- */
+const STJ_PESOS_CANONICOS = { stf: 0.40, sej: 0.35, scoj: 0.20, suj: 0.05 };
+
+function normalizarPesosSTJ(pesos) {
+  const p = pesos || STJ_PESOS_CANONICOS;
+  const soma = (p.stf || 0) + (p.sej || 0) + (p.scoj || 0) + (p.suj || 0);
+  if (soma <= 0) return STJ_PESOS_CANONICOS;
+  return { stf: p.stf / soma, sej: p.sej / soma, scoj: p.scoj / soma, suj: p.suj / soma };
+}
+
+function calcularSTJ(stfMedio, sej, scoj, suj, pesos = STJ_PESOS_CANONICOS) {
+  const p = normalizarPesosSTJ(pesos);
+  return limitar(p.stf * stfMedio + p.sej * sej + p.scoj * scoj + p.suj * suj, 0, 100);
+}
+
+function classeSTJ(valor) {
+  if (valor >= 85) return "A";
+  if (valor >= 70) return "B";
+  if (valor >= 55) return "C";
+  if (valor >= 40) return "D";
+  return "E";
+}
+
+/* Pipeline completo: pontua e ranqueia todos os jogos aprovados */
+function ranquearJogos(jogosAprovados, rankingDezenas, teia, modalidade, base, suConfig, pesosSTJ = STJ_PESOS_CANONICOS) {
+  const mapaSTF = {}; rankingDezenas.forEach(d => mapaSTF[d.dezena] = d.STF);
+  const concursoAnterior = base.length ? base[base.length - 1].dezenas : null;
+
+  return jogosAprovados.map(jogo => {
+    const stfMedio = media(jogo.map(d => mapaSTF[d] || 0));
+    const sejR = calcularSEJ(jogo, modalidade, base, concursoAnterior);
+    const sujR = calcularSUJ(jogo, suConfig, rankingDezenas);
+    const scojR = calcularSCOJ(jogo, teia);
+    const stj = calcularSTJ(stfMedio, sejR.sej, scojR.scoj, sujR.suj, pesosSTJ);
+    return {
+      jogo, stfMedio, sej: sejR.sej, suj: sujR.suj, scoj: scojR.scoj, stj,
+      classeSEJ: classeSEJ(sejR.sej), classeSTJ: classeSTJ(stj),
+      detalhes: { sejR, sujR, scojR }
+    };
+  }).sort((a, b) => b.stj - a.stj);
+}
+/* ============================================================
+   #pessoal
+   MPL — PATCH B (Super Sete) — GERAÇÃO POR PRODUTO CARTESIANO
+   Append-only. Ativa apenas quando isSuperSete(modalidade).
+   ============================================================ */
+(function () {
+  "use strict";
+
+  function stfDigitoColuna(colunas, coluna, digito) {
+    const col = colunas && colunas[coluna];
+    if (!col) return 0;
+    const r = col.ranking.find(x => x.digito === digito);
+    return r ? r.STF : 0;
+  }
+
+  /* Produto cartesiano: 1 dígito por coluna. listasPorColuna = array[7] de arrays de dígitos. */
+  window.gerarJogosSuperSete = function (listasPorColuna, limite = 50000) {
+    const total = listasPorColuna.reduce((a, l) => a * l.length, 1);
+    const cap = Math.min(total, Math.max(1, limite));
+    const jogos = [];
+    const idx = new Array(listasPorColuna.length).fill(0);
+    for (let n = 0; n < cap; n++) {
+      jogos.push(listasPorColuna.map((l, c) => l[idx[c]]));
+      let k = listasPorColuna.length - 1;
+      while (k >= 0) { idx[k]++; if (idx[k] < listasPorColuna[k].length) break; idx[k] = 0; k--; }
+      if (k < 0) break;
+    }
+    return { jogos, total };
+  };
+
+  /* Monkey-patch de ranquearJogos: caminho posicional para o Super Sete */
+  const __origRanquear = ranquearJogos;
+  ranquearJogos = function (jogosAprovados, rankingDezenas, teia, modalidade, base, suConfig, pesosSTJ) {
+    if (typeof isSuperSete === "function" && isSuperSete(modalidade)) {
+      const colunas = (MPL_STATE.cache && MPL_STATE.cache.scoresSuperSete) || [];
+      return jogosAprovados.map(jogo => {
+        const stfs = jogo.map((d, c) => stfDigitoColuna(colunas, c, Number(d)));
+        const stfMedio = stfs.length ? stfs.reduce((a, b) => a + b, 0) / stfs.length : 0;
+        return {
+          jogo, stfMedio, sej: 0, suj: 50, scoj: 0, stj: stfMedio,
+          classeSEJ: "-", classeSTJ: classeSTJ(stfMedio), detalhes: {}
+        };
+      }).sort((a, b) => b.stj - a.stj);
+    }
+    return __origRanquear(jogosAprovados, rankingDezenas, teia, modalidade, base, suConfig, pesosSTJ);
+  };
+})();
+/* ============================================================
+   #pessoal
+   MPL — MODO HÍBRIDO (DZC — Dezenas Coringas)
+   Gera jogos com N dezenas do Radar Reduzido (URR) + M dezenas
+   de fora do radar (UEX = universo excluído). Append-only.
+   Não se aplica ao Super Sete (posicional).
+   ============================================================ */
+(function () {
+  "use strict";
+
+  /* urr, uex: arrays de dezenas. nRadar/nCoringa: quantidades. */
+  window.gerarJogosHibridos = function (urr, uex, nRadar, nCoringa, qtd, seed) {
+    const rng = (typeof criarRNG === "function") ? criarRNG(seed || 42) : Math.random;
+    const set = new Set();
+    const jogos = [];
+    const amostra = (pool, n) => {
+      const p = pool.slice();
+      const out = [];
+      for (let i = 0; i < n && p.length; i++) {
+        const idx = Math.floor(rng() * p.length);
+        out.push(p.splice(idx, 1)[0]);
+      }
+      return out;
+    };
+    if (urr.length < nRadar || uex.length < nCoringa) {
+      return { jogos: [], motivo: "Universos insuficientes para a combinação pedida." };
+    }
+    let tent = 0;
+    const maxT = Math.max(200, qtd * 40);
+    while (jogos.length < qtd && tent < maxT) {
+      tent++;
+      const parteR = amostra(urr, nRadar);
+      const parteC = amostra(uex, nCoringa);
+      const jogo = parteR.concat(parteC).sort((a, b) => a - b);
+      const key = jogo.join(",");
+      if (!set.has(key)) { set.add(key); jogos.push(jogo); }
+    }
+    return { jogos, motivo: null };
+  };
+})();
+/* ============================================================
+   #pessoal
+   MPL — Games 9.16 — SCONJ calibrado (SCOEJ exato) + RANKING POR COTAS
+   COLE NO FINAL DE js/mpl-games.js (apague o bloco 9.15 antes).
+
+   1) SCONJ = frequência real da maior sequência NA BASE da modalidade,
+      com SCOEJ recalculado pela fórmula ORIGINAL do calcularSEJ:
+      scoej = limitar(1 − desvioPadrao(subscores)/100, 0,6, 1).
+   2) Ranking por cotas: o topo deixa de ser só o perfil mais comum
+      (a "moda") e passa a ter a mesma proporção de estruturas dos
+      sorteios reais. Dentro de cada grupo, a ordem continua pelo STJ.
+      Liga/desliga: MPL_STATE.config.rankCotas (padrão: ligado).
+   Super Sete: nada é alterado.
+   ============================================================ */
+(function () {
+  "use strict";
+
+  var cache = { chave: null, freq: null, rel: null, n: 0 };
+
+  function maiorSeq(j) {
+    var s = j.map(Number).sort(function (a, b) { return a - b; }), m = 1, c = 1;
+    for (var i = 1; i < s.length; i++) { c = (s[i] - s[i - 1] === 1) ? c + 1 : 1; if (c > m) m = c; }
+    return m;
+  }
+  function ehSS() { return typeof isSuperSete === "function" && MPL_STATE.modalidade && isSuperSete(MPL_STATE.modalidade); }
+
+  function dist() {
+    var base = MPL_STATE.base || [];
+    var chave = (MPL_STATE.modalidade && MPL_STATE.modalidade.presetKey) + "|" + base.length;
+    if (cache.chave === chave && cache.freq) return cache;
+    var cont = {}, n = 0, max = 0;
+    base.forEach(function (c) {
+      if (!c.dezenas || !c.dezenas.length) return;
+      var r = maiorSeq(c.dezenas); cont[r] = (cont[r] || 0) + 1; n++;
+    });
+    var freq = {}, rel = {};
+    Object.keys(cont).forEach(function (k) { if (cont[k] > max) max = cont[k]; });
+    Object.keys(cont).forEach(function (k) { freq[k] = cont[k] / n; rel[k] = (cont[k] / max) * 100; });
+    cache = { chave: chave, freq: freq, rel: rel, n: n };
+    return cache;
+  }
+  window.mplSconjCalibrado = function (jogo) {
+    var r = maiorSeq(jogo), d = dist().rel;
+    return d[r] != null ? d[r] : 5;
+  };
+
+  /* ---------- 1) SEJ com SCONJ calibrado e SCOEJ exato ---------- */
+  if (typeof calcularSEJ === "function") {
+    var __origSEJ = calcularSEJ;
+    calcularSEJ = function (jogo, modalidade, base, concursoAnterior) {
+      var r = __origSEJ.apply(this, arguments);
+      if (ehSS() || !r || r.sconj == null || !Array.isArray(jogo)) return r;
+      var novo = mplSconjCalibrado(jogo);
+      var sub = [r.sparj, r.sfxj, r.ssomj, novo, r.srepj, r.sdisj];
+      var scoej = limitar(1 - (desvioPadrao(sub) / 100), 0.6, 1);
+      var baseSej = 0.20 * r.sparj + 0.20 * r.sfxj + 0.20 * r.ssomj + 0.15 * novo + 0.15 * r.srepj + 0.10 * r.sdisj;
+      r.sconjOriginal = r.sconj;
+      r.sconj = novo;
+      r.scoej = scoej;
+      r.sej = limitar(baseSej * scoej, 0, 100);
+      return r;
+    };
+  }
+
+  /* ---------- 2) Ranking por cotas ---------- */
+  if (MPL_STATE.config.rankCotas == null) MPL_STATE.config.rankCotas = true;
+
+  function reordenarPorCotas(lista) {
+    if (!lista || lista.length < 20) return lista;
+    var freq = dist().freq;
+    var grupos = {};
+    lista.forEach(function (it) {
+      var k = maiorSeq(it.jogo);
+      (grupos[k] = grupos[k] || []).push(it);           /* cada grupo já vem ordenado por STJ */
+    });
+    var chaves = Object.keys(grupos);
+    var peso = {}, totalPeso = 0;
+    chaves.forEach(function (k) { peso[k] = freq[k] || 0.001; totalPeso += peso[k]; });
+    var pos = {}, saida = [];
+    chaves.forEach(function (k) { pos[k] = 0; });
+    /* intercala pelo "déficit" de cada grupo em relação à sua cota */
+    while (saida.length < lista.length) {
+      var melhor = null, maiorDef = -Infinity, n = saida.length + 1;
+      chaves.forEach(function (k) {
+        if (pos[k] >= grupos[k].length) return;
+        var cota = (peso[k] / totalPeso) * n;
+        var usados = pos[k];
+        var def = cota - usados;
+        if (def > maiorDef || (def === maiorDef && grupos[k][pos[k]].stj > grupos[melhor][pos[melhor]].stj)) {
+          maiorDef = def; melhor = k;
+        }
+      });
+      if (melhor == null) break;
+      saida.push(grupos[melhor][pos[melhor]++]);
+    }
+    return saida;
+  }
+
+  var __origRank = ranquearJogos;
+  ranquearJogos = function (jogosAprovados, rankingDezenas, teia, modalidade, base, suConfig, pesosSTJ) {
+    var r = __origRank.apply(this, arguments);
+    if (!MPL_STATE.config.rankCotas) return r;
+    if (typeof isSuperSete === "function" && isSuperSete(modalidade)) return r;
+    return reordenarPorCotas(r);
+  };
+
+  window.mplDistSequencias = function () {
+    var d = dist(), t = {};
+    Object.keys(d.freq).sort(function (a, b) { return a - b; }).forEach(function (k) {
+      t["seq " + k] = { sorteios: (d.freq[k] * 100).toFixed(1) + "%", score: d.rel[k].toFixed(0) };
+    });
+    console.log("Maior sequência na base (" + d.n + " sorteios):");
+    console.table(t);
+    return t;
+  };
+  window.mplRankCotas = function (ligar) {
+    MPL_STATE.config.rankCotas = !!ligar;
+    console.log("Ranking por cotas: " + (ligar ? "LIGADO" : "DESLIGADO") + ". Ranqueie de novo para aplicar.");
+  };
+
+  console.log("MPL Games 9.16: SCONJ calibrado (SCOEJ exato) + ranking por cotas ativo.");
+})();

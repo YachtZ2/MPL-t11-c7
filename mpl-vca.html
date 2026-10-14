@@ -1,0 +1,1008 @@
+/* ============================================================
+   #pessoal
+   MPL — mpl-vca.js v2 — VCA: Validação por Concurso-Alvo (Fase A)
+   SUBSTITUI a v1 inteira.
+
+   Correções v2:
+   1) Overlay agora é ancorado num WRAPPER do próprio canvas do radar
+      (antes cobria o card inteiro, deslocando as marcações).
+   2) Fim da duplicação: o overlay pinta uma máscara opaca sobre a
+      marcação do radar v3 antes de desenhar a sua.
+   3) NOVO: K ajustável no painel (permite buscar o menor radar viável).
+
+   Formas: □ dentro do RR · △ branco pulsante fora do RR.
+   Cálculo isolado — nunca escreve em MPL_STATE.cache.
+   ============================================================ */
+(function () {
+  "use strict";
+
+  var MPL_VCA = {
+    ativo: false, modo: "auto", alvo: null,
+    mapaIni: null, mapaFim: null,
+    kOverride: null,        // NOVO: K específico do VCA
+    restringirScores: false, // scores usam SÓ o mapa (não todo o histórico)
+    resultado: null, fp: null
+  };
+  window.MPL_VCA = MPL_VCA;
+
+  function ehSS() {
+    return typeof isSuperSete === "function" && MPL_STATE.modalidade && isSuperSete(MPL_STATE.modalidade);
+  }
+  function corMod() {
+    return (MPL_STATE.modalidade && typeof obterCorModalidade === "function")
+      ? obterCorModalidade(MPL_STATE.modalidade) : { principal: "#22d3ee", texto: "#03121a" };
+  }
+
+  /* ---------- NÚCLEO ---------- */
+  function calcularVCA() {
+    if (!MPL_STATE.modalidade || ehSS()) return null;
+    var base = (typeof baseEfetiva === "function") ? baseEfetiva() : MPL_STATE.base;
+    if (!base || base.length < 20) return null;
+
+    var alvoNum = Number(MPL_VCA.alvo);
+    var idxAlvo = base.findIndex(function (c) { return c.numero === alvoNum; });
+    if (idxAlvo < 0) return { erro: "Concurso-alvo " + alvoNum + " não encontrado na base/escopo." };
+    if (idxAlvo < 20) return { erro: "Histórico anterior ao alvo muito curto (mínimo ~20)." };
+
+    var historico = base.slice(0, idxAlvo);   /* CORTE TEMPORAL */
+    var concursoAlvo = base[idxAlvo];
+
+    var janela, mapaIni, mapaFim;
+    if (MPL_VCA.modo === "manual" && MPL_VCA.mapaIni && MPL_VCA.mapaFim) {
+      var i1 = historico.findIndex(function (c) { return c.numero >= MPL_VCA.mapaIni; });
+      var i2 = -1;
+      for (var k = historico.length - 1; k >= 0; k--) {
+        if (historico[k].numero <= MPL_VCA.mapaFim) { i2 = k; break; }
+      }
+      if (i1 < 0 || i2 < 0 || i1 > i2) return { erro: "Intervalo do mapa inválido para este alvo." };
+      historico = historico.slice(i1, i2 + 1);
+      janela = historico.length;
+      mapaIni = historico[0].numero;
+      mapaFim = historico[historico.length - 1].numero;
+    } else {
+      janela = MPL_STATE.config.caixaJanela ||
+        (MPL_STATE.cache.caixa ? Math.round(MPL_STATE.cache.caixa.mediana) : 20);
+      mapaFim = historico[historico.length - 1].numero;
+      mapaIni = historico[Math.max(0, historico.length - janela)].numero;
+    }
+    if (historico.length < 20) return { erro: "Mapa muito curto (mínimo ~20 concursos)." };
+
+    var cfg = MPL_STATE.config;
+    /* Se "restringir scores" estiver ligado, o mapa é a ÚNICA fonte:
+       scores e radar leem exatamente a mesma fatia de concursos. */
+    var baseScores = MPL_VCA.restringirScores
+      ? historico.slice(Math.max(0, historico.length - janela))
+      : historico;
+    if (MPL_VCA.restringirScores && baseScores.length < 20) {
+      return { erro: "Mapa muito curto para calcular scores restritos (mínimo 20). Aumente a janela ou desative a restrição." };
+    }
+    var pack = gerarRankingDezenas(baseScores, MPL_STATE.modalidade, cfg);
+    var rb = gerarRadarBruto(historico, janela);
+    var ra = pack.ranking.filter(function (r) {
+      return rb.indexOf(r.dezena) !== -1 && cfg.su.proibidas.indexOf(r.dezena) === -1;
+    });
+
+    /* K do VCA (independente do K oficial) */
+    var kDesejado = MPL_VCA.kOverride || cfg.K;
+    var K = Math.min(kDesejado, ra.length || kDesejado);
+    var rr = gerarRR(ra, K, cfg.su.fixas, cfg.su.proibidas);
+    var dezRR = rr.map(function (d) { return d.dezena; });
+
+    var dentro = [], fora = [];
+    concursoAlvo.dezenas.forEach(function (d) {
+      (dezRR.indexOf(d) !== -1 ? dentro : fora).push(d);
+    });
+
+    return {
+      alvo: alvoNum, dezenasAlvo: concursoAlvo.dezenas,
+      mapaIni: mapaIni, mapaFim: mapaFim, janela: janela,
+      ranking: pack.ranking, rr: rr, dezRR: dezRR,
+      rb: rb.length, ra: ra.length, K: K, kPedido: kDesejado,
+      restrito: MPL_VCA.restringirScores, nScores: baseScores.length,
+      dentro: dentro, fora: fora,
+      cobertura: dentro.length, total: concursoAlvo.dezenas.length,
+      pct: concursoAlvo.dezenas.length ? (dentro.length / concursoAlvo.dezenas.length) * 100 : 0,
+      rc: calcularRC(K, cfg.A || MPL_STATE.modalidade.dezenasSorteadas, MPL_STATE.modalidade.universo)
+    };
+  }
+
+  /* ---------- PAINEL ---------- */
+  function montarPainelVCA() {
+    if (!MPL_STATE.modalidade) return;
+    var ancora = document.getElementById("radarAviaoCard");
+    var wrap = document.getElementById("cockpitPesosWrap");
+    if (!ancora && !wrap) return;
+    if (document.getElementById("vcaCard")) { renderPainel(); return; }
+
+    var card = document.createElement("div");
+    card.className = "card";
+    card.id = "vcaCard";
+    card.style.cssText = "flex:0 0 300px;min-width:280px;";
+    card.innerHTML = '<div id="vcaConteudo"></div>';
+
+    if (wrap) wrap.appendChild(card);
+    else if (ancora && ancora.parentNode) ancora.parentNode.insertBefore(card, ancora.nextSibling);
+    renderPainel();
+  }
+
+  function renderPainel() {
+    var el = document.getElementById("vcaConteudo");
+    if (!el) return;
+    var cor = corMod();
+
+    if (ehSS()) {
+      el.innerHTML = '<h3 style="margin-top:0;">🎯 Target Lock <span style="font-size:9px;color:#eab308;">★ Premium</span></h3>' +
+        '<div class="info-box">O VCA não se aplica ao Super Sete (estrutura posicional).</div>';
+      return;
+    }
+
+    var base = (typeof baseEfetiva === "function") ? baseEfetiva() : MPL_STATE.base;
+    if (MPL_VCA.alvo == null && base.length) MPL_VCA.alvo = base[base.length - 1].numero;
+    if (MPL_VCA.kOverride == null) MPL_VCA.kOverride = MPL_STATE.config.K;
+
+    var cab =
+      '<h3 style="margin-top:0;">🎯 Target Lock <span style="font-size:9px;color:#eab308;">★ Premium</span></h3>' +
+      '<div class="checkbox-row" style="margin-bottom:10px;">' +
+      '<input type="checkbox" id="vcaAtivo" ' + (MPL_VCA.ativo ? "checked" : "") + ' style="width:auto;">' +
+      '<label for="vcaAtivo" style="margin:0;"><b>Ativar validação por alvo</b></label></div>';
+
+    if (!MPL_VCA.ativo) {
+      el.innerHTML = cab + '<p class="muted" style="font-size:11.5px;">Escolha o alvo, ajuste pesos e K, e veja ao vivo quantas dezenas do alvo o radar cobre. Usa <b>apenas concursos anteriores ao alvo</b>.</p>';
+      ligarEventos(); return;
+    }
+
+    var U = MPL_STATE.modalidade.universo;
+    var S = MPL_STATE.modalidade.dezenasSorteadas;
+    var r = MPL_VCA.resultado;
+
+    var corpo =
+      '<label>Modo do mapa</label>' +
+      '<select id="vcaModo" style="margin-bottom:6px;">' +
+      '<option value="auto"' + (MPL_VCA.modo === "auto" ? " selected" : "") + '>Automático (janela da Caixa)</option>' +
+      '<option value="manual"' + (MPL_VCA.modo === "manual" ? " selected" : "") + '>Manual (intervalo livre)</option>' +
+      '</select>' +
+      (MPL_VCA.modo === "manual" ?
+        '<div class="row-flex"><div><label>De</label><input type="number" id="vcaIni" value="' + (MPL_VCA.mapaIni || "") + '"></div>' +
+        '<div><label>Até</label><input type="number" id="vcaFim" value="' + (MPL_VCA.mapaFim || "") + '"></div></div>' : "") +
+      '<label>Concurso-alvo</label><input type="number" id="vcaAlvo" value="' + MPL_VCA.alvo + '">' +
+      '<label>K — tamanho do radar <span class="muted">(' + S + ' a ' + U + ')</span></label>' +
+      '<input type="range" id="vcaKRange" min="' + S + '" max="' + U + '" value="' + MPL_VCA.kOverride + '" style="width:100%;accent-color:' + cor.principal + ';">' +
+      '<div style="display:flex;gap:6px;align-items:center;margin-bottom:8px;">' +
+      '<input type="number" id="vcaK" min="' + S + '" max="' + U + '" value="' + MPL_VCA.kOverride + '" style="max-width:90px;margin:0;">' +
+      '<button id="vcaKSync" class="btn-secondary" style="margin:0;font-size:11px;padding:6px 10px;">= K oficial (' + MPL_STATE.config.K + ')</button>' +
+      '</div>' +
+      '<div class="checkbox-row" style="margin:2px 0 6px;">' +
+      '<input type="checkbox" id="vcaRestr" ' + (MPL_VCA.restringirScores ? "checked" : "") + ' style="width:auto;">' +
+      '<label for="vcaRestr" style="margin:0;font-size:11px;">Restringir <b>scores</b> ao mapa</label></div>' +
+      '<div class="muted" style="font-size:10px;margin:-2px 0 8px;">Desligado: o radar usa a janela, mas os scores leem todo o histórico anterior ao alvo. Ligado: mapa é a única fonte — mede o que <i>aqueles</i> concursos dizem sobre o próximo.</div>' +
+      '<button id="vcaRecalc" class="btn-secondary" style="width:100%;margin:0 0 10px;">Recalcular agora</button>';
+
+    var res = "";
+    if (r && r.erro) res = '<div class="alert alert-warn">' + r.erro + '</div>';
+    else if (r) {
+      var pct = r.pct.toFixed(1);
+      var cb = r.pct >= 80 ? "#10b981" : (r.pct >= 60 ? "#eab308" : "#ef4444");
+      res =
+        '<div class="muted" style="font-size:11px;">Mapa: <b>' + r.mapaIni + '</b> → <b>' + r.mapaFim + '</b> · janela ' + r.janela + '</div>' +
+        '<div style="font-size:15px;margin:8px 0 4px;"><b>RR(' + r.K + ')</b> cobre <b style="color:' + cb + ';">' + r.cobertura + ' de ' + r.total + '</b></div>' +
+        '<div style="background:#1c2434;border-radius:6px;height:10px;overflow:hidden;margin-bottom:6px;">' +
+        '<div style="height:100%;width:' + pct + '%;background:' + cb + ';transition:width .3s;"></div></div>' +
+        '<div style="font-size:11px;color:#8fa3c4;margin-bottom:8px;">' + pct + '% · RC ' + (r.rc * 100).toFixed(2) + '%' +
+        (r.K < r.kPedido ? ' · <span style="color:#eab308;">RA só tem ' + r.ra + ' dezenas</span>' : '') +
+        ' · scores em <b>' + r.nScores + '</b> concursos' + (r.restrito ? ' <span style="color:#22d3ee;">(restrito)</span>' : '') + '</div>' +
+        '<div style="font-size:11px;"><b style="color:' + cor.principal + ';">Dentro (□):</b><br>' +
+        (r.dentro.length ? r.dentro.map(function (d) {
+          return '<span class="pill" style="padding:2px 7px;font-size:10.5px;">' + String(d).padStart(2, "0") + '</span>';
+        }).join("") : '<span class="muted">nenhuma</span>') + '</div>' +
+        '<div style="font-size:11px;margin-top:6px;"><b style="color:#fff;">FORA (△):</b><br>' +
+        (r.fora.length ? r.fora.map(function (d) {
+          return '<span class="pill" style="padding:2px 7px;font-size:10.5px;border-color:#fff;color:#fff;">' + String(d).padStart(2, "0") + '</span>';
+        }).join("") : '<span style="color:#10b981;">nenhuma — cobertura total ✓</span>') + '</div>' +
+        '<div class="alert alert-warn" style="margin-top:10px;font-size:11px;">⚠ Calibrado <b>olhando</b> o alvo ' + r.alvo +
+        ' — exploração (in-sample), não validação. A prova vem na Fase C, com alvos não vistos.</div>';
+    } else res = '<p class="muted" style="font-size:11.5px;">Clique em "Recalcular agora".</p>';
+
+    el.innerHTML = cab + corpo + res;
+    ligarEventos();
+  }
+
+  function ligarEventos() {
+    var chk = document.getElementById("vcaAtivo");
+    if (chk && !chk.__v) {
+      chk.__v = true;
+      chk.addEventListener("change", function (e) {
+        MPL_VCA.ativo = e.target.checked;
+        if (MPL_VCA.ativo) recalcular(); else { MPL_VCA.resultado = null; limparOverlay(); renderPainel(); }
+      });
+    }
+    var sel = document.getElementById("vcaModo");
+    if (sel && !sel.__v) { sel.__v = true; sel.addEventListener("change", function (e) { MPL_VCA.modo = e.target.value; renderPainel(); }); }
+
+    var rng = document.getElementById("vcaKRange"), num = document.getElementById("vcaK");
+    if (rng && !rng.__v) {
+      rng.__v = true;
+      rng.addEventListener("input", function () {
+        MPL_VCA.kOverride = Number(rng.value);
+        if (num) num.value = rng.value;
+      });
+    }
+    if (num && !num.__v) {
+      num.__v = true;
+      num.addEventListener("change", function () {
+        MPL_VCA.kOverride = Number(num.value);
+        if (rng) rng.value = num.value;
+        recalcular();
+      });
+    }
+    var sync = document.getElementById("vcaKSync");
+    if (sync && !sync.__v) {
+      sync.__v = true;
+      sync.addEventListener("click", function () { MPL_VCA.kOverride = MPL_STATE.config.K; recalcular(); });
+    }
+    ["vcaAlvo", "vcaIni", "vcaFim"].forEach(function (id) {
+      var i = document.getElementById(id);
+      if (i && !i.__v) {
+        i.__v = true;
+        i.addEventListener("change", function () {
+          var a = document.getElementById("vcaAlvo");
+          if (a) MPL_VCA.alvo = Number(a.value) || MPL_VCA.alvo;
+          var x = document.getElementById("vcaIni"), y = document.getElementById("vcaFim");
+          if (x) MPL_VCA.mapaIni = Number(x.value) || null;
+          if (y) MPL_VCA.mapaFim = Number(y.value) || null;
+          recalcular();
+        });
+      }
+    });
+    var rst = document.getElementById("vcaRestr");
+    if (rst && !rst.__v) {
+      rst.__v = true;
+      rst.addEventListener("change", function (e) { MPL_VCA.restringirScores = e.target.checked; recalcular(); });
+    }
+    var b = document.getElementById("vcaRecalc");
+    if (b && !b.__v) { b.__v = true; b.addEventListener("click", recalcular); }
+  }
+
+  function recalcular() {
+    if (!MPL_VCA.ativo) return;
+    try { MPL_VCA.resultado = calcularVCA(); }
+    catch (e) { console.error("VCA:", e); MPL_VCA.resultado = { erro: "Falha no cálculo (ver console)." }; }
+    renderPainel();
+  }
+
+  /* ---------- OVERLAY: wrapper dedicado (corrige o desalinhamento) ---------- */
+  function overlay() {
+    var canvas = document.getElementById("radarAviaoCanvas");
+    if (!canvas) return null;
+
+    var wrap = document.getElementById("vcaWrap");
+    if (!wrap) {
+      wrap = document.createElement("div");
+      wrap.id = "vcaWrap";
+      wrap.style.cssText = "position:relative;display:block;width:100%;max-width:520px;margin:0 auto;";
+      canvas.parentNode.insertBefore(wrap, canvas);
+      wrap.appendChild(canvas);          /* canvas passa a viver dentro do wrapper */
+      canvas.style.display = "block";
+      canvas.style.margin = "0";
+    }
+
+    var ov = document.getElementById("vcaOverlay");
+    if (!ov) {
+      ov = document.createElement("canvas");
+      ov.id = "vcaOverlay";
+      ov.style.cssText = "position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none;border-radius:50%;";
+      wrap.appendChild(ov);
+    }
+    if (ov.width !== canvas.width || ov.height !== canvas.height) {
+      ov.width = canvas.width; ov.height = canvas.height;
+    }
+    return ov;
+  }
+  function limparOverlay() {
+    var ov = document.getElementById("vcaOverlay");
+    if (ov) ov.getContext("2d").clearRect(0, 0, ov.width, ov.height);
+  }
+
+  var pulso = 0;
+  function desenharOverlay() {
+    var ov = overlay();
+    if (!ov) return;
+    var ctx = ov.getContext("2d");
+    ctx.clearRect(0, 0, ov.width, ov.height);
+    if (!MPL_VCA.ativo || !MPL_VCA.resultado || MPL_VCA.resultado.erro || ehSS()) return;
+
+    var r = MPL_VCA.resultado, cor = corMod();
+    var cx = ov.width / 2, cy = ov.height / 2, Rmax = cx - 40;
+    var U = MPL_STATE.modalidade.universo;
+
+    var noRR = {}; r.dezRR.forEach(function (d) { noRR[d] = true; });
+    var totalDentro = r.dezRR.length, rankPos = {}, cont = 0;
+    r.ranking.forEach(function (d) { if (noRR[d.dezena]) rankPos[d.dezena] = cont++; });
+
+    pulso += 0.06;
+    var aP = 0.55 + 0.45 * Math.abs(Math.sin(pulso));
+
+    r.dezenasAlvo.forEach(function (dz) {
+      var dentro = !!noRR[dz];
+      var ang = ((dz - 1) / U) * 2 * Math.PI - Math.PI / 2;
+      var frac = dentro
+        ? (totalDentro > 1 ? 0.08 + (rankPos[dz] / (totalDentro - 1)) * 0.85 : 0.3)
+        : 0.94;
+      var x = cx + Math.cos(ang) * frac * Rmax;
+      var y = cy + Math.sin(ang) * frac * Rmax;
+
+      /* MÁSCARA: cobre a marcação do radar v3 (box 16px + rótulo à direita) */
+      ctx.save();
+      ctx.fillStyle = "rgba(4,8,12,0.92)";
+      ctx.beginPath();
+      if (ctx.roundRect) ctx.roundRect(x - 15, y - 13, 44, 26, 5);
+      else ctx.rect(x - 15, y - 13, 44, 26);
+      ctx.fill();
+      ctx.restore();
+
+      ctx.save();
+      if (dentro) {
+        ctx.strokeStyle = cor.principal; ctx.lineWidth = 2.5;
+        ctx.shadowColor = cor.principal; ctx.shadowBlur = 8;
+        ctx.strokeRect(x - 10, y - 10, 20, 20);
+      } else {
+        ctx.globalAlpha = aP;
+        ctx.strokeStyle = "#ffffff"; ctx.lineWidth = 2.5;
+        ctx.shadowColor = "#ffffff"; ctx.shadowBlur = 12;
+        ctx.beginPath();
+        ctx.moveTo(x, y - 12); ctx.lineTo(x + 11, y + 8); ctx.lineTo(x - 11, y + 8);
+        ctx.closePath(); ctx.stroke();
+      }
+      ctx.shadowBlur = 0; ctx.globalAlpha = 1;
+      ctx.font = "bold 11px 'Courier New',monospace";
+      ctx.textAlign = "center"; ctx.textBaseline = "middle";
+      ctx.lineWidth = 3; ctx.strokeStyle = "rgba(3,5,10,.95)";
+      ctx.strokeText(String(dz).padStart(2, "0"), x, y + (dentro ? 0 : 2));
+      ctx.fillStyle = "#ffffff";
+      ctx.fillText(String(dz).padStart(2, "0"), x, y + (dentro ? 0 : 2));
+      ctx.restore();
+    });
+
+    ctx.font = "bold 11px 'Courier New',monospace";
+    ctx.fillStyle = "#ffffff"; ctx.textAlign = "center"; ctx.textBaseline = "alphabetic";
+    ctx.shadowColor = "#000"; ctx.shadowBlur = 4;
+    ctx.fillText("🎯 ALVO " + r.alvo + " · " + r.cobertura + "/" + r.total + " · K=" + r.K, ov.width / 2, ov.height - 16);
+    ctx.shadowBlur = 0;
+  }
+  function loop() { desenharOverlay(); requestAnimationFrame(loop); }
+
+  /* ---------- Recálculo automático ---------- */
+  function fp() {
+    var c = MPL_STATE.config;
+    try {
+      return JSON.stringify({ p: c.pesosPerfil, m: c.modulosAtivos, j: c.caixaJanela, su: c.su,
+        k: MPL_VCA.kOverride, alvo: MPL_VCA.alvo, modo: MPL_VCA.modo,
+        i: MPL_VCA.mapaIni, f: MPL_VCA.mapaFim, rs: MPL_VCA.restringirScores });
+    } catch (e) { return String(Date.now()); }
+  }
+  var tmr = null;
+  setInterval(function () {
+    if (!MPL_VCA.ativo || !MPL_STATE.modalidade) return;
+    var a = fp();
+    if (a !== MPL_VCA.fp) { MPL_VCA.fp = a; clearTimeout(tmr); tmr = setTimeout(recalcular, 450); }
+  }, 500);
+
+  if (typeof mplOn === "function") mplOn("radar:form", montarPainelVCA, 60);
+  document.addEventListener("DOMContentLoaded", function () {
+    setTimeout(function () { montarPainelVCA(); requestAnimationFrame(loop); }, 800);
+  });
+
+  console.log("MPL VCA v2: overlay ancorado, duplicação corrigida, K ajustável.");
+})();
+/* ============================================================
+   #pessoal
+   MPL — VCA v3 — Card "RR do Alvo" + envio ao Gerador
+   COLE NO FINAL DE js/mpl-vca.js.
+
+   Resolve: as dezenas do radar calibrado no Target Lock ficavam
+   visíveis só como overlay no radar gráfico. O bloco do rodapé
+   (#radarResult) mostra o radar OFICIAL (histórico completo), que
+   não muda ao trocar o alvo — daí a sensação de "não atualiza".
+
+   Agora: seção própria dentro do card do Target Lock, com a lista
+   ordenável (STF / numérica) e botão para enviar ao Gerador.
+
+   Sobre defasagem: o radar do VCA usa base.slice(0, idxAlvo).
+   Se o alvo for o ÚLTIMO concurso da base, ignora apenas o
+   resultado dele — defasagem mínima. Se for alvo antigo, ignora
+   vários. O patch mede e só alerta quando há motivo.
+   ============================================================ */
+(function () {
+  "use strict";
+
+  var ordemRR = "stf";            // "stf" | "num"
+  var assinaturaEnviada = null;   // p/ detectar sobrescrita pelo RAE
+
+  function cor() {
+    return (MPL_STATE.modalidade && typeof obterCorModalidade === "function")
+      ? obterCorModalidade(MPL_STATE.modalidade) : { principal: "#22d3ee" };
+  }
+
+  /* ---------- Seção dentro do card do Target Lock ---------- */
+  function montarSecao() {
+    var card = document.getElementById("vcaCard");
+    if (!card || !MPL_STATE.modalidade) return;
+    if (document.getElementById("vcaRRSecao")) { render(); return; }
+    var sec = document.createElement("div");
+    sec.id = "vcaRRSecao";
+    sec.style.cssText = "margin-top:16px;padding-top:14px;border-top:1px solid var(--border);";
+    sec.innerHTML = '<div id="vcaRRConteudo"></div>';
+    var painel = document.getElementById("vcaConteudo");
+    if (painel && painel.nextSibling) card.insertBefore(sec, painel.nextSibling);
+    else card.appendChild(sec);
+    render();
+  }
+
+  function defasagem(alvo) {
+    var base = (typeof baseEfetiva === "function") ? baseEfetiva() : MPL_STATE.base;
+    var idx = base.findIndex(function (c) { return c.numero === alvo; });
+    if (idx < 0) return { ignorados: 0, ultimo: null };
+    /* concursos da base NÃO usados no cálculo (inclui o próprio alvo) */
+    return { ignorados: base.length - idx, ultimo: base[base.length - 1].numero, idx: idx };
+  }
+
+  function render() {
+    var el = document.getElementById("vcaRRConteudo");
+    if (!el) return;
+    var V = window.MPL_VCA;
+
+    if (!V || !V.ativo) {
+      el.innerHTML = '<h3 style="margin:0 0 6px;">📍 RR do Alvo</h3>' +
+        '<p class="muted" style="font-size:11px;">Ative o Target Lock para ver aqui as dezenas do radar calibrado.</p>';
+      return;
+    }
+    var r = V.resultado;
+    if (!r || r.erro) {
+      el.innerHTML = '<h3 style="margin:0 0 6px;">📍 RR do Alvo</h3>' +
+        '<p class="muted" style="font-size:11px;">Recalcule para ver o radar.</p>';
+      return;
+    }
+
+    var c = cor();
+    var lista = r.rr.slice();
+    if (ordemRR === "num") lista.sort(function (a, b) { return a.dezena - b.dezena; });
+    else lista.sort(function (a, b) { return b.STF - a.STF || a.dezena - b.dezena; });
+
+    var dentro = {};
+    r.dentro.forEach(function (d) { dentro[d] = true; });
+
+    var pills = lista.map(function (i) {
+      var marca = dentro[i.dezena] ? "✓" : "";
+      var st = dentro[i.dezena]
+        ? "border-color:" + c.principal + ";box-shadow:0 0 6px " + c.principal + "55;font-weight:700;" : "";
+      return '<span class="pill" style="padding:2px 7px;font-size:10.5px;' + st + '">' +
+        marca + String(i.dezena).padStart(2, "0") + '·' + i.STF.toFixed(0) + '</span>';
+    }).join(" ");
+
+    var d = defasagem(r.alvo);
+    var avisoDef = "";
+    if (d.ignorados > 1) {
+      avisoDef = '<div class="alert alert-warn" style="font-size:10.5px;margin:8px 0 6px;">' +
+        'Radar com corte no concurso <b>' + (r.alvo - 1) + '</b> — ignora <b>' + d.ignorados +
+        '</b> concurso(s) até o ' + d.ultimo + '. Para apostar no próximo sorteio, prefira o radar oficial.</div>';
+    } else if (d.ignorados === 1) {
+      avisoDef = '<div class="info-box" style="font-size:10.5px;margin:8px 0 6px;padding:7px 10px;">' +
+        'Alvo é o último concurso da base: o radar ignora apenas o resultado do próprio ' + r.alvo + '.</div>';
+    }
+
+    el.innerHTML =
+      '<h3 style="margin:0 0 4px;">📍 RR do Alvo ' + r.alvo + '</h3>' +
+      '<div class="muted" style="font-size:10px;margin-bottom:6px;">K=' + r.K +
+      ' · janela ' + r.janela + ' · mapa ' + r.mapaIni + '→' + r.mapaFim +
+      ' · cobertura ' + r.cobertura + '/' + r.total + '</div>' +
+      '<div style="display:flex;gap:4px;margin-bottom:6px;">' +
+      '<button id="rrOrdStf" class="' + (ordemRR === "stf" ? "btn-primary" : "btn-secondary") +
+      '" style="flex:1;font-size:10px;padding:4px;margin:0;">Por STF</button>' +
+      '<button id="rrOrdNum" class="' + (ordemRR === "num" ? "btn-primary" : "btn-secondary") +
+      '" style="flex:1;font-size:10px;padding:4px;margin:0;">Numérica</button></div>' +
+      '<div style="line-height:1.9;max-height:190px;overflow:auto;">' + pills + '</div>' +
+      avisoDef +
+      '<button id="rrCopiar" class="btn-secondary" style="width:100%;font-size:10.5px;margin:6px 0 4px;">Copiar lista</button>' +
+      '<button id="rrEnviar" class="btn-primary" style="width:100%;font-size:11.5px;margin:0;">➜ Enviar ao Gerador</button>' +
+      '<div class="muted" style="font-size:9.5px;margin-top:5px;">✓ = dezena do alvo coberta pelo radar</div>';
+
+    ligar();
+  }
+
+  function ligar() {
+    var a = document.getElementById("rrOrdStf"), b = document.getElementById("rrOrdNum");
+    if (a && !a.__r) { a.__r = true; a.addEventListener("click", function () { ordemRR = "stf"; render(); }); }
+    if (b && !b.__r) { b.__r = true; b.addEventListener("click", function () { ordemRR = "num"; render(); }); }
+
+    var cp = document.getElementById("rrCopiar");
+    if (cp && !cp.__r) {
+      cp.__r = true;
+      cp.addEventListener("click", function () {
+        var V = window.MPL_VCA, r = V && V.resultado;
+        if (!r || r.erro) return;
+        var l = r.rr.slice();
+        if (ordemRR === "num") l.sort(function (x, y) { return x.dezena - y.dezena; });
+        var txt = l.map(function (i) { return String(i.dezena).padStart(2, "0"); }).join(" ");
+        if (navigator.clipboard) navigator.clipboard.writeText(txt);
+        cp.textContent = "Copiado ✓";
+        setTimeout(function () { cp.textContent = "Copiar lista"; }, 1500);
+      });
+    }
+
+    var en = document.getElementById("rrEnviar");
+    if (en && !en.__r) { en.__r = true; en.addEventListener("click", enviarAoGerador); }
+  }
+
+  /* ---------- Envio ao Gerador ---------- */
+  function enviarAoGerador() {
+    var V = window.MPL_VCA, r = V && V.resultado;
+    if (!r || r.erro) return alert("Calibre o Target Lock primeiro.");
+
+    var d = defasagem(r.alvo);
+    if (d.ignorados > 1) {
+      var ok = confirm("Este radar foi calculado com corte no concurso " + (r.alvo - 1) +
+        " e ignora " + d.ignorados + " concurso(s) mais recentes (até o " + d.ultimo + ").\n\n" +
+        "Os scores de ausência e ciclo estarão defasados em relação ao presente.\n\n" +
+        "Enviar mesmo assim?");
+      if (!ok) return;
+    }
+
+    /* reconstrói RB/RA com a mesma janela, para os cards ficarem coerentes */
+    var base = (typeof baseEfetiva === "function") ? baseEfetiva() : MPL_STATE.base;
+    var historico = base.slice(0, d.idx);
+    var rb = [];
+    try { rb = gerarRadarBruto(historico, r.janela); } catch (e) { rb = r.dezRR.slice(); }
+
+    MPL_STATE.cache.radar = {
+      bruto: rb,
+      ajustado: r.dezRR.slice(),
+      reduzido: r.rr.slice()
+    };
+    MPL_STATE.config.K = r.K;
+    MPL_STATE.config.A = MPL_STATE.config.A || MPL_STATE.modalidade.dezenasSorteadas;
+
+    /* marca a origem para o aviso no rodapé */
+    MPL_STATE.cache.radarOrigemVCA = {
+      alvo: r.alvo, janela: r.janela, K: r.K,
+      ignorados: d.ignorados, quando: new Date().toLocaleTimeString("pt-BR")
+    };
+    assinaturaEnviada = r.dezRR.slice().sort(function (x, y) { return x - y; }).join(",");
+
+    avisarRodape();
+    if (typeof renderGeradorForm === "function") renderGeradorForm();
+
+    var tab = document.querySelector('.tab-btn[data-tab="gerador"]');
+    if (tab) tab.click();
+
+    setTimeout(function () {
+      var res = document.getElementById("geradorResult");
+      if (res) res.innerHTML = '<div class="alert alert-ok">Radar do <b>Target Lock (alvo ' + r.alvo +
+        ')</b> carregado: <b>' + r.K + '</b> dezenas. Configure a geração abaixo.</div>' + res.innerHTML;
+    }, 200);
+  }
+
+  /* ---------- Aviso no bloco do rodapé ---------- */
+  function avisarRodape() {
+    var o = MPL_STATE.cache.radarOrigemVCA;
+    var el = document.getElementById("radarResult");
+    if (!el || !o) return;
+    var antigo = document.getElementById("avisoOrigemVCA");
+    if (antigo) antigo.remove();
+    var div = document.createElement("div");
+    div.id = "avisoOrigemVCA";
+    div.className = "alert alert-warn";
+    div.style.cssText = "margin-bottom:10px;font-size:11.5px;";
+    div.innerHTML = '🎯 <b>Radar vindo do Target Lock — alvo ' + o.alvo + '</b> (K=' + o.K +
+      ', janela ' + o.janela + ', enviado às ' + o.quando + ').' +
+      (o.ignorados > 1 ? ' Ignora ' + o.ignorados + ' concurso(s) mais recentes.' : '') +
+      '<br><span class="muted">Recalcular a Caixa ou mexer na configuração substitui este radar pelo oficial.</span>';
+    el.insertBefore(div, el.firstChild);
+  }
+
+  /* limpa o aviso se o RAE sobrescrever o radar */
+  setInterval(function () {
+    if (!MPL_STATE.cache || !MPL_STATE.cache.radarOrigemVCA) return;
+    var rr = MPL_STATE.cache.radar && MPL_STATE.cache.radar.reduzido;
+    if (!rr) return;
+    var atual = rr.map(function (i) { return i.dezena; }).sort(function (x, y) { return x - y; }).join(",");
+    if (atual !== assinaturaEnviada) {
+      MPL_STATE.cache.radarOrigemVCA = null;
+      assinaturaEnviada = null;
+      var a = document.getElementById("avisoOrigemVCA");
+      if (a) a.remove();
+    } else {
+      if (!document.getElementById("avisoOrigemVCA")) avisarRodape();
+    }
+  }, 1200);
+
+  /* re-render quando o VCA recalcular */
+  var fpAnt = null;
+  setInterval(function () {
+    var V = window.MPL_VCA;
+    if (!V) return;
+    var fp = (!V.ativo || !V.resultado || V.resultado.erro) ? "off"
+      : [V.resultado.alvo, V.resultado.K, V.resultado.dezRR.join(",")].join("|");
+    if (fp !== fpAnt) { fpAnt = fp; render(); }
+  }, 450);
+
+  if (typeof mplOn === "function") mplOn("radar:form", montarSecao, 62);
+  document.addEventListener("DOMContentLoaded", function () { setTimeout(montarSecao, 950); });
+
+  console.log("MPL VCA v3: card 'RR do Alvo' + envio ao Gerador ativo.");
+})();
+/* ============================================================
+   #pessoal
+   MPL — VCA v4 — MODO PROJEÇÃO (alvo ainda não sorteado)
+   COLE NO FINAL DE js/mpl-vca.js.
+
+   O VCA recusava alvo inexistente na base ("não encontrado no
+   escopo"). Mas o radar NÃO depende do resultado do alvo — só a
+   aferição da cobertura depende. Com mapa 3024→3063 e alvo 3064,
+   o RR(40) sai normalmente; o que falta é o gabarito.
+
+   Agora: se o alvo for o próximo concurso (último + 1), calcula e
+   exibe o RR igual sempre, trocando a barra de cobertura por um
+   aviso de que ela será aferida quando o resultado for publicado.
+   A projeção fica registrada e é conferida sozinha na atualização.
+   ============================================================ */
+(function () {
+  "use strict";
+
+  var CHAVE = "mplProjecoes";
+  function lerProj() { try { return JSON.parse(localStorage.getItem(CHAVE) || "[]"); } catch (e) { return []; } }
+  function gravarProj(l) { try { localStorage.setItem(CHAVE, JSON.stringify(l)); } catch (e) {} }
+
+  /* ---------- cálculo em modo projeção ---------- */
+  function calcularProjecao() {
+    var V = window.MPL_VCA;
+    if (!MPL_STATE.modalidade) return null;
+    var base = (typeof baseEfetiva === "function") ? baseEfetiva() : MPL_STATE.base;
+    if (!base || base.length < 20) return null;
+
+    var alvo = Number(V.alvo);
+    var ultimo = base[base.length - 1].numero;
+    if (alvo !== ultimo + 1) return null;      // só o próximo concurso
+
+    var historico = base.slice();               // todo o disponível
+    var janela, mapaIni, mapaFim;
+
+    if (V.modo === "manual" && V.mapaIni && V.mapaFim) {
+      var i1 = historico.findIndex(function (c) { return c.numero >= V.mapaIni; });
+      var i2 = -1;
+      for (var k = historico.length - 1; k >= 0; k--) {
+        if (historico[k].numero <= V.mapaFim) { i2 = k; break; }
+      }
+      if (i1 < 0 || i2 < 0 || i1 > i2) return { erro: "Intervalo do mapa inválido." };
+      historico = historico.slice(i1, i2 + 1);
+      janela = historico.length;
+      mapaIni = historico[0].numero;
+      mapaFim = historico[historico.length - 1].numero;
+    } else {
+      janela = MPL_STATE.config.caixaJanela ||
+        (MPL_STATE.cache.caixa ? Math.round(MPL_STATE.cache.caixa.mediana) : 20);
+      mapaFim = historico[historico.length - 1].numero;
+      mapaIni = historico[Math.max(0, historico.length - janela)].numero;
+    }
+    if (historico.length < 20) return { erro: "Mapa muito curto (mínimo 20 concursos)." };
+
+    var cfg = MPL_STATE.config;
+    var baseScores = V.restringirScores
+      ? historico.slice(Math.max(0, historico.length - janela)) : historico;
+    if (V.restringirScores && baseScores.length < 20)
+      return { erro: "Mapa curto demais para scores restritos." };
+
+    var pack = gerarRankingDezenas(baseScores, MPL_STATE.modalidade, cfg);
+    var rb = gerarRadarBruto(historico, janela);
+    var ra = pack.ranking.filter(function (r) {
+      return rb.indexOf(r.dezena) !== -1 && cfg.su.proibidas.indexOf(r.dezena) === -1;
+    });
+    var kPedido = V.kOverride || cfg.K;
+    var K = Math.min(kPedido, ra.length || kPedido);
+    var rr = gerarRR(ra, K, cfg.su.fixas, cfg.su.proibidas);
+
+    return {
+      projecao: true, alvo: alvo,
+      dezenasAlvo: [], dentro: [], fora: [],
+      cobertura: null, total: MPL_STATE.modalidade.dezenasSorteadas, pct: null,
+      mapaIni: mapaIni, mapaFim: mapaFim, janela: janela,
+      ranking: pack.ranking, rr: rr, dezRR: rr.map(function (d) { return d.dezena; }),
+      rb: rb.length, ra: ra.length, K: K, kPedido: kPedido,
+      restrito: !!V.restringirScores, nScores: baseScores.length,
+      rc: calcularRC(K, cfg.A || MPL_STATE.modalidade.dezenasSorteadas, MPL_STATE.modalidade.universo)
+    };
+  }
+
+  /* ---------- intercepta o recálculo do VCA ---------- */
+  var alvoValido = false;
+  setInterval(function () {
+    var V = window.MPL_VCA;
+    if (!V || !V.ativo || !MPL_STATE.modalidade) return;
+    var base = (typeof baseEfetiva === "function") ? baseEfetiva() : MPL_STATE.base;
+    if (!base.length) return;
+    var ehProx = Number(V.alvo) === base[base.length - 1].numero + 1;
+    if (!ehProx) { alvoValido = false; return; }
+
+    /* se o VCA errou por "não encontrado", substitui pelo cálculo de projeção */
+    var r = V.resultado;
+    var precisa = !r || r.erro || (r.alvo !== Number(V.alvo));
+    if (precisa) {
+      var p = calcularProjecao();
+      if (p) { V.resultado = p; alvoValido = true; if (typeof renderPainel === "function") renderPainel(); }
+    }
+    decorarProjecao();
+  }, 600);
+
+  /* ---------- ajusta o painel quando for projeção ---------- */
+  function decorarProjecao() {
+    var V = window.MPL_VCA, r = V && V.resultado;
+    if (!r || !r.projecao) return;
+    var el = document.getElementById("vcaConteudo");
+    if (!el || document.getElementById("avisoProjecao")) return;
+
+    /* remove barra/cobertura que não se aplicam */
+    el.querySelectorAll("div").forEach(function (d) {
+      if (/cobre <b/.test(d.innerHTML) && d.innerHTML.length < 260) d.style.display = "none";
+    });
+
+    var box = document.createElement("div");
+    box.id = "avisoProjecao";
+    box.className = "alert alert-warn";
+    box.style.cssText = "font-size:11px;margin:8px 0;";
+    box.innerHTML = '🔮 <b>MODO PROJEÇÃO — concurso ' + r.alvo + '</b><br>' +
+      'Concurso ainda não sorteado: o radar foi calculado normalmente (mapa ' +
+      r.mapaIni + '→' + r.mapaFim + ', janela ' + r.janela + '), mas <b>a cobertura ' +
+      'só poderá ser aferida após a apuração</b>.' +
+      '<div style="margin-top:6px;"><button id="btnSalvarProj" class="btn-primary" ' +
+      'style="width:100%;font-size:11px;margin:0;">💾 Registrar projeção para conferência</button></div>';
+
+    var ancora = document.getElementById("vcaRecalc");
+    if (ancora && ancora.parentNode) ancora.parentNode.insertBefore(box, ancora.nextSibling);
+    else el.appendChild(box);
+
+    var b = document.getElementById("btnSalvarProj");
+    if (b) b.addEventListener("click", salvarProjecao);
+  }
+
+  function salvarProjecao() {
+    var r = window.MPL_VCA.resultado;
+    if (!r || !r.projecao) return;
+    var l = lerProj();
+    l = l.filter(function (p) {
+      return !(p.modalidade === MPL_STATE.modalidade.presetKey && p.alvo === r.alvo);
+    });
+    l.push({
+      id: "pj_" + Date.now(),
+      modalidade: MPL_STATE.modalidade.presetKey,
+      modalidadeNome: MPL_STATE.modalidade.nome,
+      alvo: r.alvo, K: r.K, janela: r.janela,
+      mapaIni: r.mapaIni, mapaFim: r.mapaFim,
+      dezenas: r.dezRR.slice(),
+      criadoEm: new Date().toISOString(),
+      conferida: false, cobertura: null, sorteadas: null, fora: null
+    });
+    gravarProj(l);
+    alert("Projeção do concurso " + r.alvo + " registrada com " + r.K + " dezenas.\n\n" +
+      "Quando você atualizar a base e o resultado sair, a conferência é automática.");
+    renderHistorico();
+  }
+
+  /* ---------- conferência automática ---------- */
+  function conferirPendentes() {
+    if (!MPL_STATE.modalidade || !MPL_STATE.base.length) return;
+    var l = lerProj(), mudou = false, avisos = [];
+    l.forEach(function (p) {
+      if (p.conferida || p.modalidade !== MPL_STATE.modalidade.presetKey) return;
+      var c = MPL_STATE.base.find(function (x) { return x.numero === p.alvo; });
+      if (!c) return;
+      var dentro = c.dezenas.filter(function (d) { return p.dezenas.indexOf(d) !== -1; });
+      var fora = c.dezenas.filter(function (d) { return p.dezenas.indexOf(d) === -1; });
+      p.conferida = true;
+      p.sorteadas = c.dezenas.slice();
+      p.cobertura = dentro.length;
+      p.fora = fora;
+      p.conferidaEm = new Date().toISOString();
+      mudou = true;
+      avisos.push("Concurso " + p.alvo + ": " + dentro.length + "/" + c.dezenas.length +
+        (fora.length ? " (fora: " + fora.map(function (d) { return String(d).padStart(2, "0"); }).join(" ") + ")" : " — cobertura total"));
+    });
+    if (mudou) {
+      gravarProj(l);
+      renderHistorico();
+      setTimeout(function () {
+        alert("✅ Projeção(ões) conferida(s):\n\n" + avisos.join("\n"));
+      }, 600);
+    }
+  }
+
+  /* ---------- histórico acumulado ---------- */
+  function renderHistorico() {
+    var card = document.getElementById("vcaCard");
+    if (!card || !MPL_STATE.modalidade) return;
+    var sec = document.getElementById("projHistSecao");
+    if (!sec) {
+      sec = document.createElement("div");
+      sec.id = "projHistSecao";
+      sec.style.cssText = "margin-top:16px;padding-top:14px;border-top:1px solid var(--border);";
+      card.appendChild(sec);
+    }
+    var mk = MPL_STATE.modalidade.presetKey;
+    var l = lerProj().filter(function (p) { return p.modalidade === mk; })
+      .sort(function (a, b) { return b.alvo - a.alvo; });
+
+    if (!l.length) {
+      sec.innerHTML = '<h3 style="margin:0 0 6px;">🔮 Projeções</h3>' +
+        '<p class="muted" style="font-size:11px;">Nenhuma projeção registrada para esta modalidade.</p>';
+      return;
+    }
+    var conf = l.filter(function (p) { return p.conferida; });
+    var media = conf.length
+      ? (conf.reduce(function (s, p) { return s + p.cobertura; }, 0) / conf.length) : null;
+    var S = MPL_STATE.modalidade.dezenasSorteadas;
+
+    sec.innerHTML = '<h3 style="margin:0 0 6px;">🔮 Projeções</h3>' +
+      (media !== null
+        ? '<div class="stat-card" style="border-top:3px solid #10b981;padding:8px;margin-bottom:8px;">' +
+          '<div class="label">Cobertura média prospectiva</div>' +
+          '<div class="value">' + media.toFixed(2) + ' / ' + S + '</div>' +
+          '<div class="muted" style="font-size:10px;">' + conf.length + ' projeção(ões) conferida(s) — ' +
+          'registradas ANTES do sorteio, sem ajuste retroativo</div></div>'
+        : '') +
+      l.slice(0, 12).map(function (p) {
+        var c = p.conferida
+          ? (p.cobertura >= S - 1 ? "#10b981" : (p.cobertura >= S - 2 ? "#eab308" : "#ef4444"))
+          : "#64748b";
+        return '<div style="background:var(--graphite);border:1px solid var(--border);border-left:3px solid ' + c +
+          ';border-radius:8px;padding:7px;margin-bottom:6px;">' +
+          '<div style="font-size:11.5px;font-weight:700;">Concurso ' + p.alvo +
+          (p.conferida ? ' · <span style="color:' + c + ';">' + p.cobertura + '/' + S + '</span>'
+                       : ' · <span class="muted">aguardando</span>') + '</div>' +
+          '<div class="muted" style="font-size:10px;">K=' + p.K + ' · janela ' + p.janela +
+          ' · mapa ' + p.mapaIni + '→' + p.mapaFim + '</div>' +
+          (p.conferida && p.fora && p.fora.length
+            ? '<div style="font-size:10px;color:#fff;">Fora: ' +
+              p.fora.map(function (d) { return String(d).padStart(2, "0"); }).join(" ") + '</div>' : '') +
+          '</div>';
+      }).join("");
+  }
+
+  /* dispara conferência quando a base muda */
+  var ultTam = 0;
+  setInterval(function () {
+    if (!MPL_STATE.base) return;
+    if (MPL_STATE.base.length !== ultTam) {
+      ultTam = MPL_STATE.base.length;
+      setTimeout(conferirPendentes, 900);
+    }
+  }, 1500);
+
+  if (typeof mplOn === "function") mplOn("radar:form", renderHistorico, 68);
+  document.addEventListener("DOMContentLoaded", function () {
+    setTimeout(function () { renderHistorico(); conferirPendentes(); }, 1100);
+  });
+
+  window.mplProjecoes = { listar: lerProj, conferir: conferirPendentes };
+  console.log("MPL VCA v4: modo projeção (alvo futuro) + conferência automática ativo.");
+})();
+/* ============================================================
+   #pessoal
+   MPL — VCA v5 — janelas curtas (< 20) no Target Lock
+   COLE NO FINAL DE js/mpl-vca.js.
+
+   Problema: o OCA aceita janela < 20 quando os scores usam o histórico
+   completo (só o radar bruto usa a janela). O Target Lock recusava:
+   • modo AUTOMÁTICO com "restringir scores": mínimo 20 para os scores;
+   • modo MANUAL (bug): cortava TODO o histórico para o intervalo,
+     inclusive os scores — exigindo 20 mesmo sem a restrição.
+
+   Agora:
+   • manual: o intervalo define só o RADAR BRUTO; scores usam todo o
+     histórico até o fim do intervalo (exceto se restringir marcado);
+   • mínimo do radar bruto: 5 concursos;
+   • scores restritos: mínimo 10, com aviso de instabilidade abaixo de 20.
+   Atua só quando o Target Lock acusa "mapa muito curto".
+   ============================================================ */
+(function () {
+  "use strict";
+
+  function calcular() {
+    var V = window.MPL_VCA, m = MPL_STATE.modalidade;
+    if (!V || !m) return null;
+    var base = ((typeof baseEfetiva === "function") ? baseEfetiva() : MPL_STATE.base).slice()
+      .sort(function (a, b) { return a.numero - b.numero; });
+    if (base.length < 20) return null;
+
+    var alvo = Number(V.alvo);
+    var idx = base.findIndex(function (c) { return c.numero === alvo; });
+    var projecao = false, hist;
+    if (idx >= 0) hist = base.slice(0, idx);
+    else if (alvo === base[base.length - 1].numero + 1) { hist = base.slice(); projecao = true; }
+    else return { erro: "Concurso-alvo " + alvo + " não encontrado na base." };
+
+    var fimIdx = hist.length - 1, janela, mapaIni, mapaFim;
+    if (V.modo === "manual" && V.mapaIni && V.mapaFim) {
+      var i1 = hist.findIndex(function (c) { return c.numero >= V.mapaIni; });
+      var i2 = -1;
+      for (var k = hist.length - 1; k >= 0; k--) if (hist[k].numero <= V.mapaFim) { i2 = k; break; }
+      if (i1 < 0 || i2 < 0 || i1 > i2) return { erro: "Intervalo do mapa inválido para este alvo." };
+      fimIdx = i2; janela = i2 - i1 + 1;
+    } else {
+      janela = MPL_STATE.config.caixaJanela ||
+        (MPL_STATE.cache.caixa ? Math.round(MPL_STATE.cache.caixa.mediana) : 20);
+    }
+    var histAteFim = hist.slice(0, fimIdx + 1);
+    if (janela < 5) return { erro: "Janela muito curta (mínimo 5 concursos)." };
+    if (histAteFim.length < janela) return { erro: "Histórico insuficiente para a janela pedida." };
+    mapaFim = histAteFim[histAteFim.length - 1].numero;
+    mapaIni = histAteFim[histAteFim.length - janela].numero;
+
+    var restr = !!V.restringirScores;
+    var baseScores = restr ? histAteFim.slice(histAteFim.length - janela) : histAteFim;
+    if (restr && baseScores.length < 10) {
+      return { erro: "Scores restritos com só " + baseScores.length + " concursos (mínimo 10). Desmarque a restrição ou aumente a janela." };
+    }
+    if (!restr && baseScores.length < 20) return { erro: "Histórico anterior muito curto (mínimo 20)." };
+
+    var cfg = MPL_STATE.config;
+    var pack = gerarRankingDezenas(baseScores, m, cfg);
+    var rb = gerarRadarBruto(histAteFim, janela);
+    var ra = pack.ranking.filter(function (r) {
+      return rb.indexOf(r.dezena) !== -1 && cfg.su.proibidas.indexOf(r.dezena) === -1;
+    });
+    var kPedido = V.kOverride || cfg.K;
+    var K = Math.min(kPedido, ra.length || kPedido);
+    var rr = gerarRR(ra, K, cfg.su.fixas, cfg.su.proibidas);
+    var dezRR = rr.map(function (d) { return d.dezena; });
+
+    var dez = projecao ? [] : base[idx].dezenas.map(Number);
+    var dentro = dez.filter(function (d) { return dezRR.indexOf(d) !== -1; });
+    var fora = dez.filter(function (d) { return dezRR.indexOf(d) === -1; });
+
+    return {
+      projecao: projecao, alvo: alvo, dezenasAlvo: dez, dentro: dentro, fora: fora,
+      cobertura: projecao ? null : dentro.length, total: m.dezenasSorteadas,
+      pct: projecao ? null : (dez.length ? dentro.length / dez.length * 100 : 0),
+      mapaIni: mapaIni, mapaFim: mapaFim, janela: janela,
+      ranking: pack.ranking, rr: rr, dezRR: dezRR,
+      rb: rb.length, ra: ra.length, K: K, kPedido: kPedido,
+      restrito: restr, nScores: baseScores.length,
+      rc: calcularRC(K, cfg.A || m.dezenasSorteadas, m.universo),
+      avisoCurto: restr && baseScores.length < 20
+    };
+  }
+
+  function mostrar(r) {
+    var painel = document.getElementById("vcaConteudo");
+    if (!painel) return;
+    var box = Array.prototype.find.call(painel.querySelectorAll(".alert"), function (a) {
+      return /curto|mínimo/i.test(a.textContent);
+    });
+    if (!box) return;
+    if (r.erro) { box.innerHTML = r.erro; return; }
+    var cor = r.projecao ? "#eab308" : (r.pct >= 80 ? "#10b981" : (r.pct >= 60 ? "#eab308" : "#ef4444"));
+    box.className = "alert";
+    box.style.cssText = "border-color:" + cor + ";background:rgba(16,24,40,.6);color:#e6edf7;font-size:11.5px;";
+    box.innerHTML =
+      '<b>RR(' + r.K + ')</b> · janela ' + r.janela + ' · mapa ' + r.mapaIni + '→' + r.mapaFim + '<br>' +
+      (r.projecao ? '🔮 Projeção: cobertura será aferida após o sorteio.'
+        : 'Cobre <b style="color:' + cor + ';">' + r.cobertura + ' de ' + r.total + '</b> (' + r.pct.toFixed(1) + '%)' +
+          (r.fora.length ? ' · fora: ' + r.fora.map(function (d) { return String(d).padStart(2, "0"); }).join(" ") : '')) +
+      '<br><span class="muted">Scores em ' + r.nScores + ' concursos' + (r.restrito ? ' (restritos ao mapa)' : ' (histórico completo)') + '</span>' +
+      (r.avisoCurto ? '<br><span style="color:#eab308;">⚠ Menos de 20 concursos nos scores: SA e SC ficam instáveis.</span>' : '');
+  }
+
+  var ultimo = null;
+  setInterval(function () {
+    var V = window.MPL_VCA;
+    if (!V || !V.ativo || !V.resultado || !V.resultado.erro) return;
+    if (!/curto|mínimo/i.test(V.resultado.erro)) return;
+    var chave = [V.alvo, V.modo, V.mapaIni, V.mapaFim, V.kOverride, V.restringirScores, MPL_STATE.config.caixaJanela].join("|");
+    if (chave === ultimo) return;
+    ultimo = chave;
+    var r;
+    try { r = calcular(); } catch (e) { console.error("VCA v5:", e); return; }
+    if (!r) return;
+    if (!r.erro) V.resultado = r;     /* alimenta overlay, card "RR do Alvo" e presets */
+    mostrar(r);
+  }, 500);
+
+  console.log("MPL VCA v5: janelas curtas no Target Lock (radar ≥ 5, scores restritos ≥ 10).");
+})();

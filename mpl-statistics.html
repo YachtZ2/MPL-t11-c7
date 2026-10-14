@@ -1,0 +1,126 @@
+/* ============================================================
+   MPL — mpl-statistics.js
+   Caixa Estatística: RECH, JMCT, MCE, ECE, TJF, Radar Bruto (RB)
+   Fórmulas canônicas — Volume 1, Capítulo 4
+   ============================================================ */
+
+/* RECH(N,T) = união das dezenas dos concursos T-N até T-1 */
+function calcularRECH(base, indiceAlvo, janelaN) {
+  const inicio = Math.max(0, indiceAlvo - janelaN);
+  const concursos = base.slice(inicio, indiceAlvo);
+  const radar = new Set();
+  concursos.forEach(c => c.dezenas.forEach(d => radar.add(d)));
+  return Array.from(radar).sort((a, b) => a - b);
+}
+
+/* JMCT(T) = menor N tal que Resultado(T) ⊂ RECH(N,T) */
+function calcularJMCT(base, indiceAlvo, limiteMax = null) {
+  const resultado = new Set(base[indiceAlvo].dezenas);
+  const max = limiteMax || indiceAlvo;
+  for (let n = 1; n <= max; n++) {
+    const rech = new Set(calcularRECH(base, indiceAlvo, n));
+    let contemTodas = true;
+    for (const d of resultado) { if (!rech.has(d)) { contemTodas = false; break; } }
+    if (contemTodas) return n;
+  }
+  return null; // não convergiu dentro do histórico disponível
+}
+
+/* MCE — Mensuração da Caixa Estatística (varre toda a base) */
+function calcularMCE(base, minHistorico = 10) {
+  const jmctArray = [];
+  for (let i = minHistorico; i < base.length; i++) {
+    const j = calcularJMCT(base, i);
+    if (j !== null) jmctArray.push({ concurso: base[i].numero, jmct: j });
+  }
+  const valores = jmctArray.map(x => x.jmct);
+  return {
+    jmctArray,
+    media: media(valores),
+    mediana: mediana(valores),
+    moda: moda(valores),
+    minimo: valores.length ? Math.min(...valores) : 0,
+    maximo: valores.length ? Math.max(...valores) : 0,
+    desvioPadrao: desvioPadrao(valores),
+    p75: percentil(valores, 75),
+    p80: percentil(valores, 80),
+    p85: percentil(valores, 85),
+    p90: percentil(valores, 90),
+    p95: percentil(valores, 95),
+    p99: percentil(valores, 99)
+  };
+}
+
+/* ECE — Elasticidade da Caixa Estatística (crescimento até cobertura total) */
+function calcularECE(base, indiceAlvo, janelaBase) {
+  const jmct = calcularJMCT(base, indiceAlvo);
+  if (jmct === null) return null;
+  return Math.max(0, jmct - janelaBase);
+}
+
+/* TJF — Teste de Janelas Fixas */
+const JANELAS_PADRAO_TJF = [5, 7, 8, 10, 12, 13, 15, 17, 18, 20, 25, 30, 40, 50];
+
+function testeJanelasFixas(base, janelas = JANELAS_PADRAO_TJF, minHistorico = 10) {
+  const resultados = [];
+  janelas.forEach(N => {
+    let somaCobertura = 0, coberturaTotal = 0, coberturaS1 = 0, coberturaS2 = 0, n = 0, tamanhoRadarSoma = 0;
+    for (let i = minHistorico; i < base.length; i++) {
+      if (i - N < 0) continue;
+      const rech = new Set(calcularRECH(base, i, N));
+      const alvo = base[i].dezenas;
+      const acertos = alvo.filter(d => rech.has(d)).length;
+      somaCobertura += acertos / alvo.length;
+      tamanhoRadarSoma += rech.size;
+      if (acertos === alvo.length) coberturaTotal++;
+      if (acertos >= alvo.length - 1) coberturaS1++;
+      if (acertos >= alvo.length - 2) coberturaS2++;
+      n++;
+    }
+    resultados.push({
+      janela: N,
+      tamanhoMedioRadar: n ? (tamanhoRadarSoma / n).toFixed(2) : 0,
+      coberturaMedia: n ? (100 * somaCobertura / n).toFixed(2) + "%" : "0%",
+      taxaCoberturaTotal: n ? (100 * coberturaTotal / n).toFixed(2) + "%" : "0%",
+      taxaS1: n ? (100 * coberturaS1 / n).toFixed(2) + "%" : "0%",
+      taxaS2: n ? (100 * coberturaS2 / n).toFixed(2) + "%" : "0%",
+      amostras: n
+    });
+  });
+  return resultados;
+}
+
+/* RB — Radar Bruto: união das dezenas dentro da janela escolhida (padrão: mediana da JMCT) */
+function gerarRadarBruto(base, janela) {
+  if (!base.length) return [];
+  const inicio = Math.max(0, base.length - janela);
+  const set = new Set();
+  base.slice(inicio).forEach(c => c.dezenas.forEach(d => set.add(d)));
+  return Array.from(set).sort((a, b) => a - b);
+}
+
+/* ---------------- Frequência, Ausência e Ciclo (utilitários de apoio) ---------------- */
+
+function posicoesDezena(base, dezena) {
+  const posicoes = [];
+  base.forEach((c, i) => { if (c.dezenas.includes(dezena)) posicoes.push(i); });
+  return posicoes;
+}
+
+function contarFrequencia(base, dezena, janela) {
+  const inicio = Math.max(0, base.length - janela);
+  return base.slice(inicio).filter(c => c.dezenas.includes(dezena)).length;
+}
+
+function intervalosDezena(posicoes) {
+  const intervalos = [];
+  for (let i = 1; i < posicoes.length; i++) intervalos.push(posicoes[i] - posicoes[i - 1]);
+  return intervalos;
+}
+
+function ausenciaAtual(base, dezena) {
+  for (let i = base.length - 1; i >= 0; i--) {
+    if (base[i].dezenas.includes(dezena)) return (base.length - 1) - i;
+  }
+  return base.length; // nunca apareceu
+}

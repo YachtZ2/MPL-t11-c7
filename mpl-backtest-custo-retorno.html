@@ -1,0 +1,118 @@
+/* ============================================================
+   MPL — mpl-backtest-custo-retorno.js  (Fase 8, parte 3/3)
+   ADICIONE no index.html, depois de js/mpl-ui.js:
+     <script src="js/mpl-backtest-custo-retorno.js"></script>
+
+   Acrescenta, no resultado do BTJ (Backtest de Jogos), uma
+   comparação de custo × retorno: quanto teria sido gasto apostando
+   o Top-N de cada rodada do backtest, vs. quanto teria retornado em
+   premiação REAL (usando os dados de premiação capturados via API
+   — Fase 8, partes 1 e 2). Concursos importados manualmente (sem
+   dado de premiação) são contados separadamente e EXCLUÍDOS do
+   cálculo de retorno, para não inventar valor de prêmio.
+
+   Importante, e mostrado na tela: isto é um cálculo RETROSPECTIVO
+   e hipotético (o que teria acontecido SE você tivesse apostado
+   esses jogos exatos no passado) — não é previsão nem garantia de
+   nada futuro, conforme o princípio metodológico do MPL.
+   ============================================================ */
+(function () {
+  "use strict";
+
+  function extrairAcertosDaFaixa(descricao) {
+    if (!descricao) return null;
+    var d = descricao.toLowerCase();
+    var m = d.match(/(\d+)\s*n[uú]mero/) || d.match(/(\d+)\s*acert/) || d.match(/(\d+)\s*dezena/);
+    if (m) return Number(m[1]);
+    if (d.indexOf("sena") > -1) return 6;
+    if (d.indexOf("quina") > -1) return 5;
+    if (d.indexOf("quadra") > -1) return 4;
+    if (d.indexOf("terno") > -1) return 3;
+    if (d.indexOf("duque") > -1) return 2;
+    return null;
+  }
+
+  function montarPainelConfig() {
+    var form = document.getElementById("backtestForm");
+    if (!form || document.getElementById("custoRetornoConfig")) return;
+    var card = document.createElement("div");
+    card.className = "card";
+    card.id = "custoRetornoConfig";
+    card.innerHTML =
+      '<h3>💰 Configuração de Custo × Retorno (BTJ)</h3>' +
+      '<p class="muted">Preço atual da aposta simples — mude sempre que os preços da Caixa forem reajustados (não mantemos isso automaticamente).</p>' +
+      '<label>Valor da aposta simples (R$)</label>' +
+      '<input type="number" id="precoApostaSimples" min="0" step="0.5" placeholder="ex.: 5.00" style="max-width:200px;">';
+    form.parentNode.insertBefore(card, form.nextSibling);
+  }
+
+  function religarBotaoBTJ() {
+    var btn = document.getElementById("btnBTJ");
+    if (!btn || btn.__custoRetornoLigado) return;
+    btn.__custoRetornoLigado = true;
+
+    btn.addEventListener("click", function () {
+      setTimeout(function () {
+        var btj = MPL_STATE.cache.btj;
+        if (!btj || !btj.resultados) return;
+
+        var preco = Number(document.getElementById("precoApostaSimples").value);
+        var topN = Number(document.getElementById("btTopN").value) || 10;
+
+        var mapaBase = {};
+        MPL_STATE.base.forEach(function (c) { mapaBase[c.numero] = c; });
+
+        var custoTotal = 0, retornoTotal = 0, concursosComDado = 0, concursosSemDado = 0;
+
+        btj.resultados.forEach(function (item) {
+          var concurso = mapaBase[item.concurso];
+          custoTotal += (preco || 0) * topN;
+
+          if (!concurso || !concurso.premiacoes || !concurso.premiacoes.length) {
+            concursosSemDado++;
+            return;
+          }
+          concursosComDado++;
+
+          var mapaFaixas = {};
+          concurso.premiacoes.forEach(function (p) {
+            var acertos = extrairAcertosDaFaixa(p.descricao);
+            if (acertos !== null) mapaFaixas[acertos] = p.valorPremio;
+          });
+
+          if (mapaFaixas[item.melhorAcerto] !== undefined) {
+            retornoTotal += mapaFaixas[item.melhorAcerto];
+          }
+        });
+
+        var saldo = retornoTotal - custoTotal;
+        var resultado = document.getElementById("backtestResult");
+        if (!resultado) return;
+
+        var bloco = document.createElement("div");
+        bloco.innerHTML =
+          '<h3 style="margin-top:18px;">💰 Custo × Retorno (retrospectivo e hipotético)</h3>' +
+          '<div class="grid-cards">' +
+          '<div class="stat-card"><div class="label">Custo total (Top ' + topN + ' × ' + btj.resultados.length + ' rodadas)</div><div class="value">' +
+          (preco ? "R$ " + custoTotal.toLocaleString("pt-BR", { minimumFractionDigits: 2 }) : "—") + '</div></div>' +
+          '<div class="stat-card"><div class="label">Retorno total (premiação real)</div><div class="value">R$ ' + retornoTotal.toLocaleString("pt-BR", { minimumFractionDigits: 2 }) + '</div></div>' +
+          '<div class="stat-card"><div class="label">Saldo</div><div class="value" style="color:' + (saldo >= 0 ? "#10b981" : "#ef4444") + ';">R$ ' + saldo.toLocaleString("pt-BR", { minimumFractionDigits: 2 }) + '</div></div>' +
+          '<div class="stat-card"><div class="label">Concursos com dado de premiação</div><div class="value">' + concursosComDado + ' de ' + btj.resultados.length + '</div></div>' +
+          '</div>' +
+          (concursosSemDado > 0 ? '<div class="alert alert-warn">' + concursosSemDado + ' concurso(s) sem dados de premiação (importados manualmente) foram excluídos do RETORNO, mas seguem contando no custo.</div>' : "") +
+          (!preco ? '<div class="alert alert-warn">Informe o preço da aposta simples acima para calcular o custo — sem ele, só o retorno é mostrado.</div>' : "") +
+          '<p class="muted">Cálculo retrospectivo: "o que teria acontecido SE você tivesse apostado esses jogos exatos nesses concursos passados." Não é previsão nem garantia de resultado futuro.</p>';
+
+        resultado.appendChild(bloco);
+      }, 60);
+    });
+  }
+
+  var tentativas = 0;
+  var vigia = setInterval(function () {
+    tentativas++;
+    montarPainelConfig();
+    religarBotaoBTJ();
+    if (tentativas > 40) clearInterval(vigia);
+  }, 250);
+})();

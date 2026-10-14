@@ -1,0 +1,234 @@
+/* ============================================================
+   MPL — mpl-backtest.js
+   BTM (Backtest Modular de Radar) e BTJ (Backtest de Jogos)
+   Regra absoluta: para avaliar concurso T, usar apenas dados < T.
+   v1.1 — BTM aceita "passo" de amostragem (usado pelo Otimizador de K
+   na aba Radar, para permitir comparar vários valores de K rapidamente).
+   ============================================================ */
+
+/* BTM — avalia cobertura do radar reduzido concurso a concurso.
+   passo permite amostrar concursos (ex.: passo=5 testa 1 a cada 5) para
+   viabilizar comparações rápidas entre múltiplos valores de K. */
+function executarBTM(base, modalidade, config, minHistorico = 40, passo = 1) {
+  const resultados = [];
+  for (let i = minHistorico; i < base.length; i += passo) {
+    const historico = base.slice(0, i);
+    const alvo = base[i];
+
+    const { ranking } = gerarRankingDezenas(historico, modalidade, config);
+    const rr = gerarRR(ranking, config.K, config.su.fixas, config.su.proibidas);
+    const dezenasRR = rr.map(d => d.dezena);
+
+    const cobertura = alvo.dezenas.filter(d => dezenasRR.includes(d)).length;
+    resultados.push({
+      concurso: alvo.numero,
+      cobertura,
+      total: alvo.dezenas.length,
+      coberturaPct: alvo.dezenas.length ? cobertura / alvo.dezenas.length : 0,
+      tamanhoRR: dezenasRR.length
+    });
+  }
+
+  const coberturaPcts = resultados.map(r => r.coberturaPct);
+  const rc = calcularRC(config.K, modalidade.dezenasSorteadas, modalidade.universo);
+  return {
+    resultados,
+    coberturaMedia: media(coberturaPcts),
+    coberturaTotal: resultados.filter(r => r.cobertura === r.total).length / Math.max(1, resultados.length),
+    coberturaS1: resultados.filter(r => r.cobertura >= r.total - 1).length / Math.max(1, resultados.length),
+    rc,
+    ier: calcularIER(media(coberturaPcts), rc),
+    amostras: resultados.length
+  };
+}
+
+/* Otimizador de K — roda o BTM para uma lista de valores de K e compara
+   cobertura x redução combinatória, ajudando a escolher o MENOR radar
+   com desempenho histórico aceitável (essência filosófica do MPL). */
+function executarOtimizadorK(base, modalidade, config, valoresK, passo = 5, minHistorico = 40) {
+  const resultados = [];
+  valoresK.forEach(K => {
+    if (K < modalidade.dezenasSorteadas || K > modalidade.universo) return;
+    const cfgTeste = { ...config, K };
+    const btm = executarBTM(base, modalidade, cfgTeste, minHistorico, passo);
+    resultados.push({
+      K,
+      coberturaMedia: btm.coberturaMedia,
+      coberturaTotal: btm.coberturaTotal,
+      rc: btm.rc,
+      ier: btm.ier,
+      combinacoes: combinacao(K, modalidade.dezenasSorteadas),
+      amostras: btm.amostras
+    });
+  });
+  return resultados;
+}
+
+/* BTJ — avalia se o Top-N de jogos ranqueados teria capturado bons acertos */
+function executarBTJ(base, modalidade, config, opcoes = {}, minHistorico = 60) {
+  const resultados = [];
+  const topN = opcoes.topN || 10;
+  const passo = opcoes.passo || 5;
+
+  for (let i = minHistorico; i < base.length; i += passo) {
+    const historico = base.slice(0, i);
+    const alvo = base[i];
+
+    const { ranking, teia } = gerarRankingDezenas(historico, modalidade, config);
+    const rr = gerarRR(ranking, config.K, config.su.fixas, config.su.proibidas);
+    const dezenasRR = rr.map(d => d.dezena);
+
+    const A = config.A || modalidade.dezenasSorteadas;
+    const { jogos } = gerarJogosCandidatos(dezenasRR, A, { qtdAmostra: 4000, seed: i });
+    const concursoAnterior = historico.length ? historico[historico.length - 1].dezenas : null;
+    const { aprovados } = aplicarPipelineFiltros(jogos, config.filtrosDuros, {
+      universo: modalidade.universo, concursoAnterior, rankingDezenas: ranking,
+      fixas: config.su.fixas, proibidas: config.su.proibidas,
+      layout: obterLayoutVolante(modalidade)
+    });
+
+    const pool = aprovados.length ? aprovados : jogos;
+    const ranqueados = ranquearJogos(pool.slice(0, 5000), ranking, teia, modalidade, historico, config.su, config.stjPesos);
+    const top = ranqueados.slice(0, topN);
+
+    const acertos = top.map(r => r.jogo.filter(d => alvo.dezenas.includes(d)).length);
+    resultados.push({
+      concurso: alvo.numero,
+      melhorAcerto: acertos.length ? Math.max(...acertos) : 0,
+      acertoMedio: acertos.length ? media(acertos) : 0,
+      qtdJogosAvaliados: top.length
+    });
+  }
+
+  const melhores = resultados.map(r => r.melhorAcerto);
+  return {
+    resultados,
+    melhorAcertoMedio: media(melhores),
+    melhorAcertoMediana: mediana(melhores),
+    distribuicao: melhores,
+    amostras: resultados.length
+  };
+}
+
+/* Walk-forward: divide em treino/validação/teste e compara estabilidade */
+function executarWalkForward(base, modalidade, config, opcoes = {}) {
+  const n = base.length;
+  const corteTreino = Math.floor(n * (opcoes.treinoPct || 0.6));
+  const corteValidacao = Math.floor(n * (opcoes.validacaoPct || 0.8));
+
+  const treino = base.slice(0, corteTreino);
+  const validacao = base.slice(0, corteValidacao);
+  const teste = base;
+
+  const btmTreino = executarBTM(treino, modalidade, config, Math.min(20, treino.length - 1));
+  const btmValidacao = executarBTM(validacao, modalidade, config, corteTreino);
+  const btmTeste = executarBTM(teste, modalidade, config, corteValidacao);
+
+  return {
+    treino: { coberturaMedia: btmTreino.coberturaMedia, amostras: btmTreino.amostras },
+    validacao: { coberturaMedia: btmValidacao.coberturaMedia, amostras: btmValidacao.amostras },
+    teste: { coberturaMedia: btmTeste.coberturaMedia, amostras: btmTeste.amostras },
+    diferencaTreinoTeste: Math.abs(btmTreino.coberturaMedia - btmTeste.coberturaMedia)
+  };
+}
+
+/* Painel de Overfitting: heurísticas de alerta */
+function avaliarOverfitting(base, config, walkForwardResult) {
+  const alertas = [];
+  const nParametros = Object.values(config.modulosAtivos).filter(Boolean).length +
+    Object.keys(config.filtrosDuros || {}).filter(k => config.filtrosDuros[k]?.ativo).length;
+  const nConcursos = base.length;
+  const razaoParamAmostra = nConcursos > 0 ? nParametros / nConcursos : 1;
+
+  let nivel = "baixo";
+
+  if (nConcursos < 100) { alertas.push("Amostra histórica pequena (< 100 concursos): resultados de backtest pouco confiáveis."); nivel = "alto"; }
+  if (razaoParamAmostra > 0.05) { alertas.push("Relação parâmetros/concursos elevada: risco de sobreajuste (overfitting)."); nivel = "alto"; }
+  if (walkForwardResult && walkForwardResult.diferencaTreinoTeste > 0.15) {
+    alertas.push("Grande diferença de desempenho entre treino e teste: possível overfitting."); nivel = "alto";
+  } else if (walkForwardResult && walkForwardResult.diferencaTreinoTeste > 0.08) {
+    alertas.push("Diferença moderada entre treino e teste: validar com mais cautela.");
+    if (nivel === "baixo") nivel = "moderado";
+  }
+  if (config.K && config.K < 10) alertas.push("Radar reduzido muito pequeno: risco elevado de baixa cobertura futura.");
+
+  if (!alertas.length) alertas.push("Nenhum sinal evidente de overfitting detectado nas heurísticas atuais.");
+
+  return { nivel, alertas, nParametros, nConcursos, razaoParamAmostra };
+}
+/* ============================================================
+   #pessoal
+   MPL — FASE 9 (parte 1/3) — BTJ expõe acertos INDIVIDUAIS
+   COLE NO FINAL DE js/mpl-backtest.js — não apaga nada.
+   Problema corrigido: executarBTJ só devolvia "melhorAcerto",
+   então o cálculo de custo × retorno pagava por N jogos mas só
+   contabilizava o prêmio de 1. Agora cada rodada devolve também
+   "acertos" (array com o nº de acertos de CADA jogo do Top-N) e,
+   na Dupla Sena, "acertos2" (mesma coisa para o 2º sorteio).
+   ============================================================ */
+(function () {
+  "use strict";
+
+  executarBTJ = function (base, modalidade, config, opcoes, minHistorico) {
+    opcoes = opcoes || {};
+    minHistorico = minHistorico || 60;
+    var resultados = [];
+    var topN = opcoes.topN || 10;
+    var passo = opcoes.passo || 5;
+    var ehDS = (typeof isDuplaSena === "function") && isDuplaSena(modalidade);
+
+    for (var i = minHistorico; i < base.length; i += passo) {
+      var historico = base.slice(0, i);
+      var alvo = base[i];
+      var pack = gerarRankingDezenas(historico, modalidade, config);
+      var ranking = pack.ranking, teia = pack.teia;
+      var rr = gerarRR(ranking, config.K, config.su.fixas, config.su.proibidas);
+      var dezenasRR = rr.map(function (d) { return d.dezena; });
+      var A = config.A || modalidade.dezenasSorteadas;
+
+      var ger = gerarJogosCandidatos(dezenasRR, A, { qtdAmostra: 4000, seed: i });
+      var jogos = ger.jogos;
+      var concursoAnterior = historico.length ? historico[historico.length - 1].dezenas : null;
+
+      var filtrados = aplicarPipelineFiltros(jogos, config.filtrosDuros, {
+        universo: modalidade.universo, concursoAnterior: concursoAnterior,
+        rankingDezenas: ranking, fixas: config.su.fixas, proibidas: config.su.proibidas,
+        layout: obterLayoutVolante(modalidade)
+      });
+
+      var pool = filtrados.aprovados.length ? filtrados.aprovados : jogos;
+      var ranqueados = ranquearJogos(pool.slice(0, 5000), ranking, teia, modalidade, historico, config.su, config.stjPesos);
+      var top = ranqueados.slice(0, topN);
+
+      /* NOVO: acertos de CADA jogo (não só o melhor) */
+      var acertos = top.map(function (r) {
+        return r.jogo.filter(function (d) { return alvo.dezenas.indexOf(d) !== -1; }).length;
+      });
+
+      var acertos2 = null;
+      if (ehDS && Array.isArray(alvo.dezenas2) && alvo.dezenas2.length) {
+        acertos2 = top.map(function (r) {
+          return r.jogo.filter(function (d) { return alvo.dezenas2.indexOf(d) !== -1; }).length;
+        });
+      }
+
+      resultados.push({
+        concurso: alvo.numero,
+        melhorAcerto: acertos.length ? Math.max.apply(null, acertos) : 0,
+        acertoMedio: acertos.length ? media(acertos) : 0,
+        qtdJogosAvaliados: top.length,
+        acertos: acertos,      // <-- NOVO
+        acertos2: acertos2     // <-- NOVO (só Dupla Sena)
+      });
+    }
+
+    var melhores = resultados.map(function (r) { return r.melhorAcerto; });
+    return {
+      resultados: resultados,
+      melhorAcertoMedio: media(melhores),
+      melhorAcertoMediana: mediana(melhores),
+      distribuicao: melhores,
+      amostras: resultados.length
+    };
+  };
+})();

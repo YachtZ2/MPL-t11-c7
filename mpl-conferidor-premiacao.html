@@ -1,0 +1,918 @@
+/* ============================================================
+   MPL — mpl-conferidor-premiacao.js  (Fase 8, parte 4/4)
+   ADICIONE no index.html, DEPOIS de mpl-ui-ConferidorApostas.js
+   e mpl-ui-ConferidorDuplaSena.js (precisa que a aba já exista):
+     <script src="js/mpl-conferidor-premiacao.js"></script>
+
+   Estende o Conferidor de Apostas para mostrar premiação real,
+   usando os dados capturados pela Fase 8 (mpl-api-premiacoes.js).
+   Diferente do Backtest (que só olha o MELHOR acerto), aqui
+   calculamos o RETORNO TOTAL: se você tivesse apostado esse jogo
+   exato em TODOS os concursos do escopo escolhido, quanto teria
+   ganhado somando tudo — é a pergunta mais realista pra quem está
+   de fato conferindo uma aposta própria.
+
+   Concursos sem dado de premiação (importados manualmente) são
+   contados separadamente e excluídos do cálculo de retorno.
+   ============================================================ */
+(function () {
+  "use strict";
+
+  function extrairAcertosDaFaixa(descricao) {
+    if (!descricao) return null;
+    var d = descricao.toLowerCase();
+    var m = d.match(/(\d+)\s*n[uú]mero/) || d.match(/(\d+)\s*acert/) || d.match(/(\d+)\s*dezena/);
+    if (m) return Number(m[1]);
+    if (d.indexOf("sena") > -1) return 6;
+    if (d.indexOf("quina") > -1) return 5;
+    if (d.indexOf("quadra") > -1) return 4;
+    if (d.indexOf("terno") > -1) return 3;
+    if (d.indexOf("duque") > -1) return 2;
+    return null;
+  }
+  window.mplExtrairAcertosDaFaixa = extrairAcertosDaFaixa; // exposto para reuso (evita duplicar de forma divergente)
+
+  function valorPremioParaAcertos(concurso, acertos) {
+    if (!concurso || !concurso.premiacoes || !concurso.premiacoes.length) return null; // sem dado
+    for (var i = 0; i < concurso.premiacoes.length; i++) {
+      var p = concurso.premiacoes[i];
+      if (extrairAcertosDaFaixa(p.descricao) === acertos) return p.valorPremio || 0;
+    }
+    return 0; // tinha dado de premiação, mas essa quantidade de acertos não pagou nenhuma faixa
+  }
+
+  function religarBotaoConferirPremiacao() {
+    var btn = document.getElementById("btnConferir");
+    if (!btn || btn.__premiacaoLigado) return;
+
+    // aguarda os patches anteriores (Dupla Sena) já terem religado o botão
+    // pelo menos uma vez, para não competir com eles — este roda por ÚLTIMO.
+    var novoBtn = btn.cloneNode(true);
+    btn.parentNode.replaceChild(novoBtn, btn);
+    novoBtn.__premiacaoLigado = true;
+
+    novoBtn.addEventListener("click", function () {
+      setTimeout(calcularEExibirPremiacao, 80); // roda depois da conferência normal já ter desenhado a tabela
+    });
+  }
+
+  function obterEscopoAtual() {
+    var escopoEl = document.querySelector('input[name="confEscopo"]:checked');
+    var escopo = escopoEl ? escopoEl.value : "completa";
+    var base = MPL_STATE.base;
+    if (escopo === "intervalo") {
+      var de = Number(document.getElementById("confDe").value);
+      var ate = Number(document.getElementById("confAte").value);
+      return base.filter(function (c) { return c.numero >= de && c.numero <= ate; });
+    }
+    if (escopo === "especifico") {
+      var num = Number(document.getElementById("confEspecifico").value);
+      return base.filter(function (c) { return c.numero === num; });
+    }
+    return base;
+  }
+
+  function obterJogosAtual() {
+    var origemEl = document.querySelector('input[name="confOrigem"]:checked');
+    var origem = origemEl ? origemEl.value : "ranking";
+    if (origem === "arquivo") return window.__mplJogosArquivoConferidor || [];
+    var lista = (MPL_STATE.cache.rankingExibicao && MPL_STATE.cache.rankingExibicao.length)
+      ? MPL_STATE.cache.rankingExibicao : MPL_STATE.cache.ranking;
+    return (lista || []).map(function (r) { return r.jogo; });
+  }
+
+  function calcularEExibirPremiacao() {
+    var tabela = document.getElementById("confTabela");
+    if (!tabela) return;
+    var jogos = obterJogosAtual();
+    var concursos = obterEscopoAtual();
+    if (!jogos.length || !concursos.length) return;
+
+    var duplaSena = typeof isDuplaSena === "function" && MPL_STATE.modalidade && isDuplaSena(MPL_STATE.modalidade);
+    var comDado = 0, semDado = 0;
+    var retornoGeralTotal = 0;
+
+    var linhas = jogos.map(function (jogo, i) {
+      var retorno1 = 0, retorno2 = 0;
+      concursos.forEach(function (c) {
+        var acertos1 = jogo.filter(function (d) { return c.dezenas.includes(d); }).length;
+        var v1 = valorPremioParaAcertos(c, acertos1);
+        if (v1 !== null) { comDado++; retorno1 += v1; } else { semDado++; }
+
+        if (duplaSena && Array.isArray(c.dezenas2) && c.dezenas2.length) {
+          var acertos2 = jogo.filter(function (d) { return c.dezenas2.includes(d); }).length;
+          var v2 = valorPremioParaAcertos(c, acertos2);
+          if (v2 !== null) retorno2 += v2;
+        }
+      });
+      retornoGeralTotal += retorno1 + retorno2;
+      return { indice: i + 1, retorno1: retorno1, retorno2: retorno2 };
+    });
+
+    // acrescenta as colunas de retorno na tabela já existente, sem refazer
+    // o resto (mantém tudo que os Conferidores anteriores já desenharam)
+    var cabecalho = tabela.querySelector("thead tr");
+    if (cabecalho && !cabecalho.querySelector(".colRetorno")) {
+      var th1 = document.createElement("th");
+      th1.className = "colRetorno";
+      th1.textContent = duplaSena ? "Retorno Total (1º Sorteio)" : "Retorno Total (base/escopo)";
+      cabecalho.appendChild(th1);
+      if (duplaSena) {
+        var th2 = document.createElement("th");
+        th2.className = "colRetorno";
+        th2.textContent = "Retorno Total (2º Sorteio)";
+        cabecalho.appendChild(th2);
+      }
+    }
+
+    var linhasTabela = tabela.querySelectorAll("tbody tr");
+    linhasTabela.forEach(function (tr, i) {
+      if (tr.querySelector(".colRetorno")) return;
+      var td1 = document.createElement("td");
+      td1.className = "colRetorno";
+      td1.innerHTML = "<b>R$ " + linhas[i].retorno1.toLocaleString("pt-BR", { minimumFractionDigits: 2 }) + "</b>";
+      tr.appendChild(td1);
+      if (duplaSena) {
+        var td2 = document.createElement("td");
+        td2.className = "colRetorno";
+        td2.innerHTML = "<b>R$ " + linhas[i].retorno2.toLocaleString("pt-BR", { minimumFractionDigits: 2 }) + "</b>";
+        tr.appendChild(td2);
+      }
+    });
+
+    var resumo = document.getElementById("confResumo");
+    if (resumo) {
+      var bloco = document.createElement("div");
+      bloco.className = "stat-card";
+      bloco.style.borderTop = "3px solid #10b981";
+      bloco.innerHTML = '<div class="label">Retorno hipotético total (todos os jogos, todo o escopo)</div>' +
+        '<div class="value">R$ ' + retornoGeralTotal.toLocaleString("pt-BR", { minimumFractionDigits: 2 }) + '</div>';
+      resumo.appendChild(bloco);
+    }
+
+    var aviso = document.createElement("div");
+    aviso.className = "alert alert-warn";
+    aviso.style.marginTop = "8px";
+    aviso.textContent = semDado > 0
+      ? "Alguns concursos do escopo não têm dado de premiação (importados manualmente) e foram excluídos do cálculo de retorno."
+      : "Retorno calculado com dados reais de premiação de todos os concursos do escopo.";
+    document.getElementById("confTabela").parentNode.insertBefore(aviso, document.getElementById("confTabela").nextSibling);
+  }
+
+  var tentativas = 0;
+  var vigia = setInterval(function () {
+    tentativas++;
+    religarBotaoConferirPremiacao();
+    if (tentativas > 40) clearInterval(vigia);
+  }, 300);
+})();
+/* ============================================================
+   #pessoal
+   MPL — FASE 9.2 — CORREÇÃO: Conferidor voltou a não conferir
+   COLE NO FINAL DE js/mpl-conferidor-premiacao.js.
+   Causa: a Fase 9 clonou o botão "Conferir Apostas" e tentou
+   reanexar uma função que estava privada dentro de outro IIFE.
+   Aqui reimplementamos a conferência completa (acertos + retorno)
+   num único handler, sem depender de função privada de ninguém.
+   ============================================================ */
+(function () {
+  "use strict";
+
+  function fmt(v) { return "R$ " + Number(v || 0).toLocaleString("pt-BR", { minimumFractionDigits: 2 }); }
+  function card(l, v, c) {
+    return '<div class="stat-card"' + (c ? ' style="border-top:3px solid ' + c + ';"' : '') +
+      '><div class="label">' + l + '</div><div class="value">' + v + '</div></div>';
+  }
+  function ehDS() {
+    return typeof isDuplaSena === "function" && MPL_STATE.modalidade && isDuplaSena(MPL_STATE.modalidade);
+  }
+  function jogos() {
+    var o = document.querySelector('input[name="confOrigem"]:checked');
+    if (o && o.value === "arquivo") return window.__mplJogosArquivoConferidor || [];
+    var l = (MPL_STATE.cache.rankingExibicao && MPL_STATE.cache.rankingExibicao.length)
+      ? MPL_STATE.cache.rankingExibicao : MPL_STATE.cache.ranking;
+    return (l || []).map(function (r) { return r.jogo; });
+  }
+  function escopo() {
+    var e = document.querySelector('input[name="confEscopo"]:checked');
+    var v = e ? e.value : "completa";
+    var b = MPL_STATE.base;
+    if (v === "intervalo") {
+      var de = Number(document.getElementById("confDe").value);
+      var ate = Number(document.getElementById("confAte").value);
+      return b.filter(function (c) { return c.numero >= de && c.numero <= ate; });
+    }
+    if (v === "especifico") {
+      var n = Number(document.getElementById("confEspecifico").value);
+      return b.filter(function (c) { return c.numero === n; });
+    }
+    return b;
+  }
+
+  function conferirCompleto() {
+    if (!MPL_STATE.modalidade) return alert("Configure uma modalidade primeiro.");
+    var js = jogos();
+    if (!js.length) return alert("Não há jogos para conferir. Gere/ranqueie jogos ou carregue um arquivo.");
+    var cs = escopo();
+    if (!cs.length) return alert("Nenhum concurso no escopo selecionado.");
+
+    var pk = MPL_STATE.modalidade.presetKey;
+    var ds = ehDS();
+    var temMapa = typeof mplTabelaPremios === "function";
+
+    /* pré-computa tabelas de prêmio por concurso (conta CONCURSOS) */
+    var comDado = 0, semDado = 0;
+    var ctx = cs.map(function (c) {
+      var t1 = temMapa ? mplTabelaPremios(c, pk, 1) : null;
+      var t2 = (ds && temMapa) ? mplTabelaPremios(c, pk, 2) : null;
+      if (t1) comDado++; else semDado++;
+      return { c: c, t1: t1, t2: t2 };
+    });
+
+    var precoEl = document.getElementById("confPrecoAposta");
+    var preco = precoEl ? Number(precoEl.value) || 0 : 0;
+    var totalRetorno = 0;
+
+    var res = js.map(function (jogo, i) {
+      var m1 = { a: -1, n: null }, m2 = { a: -1, n: null }, r1 = 0, r2 = 0;
+      ctx.forEach(function (x) {
+        var a1 = jogo.filter(function (d) { return x.c.dezenas.indexOf(d) !== -1; }).length;
+        if (a1 > m1.a) m1 = { a: a1, n: x.c.numero };
+        if (x.t1 && x.t1[a1] !== undefined) r1 += x.t1[a1];
+        if (ds && Array.isArray(x.c.dezenas2) && x.c.dezenas2.length) {
+          var a2 = jogo.filter(function (d) { return x.c.dezenas2.indexOf(d) !== -1; }).length;
+          if (a2 > m2.a) m2 = { a: a2, n: x.c.numero };
+          if (x.t2 && x.t2[a2] !== undefined) r2 += x.t2[a2];
+        }
+      });
+      totalRetorno += r1 + r2;
+      return { i: i + 1, jogo: jogo, m1: m1, m2: m2, r1: r1, r2: r2 };
+    });
+
+    var custo = preco * js.length * cs.length;
+    var saldo = totalRetorno - custo;
+    var melhor = res.reduce(function (a, b) { return b.m1.a > a.m1.a ? b : a; }, res[0]);
+    var mediaAc = res.reduce(function (s, r) { return s + r.m1.a; }, 0) / res.length;
+
+    var resumo = card("Jogos conferidos", res.length) +
+      card("Concursos no escopo", cs.length) +
+      card("Melhor acerto" + (ds ? " (1º sorteio)" : ""), melhor.m1.a + " (jogo #" + melhor.i + ", conc. " + melhor.m1.n + ")") +
+      card("Média de acertos", mediaAc.toFixed(2)) +
+      card("Retorno total (premiação real)", fmt(totalRetorno), "#10b981") +
+      (preco ? card("Custo total das apostas", fmt(custo)) +
+               card("Saldo", fmt(saldo), saldo >= 0 ? "#10b981" : "#ef4444") : "") +
+      card("Concursos com dado de premiação", comDado + " de " + cs.length);
+
+    var cab = "<tr><th>#</th><th>Jogo</th><th>Melhor acerto" + (ds ? " (1º)" : "") + "</th><th>Concurso</th>" +
+      (ds ? "<th>Melhor acerto (2º)</th><th>Concurso</th>" : "") +
+      "<th>Retorno" + (ds ? " (1º)" : "") + "</th>" + (ds ? "<th>Retorno (2º)</th>" : "") + "</tr>";
+
+    var linhas = res.map(function (r) {
+      var l = "<tr><td>" + r.i + "</td><td>" +
+        r.jogo.map(function (d) { return String(d).padStart(2, "0"); }).join(" ") +
+        "</td><td><b>" + r.m1.a + "</b></td><td>" + (r.m1.n || "-") + "</td>";
+      if (ds) l += "<td><b>" + (r.m2.a >= 0 ? r.m2.a : "-") + "</b></td><td>" + (r.m2.n || "-") + "</td>";
+      l += "<td>" + fmt(r.r1) + "</td>";
+      if (ds) l += "<td>" + fmt(r.r2) + "</td>";
+      return l + "</tr>";
+    }).join("");
+
+    document.getElementById("confResultadoCard").style.display = "block";
+    document.getElementById("confResumo").innerHTML = resumo;
+    document.getElementById("confTabela").innerHTML =
+      "<table><thead>" + cab + "</thead><tbody>" + linhas + "</tbody></table>" +
+      (semDado > 0 ? '<div class="alert alert-warn">' + semDado +
+        ' concurso(s) sem dado de premiação foram excluídos do retorno (importação manual não traz premiação).</div>' : "") +
+      '<p class="muted">Cálculo retrospectivo e hipotético sobre a base histórica. Não é previsão.</p>';
+  }
+
+  /* campo de preço da aposta no Conferidor */
+  function injetarCampoPreco() {
+    if (document.getElementById("confPrecoAposta")) return;
+    var btn = document.getElementById("btnConferir");
+    if (!btn) return;
+    var wrap = document.createElement("div");
+    wrap.innerHTML = '<label>Valor da aposta simples (R$) — opcional, para calcular custo</label>' +
+      '<input type="number" id="confPrecoAposta" min="0" step="0.5" placeholder="ex.: 5.00" style="max-width:200px;">';
+    btn.parentNode.insertBefore(wrap, btn);
+  }
+
+  /* religa o botão UMA vez, com o handler completo */
+  function religar() {
+    var btn = document.getElementById("btnConferir");
+    if (!btn || btn.__fase92) return;
+    var novo = btn.cloneNode(true);
+    btn.parentNode.replaceChild(novo, btn);
+    novo.__fase92 = true;
+    novo.addEventListener("click", conferirCompleto);
+    injetarCampoPreco();
+    console.log("MPL 9.2: Conferidor religado (acertos + retorno num único handler).");
+  }
+
+  var t = 0;
+  var vigia = setInterval(function () {
+    t++; religar();
+    if (document.getElementById("btnConferir") && document.getElementById("btnConferir").__fase92) clearInterval(vigia);
+    if (t > 60) clearInterval(vigia);
+  }, 300);
+})();
+/* ============================================================
+   #pessoal
+   MPL — FASE 9.3 — Conferidor: TXT + CUSTO AUTOMÁTICO
+   COLE NO FINAL DE js/mpl-conferidor-premiacao.js (após o 9.2).
+   Corrige: arquivo TXT não era lido em alguns fluxos; custo agora
+   é calculado sozinho (C(A,S) × preço simples), sem digitar nada.
+   ============================================================ */
+(function () {
+  "use strict";
+
+  var arquivoJogos = [];
+
+  function fmt(v) { return "R$ " + Number(v || 0).toLocaleString("pt-BR", { minimumFractionDigits: 2 }); }
+  function card(l, v, c) {
+    return '<div class="stat-card"' + (c ? ' style="border-top:3px solid ' + c + ';"' : '') +
+      '><div class="label">' + l + '</div><div class="value">' + v + '</div></div>';
+  }
+  function ehDS() { return typeof isDuplaSena === "function" && MPL_STATE.modalidade && isDuplaSena(MPL_STATE.modalidade); }
+
+  /* leitura robusta: ignora cabeçalhos/rodapés do TXT exportado pelo MPL */
+  function lerTexto(texto) {
+    return texto.split(/\r?\n/).map(function (l) {
+      var limpa = l.replace(/^.*?:/, "").replace(/\[.*?\]/g, ""); // tira "Jogo 001:" e "[STJ ...]"
+      return limpa.split(/[\s,;]+/).map(Number).filter(function (n) { return !isNaN(n); });
+    }).filter(function (j) { return j.length >= 3; });
+  }
+
+  function ligarInput() {
+    var input = document.getElementById("confArquivo");
+    if (!input || input.__f93) return;
+    input.__f93 = true;
+    input.addEventListener("change", function (e) {
+      var f = e.target.files[0];
+      if (!f) return;
+      var reader = new FileReader();
+      reader.onload = function () {
+        arquivoJogos = lerTexto(String(reader.result));
+        window.__mplJogosArquivoConferidor = arquivoJogos;
+        var info = document.getElementById("confArquivoInfo");
+        if (info) info.innerHTML = '<span style="color:#10b981;">✓ ' + arquivoJogos.length +
+          ' jogo(s) lido(s) de ' + f.name + '.</span>';
+        console.log("MPL 9.3: arquivo lido —", arquivoJogos.length, "jogos.", arquivoJogos.slice(0, 3));
+      };
+      reader.readAsText(f);
+    });
+  }
+
+  function obterJogos() {
+    var o = document.querySelector('input[name="confOrigem"]:checked');
+    if (o && o.value === "arquivo") {
+      var lista = arquivoJogos.length ? arquivoJogos : (window.__mplJogosArquivoConferidor || []);
+      return lista;
+    }
+    var l = (MPL_STATE.cache.rankingExibicao && MPL_STATE.cache.rankingExibicao.length)
+      ? MPL_STATE.cache.rankingExibicao : MPL_STATE.cache.ranking;
+    return (l || []).map(function (r) { return r.jogo; });
+  }
+  function obterEscopo() {
+    var e = document.querySelector('input[name="confEscopo"]:checked');
+    var v = e ? e.value : "completa";
+    var b = MPL_STATE.base;
+    if (v === "intervalo") {
+      var de = Number(document.getElementById("confDe").value);
+      var ate = Number(document.getElementById("confAte").value);
+      return b.filter(function (c) { return c.numero >= de && c.numero <= ate; });
+    }
+    if (v === "especifico") {
+      var n = Number(document.getElementById("confEspecifico").value);
+      return b.filter(function (c) { return c.numero === n; });
+    }
+    return b;
+  }
+
+  function conferir() {
+    if (!MPL_STATE.modalidade) return alert("Configure uma modalidade primeiro.");
+    var js = obterJogos();
+    if (!js.length) return alert("Nenhum jogo carregado. Selecione a origem 'arquivo' e carregue o TXT, ou ranqueie jogos.");
+    var cs = obterEscopo();
+    if (!cs.length) return alert("Nenhum concurso no escopo.");
+
+    var m = MPL_STATE.modalidade, pk = m.presetKey, ds = ehDS();
+    var temMapa = typeof mplTabelaPremios === "function";
+    var temPreco = typeof mplCustoDoJogo === "function";
+
+    var comDado = 0, semDado = 0;
+    var ctx = cs.map(function (c) {
+      var t1 = temMapa ? mplTabelaPremios(c, pk, 1) : null;
+      var t2 = (ds && temMapa) ? mplTabelaPremios(c, pk, 2) : null;
+      if (t1) comDado++; else semDado++;
+      return { c: c, t1: t1, t2: t2 };
+    });
+
+    var custoTotal = 0, retornoTotal = 0;
+    var res = js.map(function (jogo, i) {
+      var custoJogo = temPreco ? mplCustoDoJogo(jogo.length, m) : 0;
+      custoTotal += custoJogo * cs.length;
+      var m1 = { a: -1, n: null }, m2 = { a: -1, n: null }, r1 = 0, r2 = 0;
+      ctx.forEach(function (x) {
+        var a1 = jogo.filter(function (d) { return x.c.dezenas.indexOf(d) !== -1; }).length;
+        if (a1 > m1.a) m1 = { a: a1, n: x.c.numero };
+        if (x.t1 && x.t1[a1] !== undefined) r1 += x.t1[a1];
+        if (ds && Array.isArray(x.c.dezenas2) && x.c.dezenas2.length) {
+          var a2 = jogo.filter(function (d) { return x.c.dezenas2.indexOf(d) !== -1; }).length;
+          if (a2 > m2.a) m2 = { a: a2, n: x.c.numero };
+          if (x.t2 && x.t2[a2] !== undefined) r2 += x.t2[a2];
+        }
+      });
+      retornoTotal += r1 + r2;
+      return { i: i + 1, jogo: jogo, m1: m1, m2: m2, r1: r1, r2: r2, custo: custoJogo };
+    });
+
+    var saldo = retornoTotal - custoTotal;
+    var melhor = res.reduce(function (a, b) { return b.m1.a > a.m1.a ? b : a; }, res[0]);
+    var precoBase = temPreco ? mplPrecoSimples(pk) : 0;
+    var custoUnit = res.length ? res[0].custo : 0;
+
+    document.getElementById("confResultadoCard").style.display = "block";
+    document.getElementById("confResumo").innerHTML =
+      card("Jogos conferidos", res.length) +
+      card("Concursos no escopo", cs.length) +
+      card("Melhor acerto" + (ds ? " (1º)" : ""), melhor.m1.a + " (jogo #" + melhor.i + ", conc. " + melhor.m1.n + ")") +
+      card("Custo por jogo (" + (js[0] ? js[0].length : 0) + " dz)", fmt(custoUnit)) +
+      card("Custo total no escopo", fmt(custoTotal)) +
+      card("Retorno total (premiação real)", fmt(retornoTotal), "#10b981") +
+      card("Saldo", fmt(saldo), saldo >= 0 ? "#10b981" : "#ef4444") +
+      card("Concursos com premiação", comDado + " de " + cs.length);
+
+    var cab = "<tr><th>#</th><th>Jogo</th><th>Custo</th><th>Melhor acerto" + (ds ? " (1º)" : "") +
+      "</th><th>Concurso</th>" + (ds ? "<th>Acerto (2º)</th>" : "") +
+      "<th>Retorno</th></tr>";
+    var linhas = res.map(function (r) {
+      var l = "<tr><td>" + r.i + "</td><td>" + r.jogo.map(function (d) { return String(d).padStart(2, "0"); }).join(" ") +
+        "</td><td>" + fmt(r.custo) + "</td><td><b>" + r.m1.a + "</b></td><td>" + (r.m1.n || "-") + "</td>";
+      if (ds) l += "<td><b>" + (r.m2.a >= 0 ? r.m2.a : "-") + "</b></td>";
+      l += "<td>" + fmt(r.r1 + r.r2) + "</td></tr>";
+      return l;
+    }).join("");
+
+    document.getElementById("confTabela").innerHTML =
+      "<table><thead>" + cab + "</thead><tbody>" + linhas + "</tbody></table>" +
+      '<div class="info-box">Custo calculado automaticamente: <b>C(A,S) × preço da aposta simples</b> ' +
+      '(preço base atual: ' + fmt(precoBase) + '). Ajuste o preço abaixo se a Caixa reajustou.</div>' +
+      (semDado > 0 ? '<div class="alert alert-warn">' + semDado +
+        ' concurso(s) sem dado de premiação foram excluídos do retorno (mas contam no custo — saldo conservador).</div>' : "");
+  }
+
+  /* campo de ajuste do preço base (não é obrigatório preencher) */
+  function injetarAjustePreco() {
+    if (document.getElementById("confPrecoBase")) return;
+    var card9 = document.getElementById("confResultadoCard");
+    if (!card9 || !MPL_STATE.modalidade) return;
+    var pk = MPL_STATE.modalidade.presetKey;
+    var atual = (typeof mplPrecoSimples === "function") ? mplPrecoSimples(pk) : 0;
+    var div = document.createElement("div");
+    div.style.marginTop = "10px";
+    div.innerHTML = '<label>Preço da aposta simples desta modalidade (R$) — só altere se a Caixa reajustou</label>' +
+      '<input type="number" id="confPrecoBase" step="0.5" min="0" value="' + atual + '" style="max-width:180px;">' +
+      '<button id="btnSalvarPrecoBase" class="btn-secondary">Salvar preço</button>';
+    card9.appendChild(div);
+    document.getElementById("btnSalvarPrecoBase").addEventListener("click", function () {
+      var v = Number(document.getElementById("confPrecoBase").value) || 0;
+      if (typeof mplSalvarPreco === "function") mplSalvarPreco(pk, v);
+      alert("Preço salvo: R$ " + v.toFixed(2) + ". Confira novamente para recalcular.");
+    });
+  }
+
+  function religar() {
+    var btn = document.getElementById("btnConferir");
+    if (!btn || btn.__f93) return;
+    var novo = btn.cloneNode(true);
+    btn.parentNode.replaceChild(novo, btn);
+    novo.__f93 = true;
+    novo.addEventListener("click", function () { conferir(); setTimeout(injetarAjustePreco, 80); });
+    /* remove o campo de preço manual que eu havia criado no 9.2 */
+    var manual = document.getElementById("confPrecoAposta");
+    if (manual && manual.parentNode) manual.parentNode.remove();
+    ligarInput();
+    console.log("MPL 9.3: Conferidor com custo automático ativo.");
+  }
+
+  var t = 0;
+  var vigia = setInterval(function () {
+    t++; religar(); ligarInput();
+    if (t > 60) clearInterval(vigia);
+  }, 300);
+})();
+/* ============================================================
+   #pessoal
+   MPL — FASE 9.4 — Conferidor com retorno combinatório correto
+   COLE NO FINAL DE js/mpl-conferidor-premiacao.js.
+   Também corrige o vigia que religava o botão repetidamente
+   (o log "9.3 ativo" aparecia 29 vezes no console).
+   ============================================================ */
+(function () {
+  "use strict";
+
+  function fmt(v) { return "R$ " + Number(v || 0).toLocaleString("pt-BR", { minimumFractionDigits: 2 }); }
+  function card(l, v, c) {
+    return '<div class="stat-card"' + (c ? ' style="border-top:3px solid ' + c + ';"' : '') +
+      '><div class="label">' + l + '</div><div class="value">' + v + '</div></div>';
+  }
+  function ehDS() { return typeof isDuplaSena === "function" && MPL_STATE.modalidade && isDuplaSena(MPL_STATE.modalidade); }
+  function ehSS() { return typeof isSuperSete === "function" && MPL_STATE.modalidade && isSuperSete(MPL_STATE.modalidade); }
+
+  function jogosAtuais() {
+    var o = document.querySelector('input[name="confOrigem"]:checked');
+    if (o && o.value === "arquivo") return window.__mplJogosArquivoConferidor || [];
+    var l = (MPL_STATE.cache.rankingExibicao && MPL_STATE.cache.rankingExibicao.length)
+      ? MPL_STATE.cache.rankingExibicao : MPL_STATE.cache.ranking;
+    return (l || []).map(function (r) { return r.jogo; });
+  }
+  function escopoAtual() {
+    var e = document.querySelector('input[name="confEscopo"]:checked');
+    var v = e ? e.value : "completa";
+    var b = MPL_STATE.base;
+    if (v === "intervalo") {
+      var de = Number(document.getElementById("confDe").value);
+      var ate = Number(document.getElementById("confAte").value);
+      return b.filter(function (c) { return c.numero >= de && c.numero <= ate; });
+    }
+    if (v === "especifico") {
+      var n = Number(document.getElementById("confEspecifico").value);
+      return b.filter(function (c) { return c.numero === n; });
+    }
+    return b;
+  }
+
+  function conferir94() {
+    if (!MPL_STATE.modalidade) return alert("Configure uma modalidade primeiro.");
+    var js = jogosAtuais();
+    if (!js.length) return alert("Nenhum jogo carregado. Escolha a origem 'arquivo' e carregue o TXT, ou ranqueie jogos.");
+    var cs = escopoAtual();
+    if (!cs.length) return alert("Nenhum concurso no escopo.");
+
+    var m = MPL_STATE.modalidade, pk = m.presetKey, S = m.dezenasSorteadas;
+    var ds = ehDS(), ss = ehSS();
+    var temMapa = typeof mplTabelaPremios === "function";
+    var temDec = typeof mplDecomporPremio === "function";
+
+    var comDado = 0, semDado = 0;
+    var ctx = cs.map(function (c) {
+      var t1 = temMapa ? mplTabelaPremios(c, pk, 1) : null;
+      var t2 = (ds && temMapa) ? mplTabelaPremios(c, pk, 2) : null;
+      if (t1) comDado++; else semDado++;
+      return { c: c, t1: t1, t2: t2 };
+    });
+
+    var custoTotal = 0, retornoTotal = 0;
+    var res = js.map(function (jogo, i) {
+      var A = jogo.length;
+      var custoJogo = (typeof mplCustoDoJogo === "function") ? mplCustoDoJogo(A, m) : 0;
+      custoTotal += custoJogo * cs.length;
+
+      var m1 = { a: -1, n: null }, m2 = { a: -1, n: null }, r1 = 0, r2 = 0;
+      var melhorDet = null;
+
+      ctx.forEach(function (x) {
+        var H1 = jogo.filter(function (d) { return x.c.dezenas.indexOf(d) !== -1; }).length;
+        if (H1 > m1.a) m1 = { a: H1, n: x.c.numero };
+        if (x.t1) {
+          if (ss) { if (x.t1[H1] !== undefined) r1 += x.t1[H1]; }
+          else if (temDec) {
+            var dec = mplDecomporPremio(A, H1, S, x.t1);
+            r1 += dec.total;
+            if (dec.total > 0 && (!melhorDet || dec.total > melhorDet.total)) {
+              melhorDet = { total: dec.total, det: dec.detalhe, conc: x.c.numero, H: H1 };
+            }
+          }
+        }
+        if (ds && Array.isArray(x.c.dezenas2) && x.c.dezenas2.length) {
+          var H2 = jogo.filter(function (d) { return x.c.dezenas2.indexOf(d) !== -1; }).length;
+          if (H2 > m2.a) m2 = { a: H2, n: x.c.numero };
+          if (x.t2 && temDec) r2 += mplDecomporPremio(A, H2, S, x.t2).total;
+        }
+      });
+
+      retornoTotal += r1 + r2;
+      return { i: i + 1, jogo: jogo, A: A, m1: m1, m2: m2, r1: r1, r2: r2, custo: custoJogo, det: melhorDet };
+    });
+
+    var saldo = retornoTotal - custoTotal;
+    var melhor = res.reduce(function (a, b) { return b.m1.a > a.m1.a ? b : a; }, res[0]);
+    var A0 = js[0] ? js[0].length : 0;
+    var equiv = (!ss && typeof combinacao === "function") ? combinacao(A0, S) : 1;
+
+    document.getElementById("confResultadoCard").style.display = "block";
+    document.getElementById("confResumo").innerHTML =
+      card("Jogos conferidos", res.length) +
+      card("Concursos no escopo", cs.length) +
+      card("Dezenas por jogo", A0 + (equiv > 1 ? " (= " + equiv.toLocaleString("pt-BR") + " apostas simples)" : "")) +
+      card("Melhor acerto" + (ds ? " (1º)" : ""), melhor.m1.a + " (jogo #" + melhor.i + ", conc. " + melhor.m1.n + ")") +
+      card("Custo por jogo", fmt(res[0] ? res[0].custo : 0)) +
+      card("Custo total no escopo", fmt(custoTotal)) +
+      card("Retorno total (premiação real)", fmt(retornoTotal), "#10b981") +
+      card("Saldo", fmt(saldo), saldo >= 0 ? "#10b981" : "#ef4444") +
+      card("Concursos com premiação", comDado + " de " + cs.length);
+
+    var cab = "<tr><th>#</th><th>Jogo</th><th>Custo</th><th>Melhor acerto" + (ds ? " (1º)" : "") +
+      "</th><th>Concurso</th>" + (ds ? "<th>Acerto (2º)</th>" : "") + "<th>Retorno</th></tr>";
+    var linhas = res.map(function (r) {
+      var l = "<tr><td>" + r.i + "</td><td>" +
+        r.jogo.map(function (d) { return String(d).padStart(2, "0"); }).join(" ") +
+        "</td><td>" + fmt(r.custo) + "</td><td><b>" + r.m1.a + "</b></td><td>" + (r.m1.n || "-") + "</td>";
+      if (ds) l += "<td><b>" + (r.m2.a >= 0 ? r.m2.a : "-") + "</b></td>";
+      l += "<td><b>" + fmt(r.r1 + r.r2) + "</b></td></tr>";
+      return l;
+    }).join("");
+
+    /* memória de cálculo do melhor jogo — transparência total */
+    var memoria = "";
+    var comDet = res.filter(function (r) { return r.det; });
+    if (comDet.length) {
+      var top = comDet.reduce(function (a, b) { return b.det.total > a.det.total ? b : a; }, comDet[0]);
+      memoria = '<div class="info-box"><b>Memória de cálculo — jogo #' + top.i +
+        ' no concurso ' + top.det.conc + ' (' + top.det.H + ' acertos em ' + top.A + ' dezenas):</b><br>' +
+        top.det.det.map(function (d) {
+          return "• <b>" + d.qtd + "</b> aposta(s) com " + d.acertos + " acertos × " +
+            fmt(d.valorUnit) + " = <b>" + fmt(d.subtotal) + "</b>";
+        }).join("<br>") +
+        '<br>Total: <b>' + fmt(top.det.total) + '</b>' +
+        '<br><span class="muted">Fórmula: apostas com k acertos = C(H,k) × C(A−H, S−k)</span></div>';
+    }
+
+    document.getElementById("confTabela").innerHTML =
+      "<table><thead>" + cab + "</thead><tbody>" + linhas + "</tbody></table>" + memoria +
+      (semDado > 0 ? '<div class="alert alert-warn">' + semDado +
+        ' concurso(s) sem dado de premiação foram excluídos do retorno (mas contam no custo — saldo conservador).</div>' : "");
+  }
+
+  /* religa UMA única vez e encerra o vigia (corrige log repetido) */
+  var t = 0;
+  var vigia = setInterval(function () {
+    t++;
+    var btn = document.getElementById("btnConferir");
+    if (btn && !btn.__f94) {
+      var novo = btn.cloneNode(true);
+      btn.parentNode.replaceChild(novo, btn);
+      novo.__f94 = true;
+      novo.addEventListener("click", conferir94);
+      console.log("MPL 9.4: Conferidor com retorno combinatório ativo.");
+      clearInterval(vigia);
+    }
+    if (t > 60) clearInterval(vigia);
+  }, 300);
+})();
+/* ============================================================
+   #pessoal
+   MPL — FASE 9.5 — Conferidor definitivo (imune a clones)
+   COLE NO FINAL DE js/mpl-conferidor-premiacao.js.
+
+   Causa do 9.4 não funcionar: os vigias dos patches 9.2/9.3 ficam
+   clonando o botão por ~18s; o clone perde as marcas (__f93/__f94)
+   e o handler novo é descartado. Aqui NÃO disputamos o botão:
+   interceptamos o clique no document em fase de CAPTURA e cortamos
+   a propagação — nenhum handler antigo chega a rodar.
+   ============================================================ */
+(function () {
+  "use strict";
+  if (window.__mplConf95) return;
+  window.__mplConf95 = true;
+
+  function fmt(v) { return "R$ " + Number(v || 0).toLocaleString("pt-BR", { minimumFractionDigits: 2 }); }
+  function card(l, v, c) {
+    return '<div class="stat-card"' + (c ? ' style="border-top:3px solid ' + c + ';"' : '') +
+      '><div class="label">' + l + '</div><div class="value">' + v + '</div></div>';
+  }
+  function ehDS() { return typeof isDuplaSena === "function" && MPL_STATE.modalidade && isDuplaSena(MPL_STATE.modalidade); }
+  function ehSS() { return typeof isSuperSete === "function" && MPL_STATE.modalidade && isSuperSete(MPL_STATE.modalidade); }
+
+  /* decomposição local (não depende de outro patch ter carregado) */
+  function decompor(A, H, S, tabela) {
+    var out = { total: 0, detalhe: [] };
+    if (!tabela || !A || !S) return out;
+    for (var k = S; k >= 0; k--) {
+      var val = tabela[k];
+      if (val === undefined || val <= 0) continue;
+      var qtd = combinacao(H, k) * combinacao(A - H, S - k);
+      if (qtd > 0) {
+        out.total += qtd * val;
+        out.detalhe.push({ acertos: k, qtd: qtd, valorUnit: val, subtotal: qtd * val });
+      }
+    }
+    return out;
+  }
+
+  function jogos() {
+    var o = document.querySelector('input[name="confOrigem"]:checked');
+    if (o && o.value === "arquivo") return window.__mplJogosArquivoConferidor || [];
+    var l = (MPL_STATE.cache.rankingExibicao && MPL_STATE.cache.rankingExibicao.length)
+      ? MPL_STATE.cache.rankingExibicao : MPL_STATE.cache.ranking;
+    return (l || []).map(function (r) { return r.jogo; });
+  }
+  function escopo() {
+    var e = document.querySelector('input[name="confEscopo"]:checked');
+    var v = e ? e.value : "completa";
+    var b = MPL_STATE.base;
+    if (v === "intervalo") {
+      var de = Number(document.getElementById("confDe").value);
+      var ate = Number(document.getElementById("confAte").value);
+      return b.filter(function (c) { return c.numero >= de && c.numero <= ate; });
+    }
+    if (v === "especifico") {
+      var n = Number(document.getElementById("confEspecifico").value);
+      return b.filter(function (c) { return c.numero === n; });
+    }
+    return b;
+  }
+
+  function conferir() {
+    console.log("MPL 9.5: ▶ conferência iniciada (handler definitivo).");
+    if (!MPL_STATE.modalidade) return alert("Configure uma modalidade primeiro.");
+    var js = jogos();
+    if (!js.length) return alert("Nenhum jogo carregado. Escolha a origem 'arquivo' e carregue o TXT, ou ranqueie jogos.");
+    var cs = escopo();
+    if (!cs.length) return alert("Nenhum concurso no escopo.");
+
+    var m = MPL_STATE.modalidade, pk = m.presetKey, S = m.dezenasSorteadas;
+    var ds = ehDS(), ss = ehSS();
+    var temMapa = typeof mplTabelaPremios === "function";
+    if (!temMapa) console.warn("MPL 9.5: mplTabelaPremios ausente — sem tabela de prêmios, retorno ficará zerado.");
+
+    var comDado = 0, semDado = 0;
+    var ctx = cs.map(function (c) {
+      var t1 = temMapa ? mplTabelaPremios(c, pk, 1) : null;
+      var t2 = (ds && temMapa) ? mplTabelaPremios(c, pk, 2) : null;
+      if (t1) comDado++; else semDado++;
+      return { c: c, t1: t1, t2: t2 };
+    });
+    console.log("MPL 9.5: concursos com tabela de prêmio:", comDado, "| sem:", semDado);
+
+    var custoTotal = 0, retornoTotal = 0, melhorDet = null, jaLogou = false;
+
+    var res = js.map(function (jogo, i) {
+      var A = jogo.length;
+      var custoJogo = (typeof mplCustoDoJogo === "function") ? mplCustoDoJogo(A, m) : 0;
+      custoTotal += custoJogo * cs.length;
+
+      var m1 = { a: -1, n: null }, m2 = { a: -1, n: null }, r1 = 0, r2 = 0;
+
+      ctx.forEach(function (x) {
+        var H1 = jogo.filter(function (d) { return x.c.dezenas.indexOf(d) !== -1; }).length;
+        if (H1 > m1.a) m1 = { a: H1, n: x.c.numero };
+        if (x.t1) {
+          if (ss) { if (x.t1[H1] !== undefined) r1 += x.t1[H1]; }
+          else {
+            var dec = decompor(A, H1, S, x.t1);
+            r1 += dec.total;
+            if (dec.total > 0) {
+              if (!jaLogou) {
+                console.log("MPL 9.5: exemplo de decomposição → A=" + A + " S=" + S + " H=" + H1 +
+                  " | tabela:", x.t1, "| detalhe:", dec.detalhe, "| total:", dec.total);
+                jaLogou = true;
+              }
+              if (!melhorDet || dec.total > melhorDet.total) {
+                melhorDet = { total: dec.total, det: dec.detalhe, conc: x.c.numero, H: H1, A: A, jogo: i + 1 };
+              }
+            }
+          }
+        }
+        if (ds && Array.isArray(x.c.dezenas2) && x.c.dezenas2.length) {
+          var H2 = jogo.filter(function (d) { return x.c.dezenas2.indexOf(d) !== -1; }).length;
+          if (H2 > m2.a) m2 = { a: H2, n: x.c.numero };
+          if (x.t2) r2 += decompor(A, H2, S, x.t2).total;
+        }
+      });
+
+      retornoTotal += r1 + r2;
+      return { i: i + 1, jogo: jogo, A: A, m1: m1, m2: m2, r1: r1, r2: r2, custo: custoJogo };
+    });
+
+    var saldo = retornoTotal - custoTotal;
+    var melhor = res.reduce(function (a, b) { return b.m1.a > a.m1.a ? b : a; }, res[0]);
+    var A0 = js[0] ? js[0].length : 0;
+    var equiv = (!ss && typeof combinacao === "function") ? combinacao(A0, S) : 1;
+
+    document.getElementById("confResultadoCard").style.display = "block";
+    document.getElementById("confResumo").innerHTML =
+      card("Jogos conferidos", res.length) +
+      card("Concursos no escopo", cs.length) +
+      card("Dezenas por jogo", A0 + (equiv > 1 ? " (= " + equiv.toLocaleString("pt-BR") + " apostas simples)" : "")) +
+      card("Melhor acerto" + (ds ? " (1º)" : ""), melhor.m1.a + " (jogo #" + melhor.i + ", conc. " + melhor.m1.n + ")") +
+      card("Custo por jogo", fmt(res[0] ? res[0].custo : 0)) +
+      card("Custo total no escopo", fmt(custoTotal)) +
+      card("Retorno total", fmt(retornoTotal), "#10b981") +
+      card("Saldo", fmt(saldo), saldo >= 0 ? "#10b981" : "#ef4444") +
+      card("Concursos com premiação", comDado + " de " + cs.length);
+
+    var cab = "<tr><th>#</th><th>Jogo</th><th>Custo</th><th>Melhor acerto" + (ds ? " (1º)" : "") +
+      "</th><th>Concurso</th>" + (ds ? "<th>Acerto (2º)</th>" : "") + "<th>Retorno</th></tr>";
+    var linhas = res.map(function (r) {
+      var l = "<tr><td>" + r.i + "</td><td>" +
+        r.jogo.map(function (d) { return String(d).padStart(2, "0"); }).join(" ") +
+        "</td><td>" + fmt(r.custo) + "</td><td><b>" + r.m1.a + "</b></td><td>" + (r.m1.n || "-") + "</td>";
+      if (ds) l += "<td><b>" + (r.m2.a >= 0 ? r.m2.a : "-") + "</b></td>";
+      l += "<td><b>" + fmt(r.r1 + r.r2) + "</b></td></tr>";
+      return l;
+    }).join("");
+
+    var memoria = "";
+    if (melhorDet) {
+      memoria = '<div class="info-box"><b>Memória de cálculo — jogo #' + melhorDet.jogo +
+        ' no concurso ' + melhorDet.conc + ' (' + melhorDet.H + ' acertos em ' + melhorDet.A + ' dezenas):</b><br>' +
+        melhorDet.det.map(function (d) {
+          return "• <b>" + d.qtd + "</b> aposta(s) com " + d.acertos + " acertos × " +
+            fmt(d.valorUnit) + " = <b>" + fmt(d.subtotal) + "</b>";
+        }).join("<br>") +
+        '<br>Total: <b>' + fmt(melhorDet.total) + '</b>' +
+        '<br><span class="muted">Fórmula: apostas com k acertos = C(H,k) × C(A−H, S−k)</span></div>';
+    }
+
+    document.getElementById("confTabela").innerHTML =
+      "<table><thead>" + cab + "</thead><tbody>" + linhas + "</tbody></table>" + memoria +
+      (semDado > 0 ? '<div class="alert alert-warn">' + semDado +
+        ' concurso(s) sem dado de premiação foram excluídos do retorno (mas contam no custo — saldo conservador).</div>' : "");
+
+    console.log("MPL 9.5: ■ concluído. Retorno total:", retornoTotal, "| Custo:", custoTotal);
+  }
+
+  /* INTERCEPTAÇÃO EM FASE DE CAPTURA — imune a clones e a ordem */
+  document.addEventListener("click", function (e) {
+    var alvo = e.target && e.target.closest ? e.target.closest("#btnConferir") : null;
+    if (!alvo) return;
+    e.stopImmediatePropagation();
+    e.preventDefault();
+    conferir();
+  }, true);
+
+  console.log("MPL 9.5: Conferidor definitivo ativo (captura no document — handlers antigos neutralizados).");
+})();
+/* ============================================================
+   #pessoal
+   MPL — FASE 9.7 — UI: trevos (+Milionária) e dígitos/coluna (S7)
+   COLE NO FINAL DE js/mpl-conferidor-premiacao.js.
+   Injeta os campos que faltavam no Conferidor e repassa ao cálculo.
+   ============================================================ */
+(function () {
+  "use strict";
+
+  function pk() { return MPL_STATE.modalidade ? MPL_STATE.modalidade.presetKey : null; }
+  function ehMM() { return pk() === "maisMilionaria"; }
+  function ehSS() { return typeof isSuperSete === "function" && MPL_STATE.modalidade && isSuperSete(MPL_STATE.modalidade); }
+
+  function injetarCampos() {
+    var btn = document.getElementById("btnConferir");
+    if (!btn || document.getElementById("confExtraWrap")) return;
+    if (!ehMM() && !ehSS()) return;
+
+    var div = document.createElement("div");
+    div.id = "confExtraWrap";
+    div.style.marginBottom = "8px";
+
+    if (ehMM()) {
+      div.innerHTML =
+        '<label>Trevos marcados (2 a 6) — afeta o custo da aposta</label>' +
+        '<input type="number" id="confTrevos" min="2" max="6" value="2" style="max-width:120px;">' +
+        '<div class="muted" style="font-size:11.5px;">Custo da +Milionária = C(dezenas,6) × C(trevos,2) × preço simples.</div>';
+    } else {
+      div.innerHTML =
+        '<label>Dígitos marcados por coluna (1 a 3) — afeta o custo</label>' +
+        '<input type="number" id="confDigCol" min="1" max="3" value="1" style="max-width:120px;">' +
+        '<div class="muted" style="font-size:11.5px;">Super Sete: custo = produto dos dígitos das 7 colunas × preço simples. ' +
+        'Jogos gerados pelo MPL têm 1 dígito por coluna (aposta simples).</div>';
+    }
+    btn.parentNode.insertBefore(div, btn);
+  }
+
+  /* Repassa as opções extras para o cálculo de custo */
+  var __base = window.mplCustoDoJogo;
+  window.mplCustoDoJogo = function (qtdDezenas, modalidade, opcoes) {
+    opcoes = opcoes || {};
+    if (opcoes.trevos == null) {
+      var t = document.getElementById("confTrevos");
+      if (t) opcoes.trevos = Number(t.value) || 2;
+    }
+    if (opcoes.digitosPorColuna == null) {
+      var d = document.getElementById("confDigCol");
+      if (d) opcoes.digitosPorColuna = Number(d.value) || 1;
+    }
+    return __base(qtdDezenas, modalidade, opcoes);
+  };
+
+  var t = 0;
+  var vigia = setInterval(function () {
+    t++; injetarCampos();
+    if (document.getElementById("confExtraWrap") || t > 60) clearInterval(vigia);
+  }, 300);
+
+  /* re-injeta ao trocar de modalidade */
+  document.addEventListener("click", function (e) {
+    if (e.target && (e.target.id === "mpBtnAplicar2" || e.target.id === "btnAplicarPreset")) {
+      setTimeout(function () {
+        var w = document.getElementById("confExtraWrap");
+        if (w) w.remove();
+        injetarCampos();
+      }, 400);
+    }
+  });
+
+  console.log("MPL 9.7: campos de trevos/dígitos-por-coluna ativos no Conferidor.");
+})();

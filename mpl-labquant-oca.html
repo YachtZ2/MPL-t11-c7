@@ -1,0 +1,690 @@
+/* ============================================================
+   #pessoal
+   MPL — mpl-labquant-oca.js — Aba LAB QUANT ★★★ + OCA
+   ARQUIVO NOVO. No index.html, carregue POR ÚLTIMO.
+
+   OCA — Otimizador de Configuração (add-on do Lab Quant)
+   Objetivo: achar o MENOR RR(K) que bate a meta de cobertura
+   (ex.: ≥5 de 6) na confiança pedida (ex.: 40% dos concursos),
+   medido em concursos que a configuração NÃO viu (treino/teste).
+
+   Motor: o ranking STF (parte pesada) é calculado UMA vez por
+   (concurso, perfil). K e janela são apenas cortes desse ranking
+   → centenas de configurações ao custo de poucos rankings.
+   Processa em fatias (setTimeout) — não trava; pausar/cancelar.
+
+   Isolamento: nunca escreve em MPL_STATE.cache nem altera a
+   configuração ativa. Só lê a base.
+   ============================================================ */
+(function () {
+  "use strict";
+
+  var LQ = { sub: "oca", f: null, pk: null, rodando: false, pausado: false,
+             cancelar: false, res: null, msRanking: null, aberta: false };
+  window.MPL_LABQUANT = LQ;
+
+  /* ---------------- padrões por modalidade ---------------- */
+  var DEF = {
+    megaSena:      { k: [30, 46, 2], meta: 5, jan: [20, 60, 10] },
+    megaDaVirada:  { k: [30, 46, 2], meta: 5, jan: [20, 60, 10] },
+    duplaSena:     { k: [25, 41, 2], meta: 5, jan: [20, 60, 10] },
+    maisMilionaria:{ k: [25, 41, 2], meta: 5, jan: [20, 60, 10] },
+    quina:         { k: [30, 60, 5], meta: 4, jan: [20, 60, 10] },
+    quinaSaoJoao:  { k: [30, 60, 5], meta: 4, jan: [20, 60, 10] },
+    diaDeSorte:    { k: [15, 25, 1], meta: 6, jan: [10, 50, 10] },
+    lotofacil:     { k: [16, 22, 1], meta: 13, jan: [10, 50, 10] },
+    lotofacilIndependencia: { k: [16, 22, 1], meta: 13, jan: [10, 50, 10] },
+    timemania:     { k: [35, 60, 5], meta: 7, jan: [20, 60, 10] },
+    lotomania:     { k: [50, 80, 5], meta: 15, jan: [20, 60, 10] },
+    superSete:     { k: [3, 7, 1], meta: 5, jan: null }
+  };
+
+  var PERFIS = [
+    { id: "equilibrado", nome: "Equilibrado oficial", p: { SIC: .28, SF: .17, SA: .13, SC: .10, SRT: .22, SEI: .05, SU: .05 } },
+    { id: "atual", nome: "Atual do cockpit", p: null },
+    { id: "sicsrt", nome: "SIC + SRT", p: { SIC: .333, SRT: .333, SF: .067, SA: .067, SC: .067, SEI: .067, SU: .066 } },
+    { id: "freq", nome: "Frequência", p: { SF: .45, SIC: .20, SRT: .15, SA: .08, SC: .07, SEI: .05, SU: 0 } },
+    { id: "ausciclo", nome: "Ausência / Ciclo", p: { SA: .30, SC: .25, SIC: .20, SF: .10, SRT: .10, SEI: .05, SU: 0 } }
+  ];
+  var MODS = ["SIC", "SF", "SA", "SC", "SRT", "SEI", "SU"];
+
+  /* ---------------- utilidades ---------------- */
+  function M() { return MPL_STATE.modalidade; }
+  function ehSS() { var m = M(); return !!(m && typeof isSuperSete === "function" && isSuperSete(m)); }
+  function ehDS() { var m = M(); return !!(m && typeof isDuplaSena === "function" && isDuplaSena(m)); }
+  function cor() { return (M() && typeof obterCorModalidade === "function") ? obterCorModalidade(M()).principal : "#22d3ee"; }
+  function C(n, k) { if (k < 0 || k > n) return 0; k = Math.min(k, n - k); var r = 1; for (var i = 1; i <= k; i++) r = r * (n - k + i) / i; return r; }
+  function acaso(K, meta) {
+    var m = M();
+    if (ehSS()) { var p = K / 10, t = 0; for (var x = meta; x <= 7; x++) t += C(7, x) * Math.pow(p, x) * Math.pow(1 - p, 7 - x); return t; }
+    var U = m.universo, S = m.dezenasSorteadas, tot = C(U, S), s = 0;
+    for (var y = meta; y <= S; y++) s += C(K, y) * C(U - K, S - y);
+    return s / tot;
+  }
+  function kMinimoAcaso(meta, conf) {
+    var lim = ehSS() ? 10 : M().universo, ini = ehSS() ? 1 : M().dezenasSorteadas;
+    for (var k = ini; k <= lim; k++) if (acaso(k, meta) >= conf) return k;
+    return null;
+  }
+  function pct(x) { return (x * 100).toFixed(1) + "%"; }
+  function lista(a, b, p) { var r = []; p = Math.max(1, p); for (var v = a; v <= b; v += p) r.push(v); return r; }
+  function presetsDaModalidade() {
+    try {
+      return JSON.parse(localStorage.getItem("mplPresets") || "[]")
+        .filter(function (p) { return p.modalidade === M().presetKey && p.config && p.config.pesosPerfil; });
+    } catch (e) { return []; }
+  }
+  function baseOrdenada() {
+    var m = M(), f = LQ.f;
+    var b;
+    if (ehDS()) {
+      b = MPL_STATE.base.filter(function (c) { return f.sorteio === "2" ? (c.dezenas2 && c.dezenas2.length) : true; })
+        .map(function (c) {
+          return { numero: c.numero, data: c.data,
+                   dezenas: (f.sorteio === "2" ? c.dezenas2 : c.dezenas).map(Number),
+                   _d1: c.dezenas.map(Number), _d2: c.dezenas2 ? c.dezenas2.map(Number) : null };
+        });
+    } else {
+      b = ((typeof baseEfetiva === "function") ? baseEfetiva() : MPL_STATE.base).slice();
+    }
+    return b.sort(function (x, y) { return x.numero - y.numero; });
+  }
+
+  /* ---------------- estado do formulário ---------------- */
+  function iniciarForm() {
+    var m = M(); if (!m) return;
+    var d = DEF[m.presetKey] || { k: [Math.max(m.dezenasSorteadas, Math.round(m.universo * .5)), Math.round(m.universo * .8), Math.max(1, Math.round(m.universo * .05))], meta: Math.max(1, m.dezenasSorteadas - 1), jan: [20, 60, 10] };
+    var b = MPL_STATE.base.slice().sort(function (x, y) { return x.numero - y.numero; });
+    var ini = b.length ? b[Math.max(0, b.length - 400)].numero : 0;
+    var fim = b.length ? b[b.length - 1].numero : 0;
+    var perf = {}; PERFIS.forEach(function (p) { perf[p.id] = (p.id === "equilibrado" || p.id === "atual" || p.id === "sicsrt"); });
+    LQ.f = {
+      meta: d.meta, conf: 40, de: ini, ate: fim, sorteio: "1",
+      kDe: d.k[0], kAte: d.k[1], kPasso: d.k[2],
+      jDe: d.jan ? d.jan[0] : 0, jAte: d.jan ? d.jan[1] : 0, jPasso: d.jan ? d.jan[2] : 1,
+      perfis: perf, presets: {}, restrH: true, restrR: false, su: true,
+      treino: 70, passo: 1
+    };
+    LQ.pk = m.presetKey; LQ.res = null; LQ.msRanking = null;
+  }
+
+  function kList() {
+    var f = LQ.f, m = M();
+    var min = ehSS() ? 1 : Math.max(m.dezenasSorteadas, m.apostaMinima || m.dezenasSorteadas);
+    var max = ehSS() ? 10 : m.universo;
+    return lista(Math.max(min, f.kDe), Math.min(max, f.kAte), f.kPasso);
+  }
+  function janList() { return ehSS() ? [0] : lista(Math.max(5, LQ.f.jDe), LQ.f.jAte, LQ.f.jPasso); }
+  function perfisSelecionados() {
+    var f = LQ.f, out = [];
+    PERFIS.forEach(function (p) {
+      if (!f.perfis[p.id]) return;
+      if (p.id === "atual") out.push({ nome: p.nome, p: JSON.parse(JSON.stringify(MPL_STATE.config.pesosPerfil)), mod: JSON.parse(JSON.stringify(MPL_STATE.config.modulosAtivos)) });
+      else out.push({ nome: p.nome, p: p.p, mod: null });
+    });
+    presetsDaModalidade().forEach(function (pr) {
+      if (f.presets[pr.id]) out.push({ nome: "Preset: " + pr.nome, p: pr.config.pesosPerfil, mod: pr.config.modulosAtivos || null });
+    });
+    return out;
+  }
+  function alvosIdx(base) {
+    var f = LQ.f, minHist = Math.max(30, ehSS() ? 30 : Math.max.apply(null, janList()));
+    var out = [];
+    for (var i = minHist; i < base.length; i++) {
+      var n = base[i].numero;
+      if (n >= f.de && n <= f.ate) out.push(i);
+    }
+    var p = Math.max(1, LQ.f.passo);
+    return out.filter(function (_, i) { return i % p === 0; });
+  }
+  function tamanhoPlano() {
+    var nP = perfisSelecionados().length, nK = kList().length, nJ = janList().length;
+    var nT = alvosIdx(baseOrdenada()).length;
+    var restr = ehSS() ? 1 : ((LQ.f.restrH ? 1 : 0) + (LQ.f.restrR ? 1 : 0));
+    var configs = nP * nK * nJ * restr;
+    var rankings = ehSS() ? nP * nT : nP * nT * ((LQ.f.restrH ? 1 : 0) + (LQ.f.restrR ? nJ : 0));
+    return { configs: configs, rankings: rankings, nT: nT, nP: nP };
+  }
+
+  /* ---------------- calibração de tempo ---------------- */
+  function calibrar() {
+    if (LQ.msRanking || !M()) return;
+    var b = baseOrdenada(); if (b.length < 40) return;
+    try {
+      var cfg = Object.assign({}, MPL_STATE.config);
+      var salvo = MPL_STATE.cache ? MPL_STATE.cache.scoresSuperSete : null;
+      var t0 = performance.now();
+      if (ehSS()) gerarRankingSuperSete(b.slice(0, b.length - 1), M(), cfg);
+      else gerarRankingDezenas(b.slice(0, b.length - 1), M(), cfg);
+      LQ.msRanking = Math.max(5, performance.now() - t0);
+      if (MPL_STATE.cache) MPL_STATE.cache.scoresSuperSete = salvo;
+      atualizarResumo();
+    } catch (e) { LQ.msRanking = 80; }
+  }
+
+  /* ---------------- ABA ---------------- */
+  var escondidos = [];
+  function criarAba() {
+    if (document.getElementById("tab-labquant")) return true;
+    var btns = document.querySelectorAll(".tab-btn"); if (!btns.length) return false;
+    var ult = btns[btns.length - 1];
+    var b = document.createElement("button");
+    b.className = ult.className.replace(/\bactive\b/, "").trim();
+    b.dataset.tab = "labquant"; b.id = "btnTabLabQuant";
+    b.innerHTML = '🧪 Lab Quant <span style="color:#eab308;font-size:10px;">★★★</span>';
+    ult.parentNode.insertBefore(b, ult.nextSibling);
+
+    var ref = document.getElementById("tab-base");
+    var sec = document.createElement("section");
+    sec.id = "tab-labquant";
+    sec.className = ref ? ref.className.replace(/\bactive\b/, "").trim() : "tab-content";
+    sec.style.display = "none";
+    sec.innerHTML = '<div id="lqRoot"></div>';
+    (ref ? ref.parentNode : document.body).appendChild(sec);
+
+    b.addEventListener("click", abrirAba);
+    document.addEventListener("click", function (e) {
+      var t = e.target && e.target.closest ? e.target.closest(".tab-btn") : null;
+      if (t && t.id !== "btnTabLabQuant" && LQ.aberta) fecharAba();
+    }, true);
+    return true;
+  }
+  function abrirAba() {
+    var sec = document.getElementById("tab-labquant"), btn = document.getElementById("btnTabLabQuant");
+    document.querySelectorAll(".tab-btn").forEach(function (x) { x.classList.remove("active"); });
+    btn.classList.add("active");
+    escondidos = [];
+    Array.prototype.forEach.call(sec.parentNode.children, function (el) {
+      if (el === sec || !/^tab-/.test(el.id || "")) return;
+      escondidos.push([el, el.style.display]);
+      el.classList.remove("active"); el.style.display = "none";
+    });
+    sec.classList.add("active"); sec.style.display = "block";
+    LQ.aberta = true;
+    if (!LQ.f || LQ.pk !== (M() && M().presetKey)) iniciarForm();
+    render();
+    setTimeout(calibrar, 300);
+  }
+  function fecharAba() {
+    var sec = document.getElementById("tab-labquant"), btn = document.getElementById("btnTabLabQuant");
+    sec.style.display = "none"; sec.classList.remove("active"); btn.classList.remove("active");
+    escondidos.forEach(function (x) { x[0].style.display = x[1]; }); escondidos = [];
+    LQ.aberta = false;
+  }
+
+  /* ---------------- RENDER ---------------- */
+  function render() {
+    var root = document.getElementById("lqRoot"); if (!root) return;
+    if (!M()) { root.innerHTML = '<div class="card"><p class="muted">Escolha uma modalidade primeiro.</p></div>'; return; }
+    if (!MPL_STATE.base || MPL_STATE.base.length < 60) { root.innerHTML = '<div class="card"><p class="muted">Base insuficiente (mínimo ~60 concursos).</p></div>'; return; }
+    var c = cor();
+    var subs = [["oca", "🧭 OCA — Otimizador", false], ["fech", "🔗 Fechamentos", true], ["ens", "🎛 Ensemble", true], ["sand", "🧬 Sandbox", true]];
+    var nav = subs.map(function (s) {
+      return '<button class="' + (s[0] === LQ.sub ? "btn-primary" : "btn-secondary") + '" ' + (s[2] ? "disabled" : "") +
+        ' style="margin:0 6px 6px 0;font-size:12px;' + (s[2] ? "opacity:.5;cursor:not-allowed;" : "") + '">' + s[1] + (s[2] ? " · em breve" : "") + '</button>';
+    }).join("");
+    root.innerHTML =
+      '<div class="card"><h2 style="margin:0 0 6px;">🧪 Lab Quant <span style="color:#eab308;font-size:13px;">★★★ add-on</span></h2>' +
+      '<p class="muted" style="margin:0 0 10px;">Laboratório de pesquisa do MPL. Ferramentas que trabalham sobre o radar — não sobre jogos.</p>' + nav + '</div>' +
+      '<div id="lqOca"></div>';
+    renderOCA();
+  }
+
+  function renderOCA() {
+    var el = document.getElementById("lqOca"); if (!el) return;
+    var f = LQ.f, m = M(), c = cor(), ss = ehSS(), ds = ehDS();
+    var S = ss ? 7 : m.dezenasSorteadas;
+    var pres = presetsDaModalidade();
+
+    var A =
+      '<div class="card"><h3 style="margin-top:0;">A · Pedido</h3>' +
+      '<div style="display:inline-block;padding:5px 12px;border-radius:20px;border:1px solid ' + c + ';color:' + c + ';font-weight:700;margin-bottom:10px;">' +
+      m.nome + ' · U=' + (ss ? "7×10" : m.universo) + ' · S=' + S + '</div>' +
+      '<div class="row-flex">' +
+      '<div><label>Meta de acertos (≥ x de ' + S + ')</label><input type="number" id="lq_meta" min="1" max="' + S + '" value="' + f.meta + '"></div>' +
+      '<div><label>Confiança (% dos concursos)</label><input type="number" id="lq_conf" min="1" max="100" value="' + f.conf + '"></div>' +
+      '<div><label>Período: de</label><input type="number" id="lq_de" value="' + f.de + '"></div>' +
+      '<div><label>até</label><input type="number" id="lq_ate" value="' + f.ate + '"></div>' +
+      (ds ? '<div><label>Sorteio</label><select id="lq_sorteio">' +
+        '<option value="1"' + (f.sorteio === "1" ? " selected" : "") + '>1º sorteio</option>' +
+        '<option value="2"' + (f.sorteio === "2" ? " selected" : "") + '>2º sorteio</option>' +
+        '<option value="melhor"' + (f.sorteio === "melhor" ? " selected" : "") + '>Melhor dos dois</option></select></div>' : '') +
+      '</div><div id="lq_regua"></div></div>';
+
+    var perfHtml = PERFIS.map(function (p) {
+      return '<label style="display:inline-flex;align-items:center;gap:5px;margin:0 14px 6px 0;font-size:12.5px;">' +
+        '<input type="checkbox" data-lqperf="' + p.id + '" ' + (f.perfis[p.id] ? "checked" : "") + ' style="width:auto;margin:0;">' + p.nome + '</label>';
+    }).join("") + (pres.length ? '<div class="muted" style="font-size:11px;margin:6px 0 4px;">Presets salvos desta modalidade:</div>' +
+      pres.map(function (p) {
+        return '<label style="display:inline-flex;align-items:center;gap:5px;margin:0 14px 6px 0;font-size:12px;">' +
+          '<input type="checkbox" data-lqpre="' + p.id + '" ' + (f.presets[p.id] ? "checked" : "") + ' style="width:auto;margin:0;">' + p.nome + '</label>';
+      }).join("") : '');
+
+    var B =
+      '<div class="card"><h3 style="margin-top:0;">B · Espaço de busca</h3>' +
+      '<div class="row-flex">' +
+      '<div><label>' + (ss ? "Dígitos por coluna: de" : "K (tamanho do RR): de") + '</label><input type="number" id="lq_kDe" value="' + f.kDe + '"></div>' +
+      '<div><label>até</label><input type="number" id="lq_kAte" value="' + f.kAte + '"></div>' +
+      '<div><label>passo</label><input type="number" id="lq_kPasso" min="1" value="' + f.kPasso + '"></div></div>' +
+      (ss ? '<div class="info-box" style="font-size:11.5px;">Super Sete: o radar é por coluna; a janela não se aplica.</div>' :
+        '<div class="row-flex">' +
+        '<div><label>Janela (concursos): de</label><input type="number" id="lq_jDe" value="' + f.jDe + '"></div>' +
+        '<div><label>até</label><input type="number" id="lq_jAte" value="' + f.jAte + '"></div>' +
+        '<div><label>passo</label><input type="number" id="lq_jPasso" min="1" value="' + f.jPasso + '"></div></div>') +
+      '<label style="margin-top:6px;">Perfis de pesos</label><div>' + perfHtml + '</div>' +
+      (ss ? '' : '<label style="margin-top:6px;">Scores</label><div>' +
+        '<label style="display:inline-flex;gap:5px;margin-right:14px;font-size:12.5px;"><input type="checkbox" id="lq_restrH" ' + (f.restrH ? "checked" : "") + ' style="width:auto;margin:0;">Histórico completo</label>' +
+        '<label style="display:inline-flex;gap:5px;font-size:12.5px;"><input type="checkbox" id="lq_restrR" ' + (f.restrR ? "checked" : "") + ' style="width:auto;margin:0;">Restritos ao mapa</label></div>') +
+      '<label style="display:inline-flex;gap:5px;margin-top:8px;font-size:12.5px;"><input type="checkbox" id="lq_su" ' + (f.su ? "checked" : "") + ' style="width:auto;margin:0;">Respeitar dezenas fixas e proibidas (SU)</label>' +
+      '<div id="lq_total" style="margin-top:10px;"></div></div>';
+
+    var Cc =
+      '<div class="card"><h3 style="margin-top:0;">C · Execução</h3>' +
+      '<details style="margin-bottom:8px;"><summary class="muted" style="cursor:pointer;font-size:12px;">Avançado</summary>' +
+      '<div class="row-flex" style="margin-top:6px;">' +
+      '<div><label>Treino (%)</label><input type="number" id="lq_treino" min="50" max="90" value="' + f.treino + '"></div>' +
+      '<div><label>Passo entre alvos</label><input type="number" id="lq_passo" min="1" max="20" value="' + f.passo + '"></div></div>' +
+      '<p class="muted" style="font-size:11px;">O OCA escolhe a configuração na parte de treino e confere, sem ajustes, na parte de teste. O resultado exibido é sempre o do teste. Passo maior = mais rápido, menos alvos.</p></details>' +
+      '<div style="display:flex;gap:8px;flex-wrap:wrap;">' +
+      '<button id="lq_exec" class="btn-primary" ' + (LQ.rodando ? "disabled" : "") + '>▶ Executar</button>' +
+      '<button id="lq_pausa" class="btn-secondary" ' + (LQ.rodando ? "" : "disabled") + '>' + (LQ.pausado ? "▶ Retomar" : "⏸ Pausar") + '</button>' +
+      '<button id="lq_cancel" class="btn-danger" ' + (LQ.rodando ? "" : "disabled") + '>✕ Cancelar</button></div>' +
+      '<div style="background:#1c2434;border-radius:6px;height:10px;overflow:hidden;margin-top:10px;"><div id="lq_bar" style="height:100%;width:0%;background:' + c + ';transition:width .2s;"></div></div>' +
+      '<div id="lq_prog" class="muted" style="font-size:11.5px;margin-top:5px;">Pronto para executar.</div></div>';
+
+    el.innerHTML = A + B + Cc + '<div id="lq_resultado"></div>';
+    ligarForm(); atualizarResumo();
+    if (LQ.res) renderResultado();
+  }
+
+  function ligarForm() {
+    var num = ["meta", "conf", "de", "ate", "kDe", "kAte", "kPasso", "jDe", "jAte", "jPasso", "treino", "passo"];
+    num.forEach(function (k) {
+      var i = document.getElementById("lq_" + k); if (!i) return;
+      i.addEventListener("input", function () { LQ.f[k] = Number(i.value) || 0; atualizarResumo(); });
+    });
+    var s = document.getElementById("lq_sorteio");
+    if (s) s.addEventListener("change", function () { LQ.f.sorteio = s.value; LQ.msRanking = null; atualizarResumo(); });
+    ["restrH", "restrR", "su"].forEach(function (k) {
+      var i = document.getElementById("lq_" + k); if (!i) return;
+      i.addEventListener("change", function () { LQ.f[k] = i.checked; atualizarResumo(); });
+    });
+    document.querySelectorAll("[data-lqperf]").forEach(function (i) {
+      i.addEventListener("change", function () { LQ.f.perfis[i.dataset.lqperf] = i.checked; atualizarResumo(); });
+    });
+    document.querySelectorAll("[data-lqpre]").forEach(function (i) {
+      i.addEventListener("change", function () { LQ.f.presets[i.dataset.lqpre] = i.checked; atualizarResumo(); });
+    });
+    document.getElementById("lq_exec").addEventListener("click", executar);
+    document.getElementById("lq_pausa").addEventListener("click", function () { LQ.pausado = !LQ.pausado; this.textContent = LQ.pausado ? "▶ Retomar" : "⏸ Pausar"; });
+    document.getElementById("lq_cancel").addEventListener("click", function () { LQ.cancelar = true; });
+  }
+
+  function atualizarResumo() {
+    var f = LQ.f, S = ehSS() ? 7 : M().dezenasSorteadas;
+    var reg = document.getElementById("lq_regua");
+    if (reg) {
+      var ks = kList();
+      var conf = f.conf / 100, kA = kMinimoAcaso(f.meta, conf);
+      var amostra = ks.length ? [ks[0], ks[Math.floor(ks.length / 2)], ks[ks.length - 1]] : [];
+      reg.innerHTML = '<div class="info-box" style="font-size:12px;margin-top:8px;">🎲 <b>Régua do acaso</b> — chance de ≥' + f.meta + ' de ' + S +
+        ' com dezenas aleatórias: ' + amostra.map(function (k) { return (ehSS() ? "d=" : "K=") + k + ': <b>' + pct(acaso(k, f.meta)) + '</b>'; }).join(" · ") +
+        '<br>Para bater ' + f.conf + '% por puro acaso seria preciso ' + (kA ? (ehSS() ? "d=" : "K=") + '<b>' + kA + '</b>' : '<b>mais que o universo todo</b>') +
+        '. O OCA busca o menor ' + (ehSS() ? "d" : "K") + ' que faça isso <b>com menos dezenas</b>.</div>';
+    }
+    var tot = document.getElementById("lq_total");
+    if (tot) {
+      var t = tamanhoPlano();
+      var est = LQ.msRanking ? Math.ceil(t.rankings * LQ.msRanking / 1000) : null;
+      var tempo = est == null ? "calculando…" : (est < 60 ? est + " s" : Math.round(est / 60) + " min");
+      var aviso = !t.nP ? '<div class="alert alert-warn">Selecione ao menos um perfil.</div>' :
+        (t.nT < 20 ? '<div class="alert alert-warn">Poucos alvos no período (' + t.nT + '). Amplie o período ou reduza o passo.</div>' : '');
+      tot.innerHTML = '<div class="grid-cards">' +
+        card("Configurações avaliadas", t.configs.toLocaleString("pt-BR")) +
+        card("Concursos-alvo", t.nT) +
+        card("Rankings a calcular", t.rankings.toLocaleString("pt-BR")) +
+        card("Tempo estimado", tempo) + '</div>' + aviso;
+    }
+  }
+  function card(l, v, cc) {
+    return '<div class="stat-card"' + (cc ? ' style="border-top:3px solid ' + cc + ';"' : '') + '><div class="label">' + l + '</div><div class="value">' + v + '</div></div>';
+  }
+
+  /* ---------------- MOTOR ---------------- */
+  var P = null;
+  function cfgDoPerfil(pf) {
+    var mod = pf.mod || {}; if (!pf.mod) MODS.forEach(function (k) { mod[k] = (pf.p[k] || 0) > 0; });
+    var su = JSON.parse(JSON.stringify(MPL_STATE.config.su || {}));
+    if (!LQ.f.su) { su.fixas = []; su.proibidas = []; }
+    return Object.assign({}, MPL_STATE.config, { pesosPerfil: Object.assign({}, pf.p), modulosAtivos: mod, su: su });
+  }
+
+  function executar() {
+    if (LQ.rodando) return;
+    var f = LQ.f, t = tamanhoPlano();
+    if (!t.nP) return alert("Selecione ao menos um perfil.");
+    if (!ehSS() && !f.restrH && !f.restrR) return alert("Marque ao menos uma opção de Scores.");
+    if (t.nT < 20) return alert("Poucos concursos-alvo no período (" + t.nT + "). Amplie o período.");
+    if (f.meta < 1 || f.meta > (ehSS() ? 7 : M().dezenasSorteadas)) return alert("Meta inválida.");
+    if (t.rankings > 30000 && !confirm("Execução grande: " + t.rankings.toLocaleString("pt-BR") + " rankings. Continuar?")) return;
+
+    var base = baseOrdenada(), targets = alvosIdx(base);
+    var perfis = perfisSelecionados();
+    var fixSet = {}, proSet = {};
+    if (f.su) { (MPL_STATE.config.su.fixas || []).forEach(function (d) { fixSet[d] = 1; }); (MPL_STATE.config.su.proibidas || []).forEach(function (d) { proSet[d] = 1; }); }
+    P = {
+      m: M(), ss: ehSS(), ds: ehDS(), base: base, targets: targets, perfis: perfis,
+      cfgs: perfis.map(cfgDoPerfil), kList: kList(), janList: janList(),
+      restr: ehSS() ? ["H"] : [].concat(f.restrH ? ["H"] : []).concat(f.restrR ? ["R"] : []),
+      fixSet: fixSet, proSet: proSet, meta: f.meta, conf: f.conf / 100, treino: f.treino, sorteio: f.sorteio,
+      hits: {}, short: {}
+    };
+    /* unidades: por alvo, depois por perfil (permite cache do RB por alvo) */
+    var units = [];
+    targets.forEach(function (_, ti) {
+      perfis.forEach(function (_, pi) {
+        if (P.ss || P.restr.indexOf("H") >= 0) units.push({ t: ti, pi: pi, r: "H" });
+        if (!P.ss && P.restr.indexOf("R") >= 0) P.janList.forEach(function (_, ji) { units.push({ t: ti, pi: pi, r: "R", ji: ji }); });
+      });
+    });
+    /* aloca arrays */
+    perfis.forEach(function (_, pi) {
+      P.restr.forEach(function (r) {
+        P.janList.forEach(function (_, ji) {
+          var key = pi + "|" + r + "|" + ji;
+          P.hits[key] = P.kList.map(function () { var a = new Int8Array(targets.length); a.fill(-1); return a; });
+          P.short[key] = P.kList.map(function () { return new Uint8Array(targets.length); });
+        });
+      });
+    });
+
+    LQ.rodando = true; LQ.pausado = false; LQ.cancelar = false; LQ.res = null;
+    renderOCA();
+    var i = 0, t0 = performance.now(), rbT = -1, rbCache = {};
+    var salvoSS = MPL_STATE.cache ? MPL_STATE.cache.scoresSuperSete : null;
+
+    function processar(u) {
+      var idx = P.targets[u.t], hist = P.base.slice(0, idx), alvo = P.base[idx];
+      if (rbT !== u.t) { rbT = u.t; rbCache = {}; }
+      var draws = !P.ds ? [alvo.dezenas.map(Number)]
+        : (P.sorteio === "2" ? [alvo._d2] : (P.sorteio === "melhor" ? [alvo._d1, alvo._d2].filter(Boolean) : [alvo._d1]));
+
+      if (P.ss) {
+        var pk = gerarRankingSuperSete(hist, P.m, P.cfgs[u.pi]);
+        var pos7 = pk.colunas.map(function (col, cI) {
+          var dg = Number(alvo.dezenas[cI]);
+          var k = col.ranking.findIndex(function (r) { return r.digito === dg; });
+          return k < 0 ? 99 : k;
+        });
+        var key = u.pi + "|H|0";
+        P.kList.forEach(function (d, ki) {
+          P.hits[key][ki][u.t] = pos7.filter(function (p) { return p < d; }).length;
+        });
+        return;
+      }
+
+      var jis = u.r === "R" ? [u.ji] : P.janList.map(function (_, j) { return j; });
+      var ord = null;
+      if (u.r === "H") {
+        ord = gerarRankingDezenas(hist, P.m, P.cfgs[u.pi]).ranking.slice()
+          .sort(function (a, b) { return b.STF - a.STF; }).map(function (r) { return r.dezena; });
+      }
+      jis.forEach(function (ji) {
+        var jan = P.janList[ji], key = u.pi + "|" + u.r + "|" + ji;
+        if (hist.length < jan) return;
+        var o = ord;
+        if (u.r === "R") {
+          var hs = hist.slice(hist.length - jan);
+          if (hs.length < 20) return;
+          o = gerarRankingDezenas(hs, P.m, P.cfgs[u.pi]).ranking.slice()
+            .sort(function (a, b) { return b.STF - a.STF; }).map(function (r) { return r.dezena; });
+        }
+        var rb = rbCache[jan] || (rbCache[jan] = (function () { var s = {}; gerarRadarBruto(hist, jan).forEach(function (d) { s[d] = 1; }); return s; })());
+        var ra = o.filter(function (d) { return rb[d] && !P.proSet[d]; });
+        if (Object.keys(P.fixSet).length) {
+          ra = ra.filter(function (d) { return P.fixSet[d]; }).concat(ra.filter(function (d) { return !P.fixSet[d]; }));
+        }
+        var pos = {}; ra.forEach(function (d, k) { pos[d] = k; });
+        P.kList.forEach(function (K, ki) {
+          var best = 0;
+          draws.forEach(function (dz) {
+            if (!dz) return;
+            var h = 0; dz.forEach(function (d) { if (pos[d] !== undefined && pos[d] < K) h++; });
+            if (h > best) best = h;
+          });
+          P.hits[key][ki][u.t] = best;
+          if (ra.length < K) P.short[key][ki][u.t] = 1;
+        });
+      });
+    }
+
+    function passo() {
+      if (LQ.cancelar) return fim(true);
+      if (LQ.pausado) return setTimeout(passo, 250);
+      var ini = performance.now();
+      try {
+        while (i < units.length && performance.now() - ini < 45) { processar(units[i]); i++; }
+      } catch (e) {
+        console.error("OCA:", e); if (MPL_STATE.cache) MPL_STATE.cache.scoresSuperSete = salvoSS;
+        LQ.rodando = false; alert("Falha no cálculo (ver console): " + e.message); renderOCA(); return;
+      }
+      var el = (performance.now() - t0) / 1000, rest = i ? el / i * (units.length - i) : 0;
+      var bar = document.getElementById("lq_bar"), pg = document.getElementById("lq_prog");
+      if (bar) bar.style.width = (i / units.length * 100).toFixed(1) + "%";
+      if (pg) pg.textContent = "Processando " + i.toLocaleString("pt-BR") + " de " + units.length.toLocaleString("pt-BR") +
+        " · " + Math.round(el) + " s decorridos · ~" + (rest < 60 ? Math.round(rest) + " s" : Math.round(rest / 60) + " min") + " restantes";
+      if (i < units.length) setTimeout(passo, 0); else fim(false);
+    }
+    function fim(cancelado) {
+      if (MPL_STATE.cache) MPL_STATE.cache.scoresSuperSete = salvoSS;
+      LQ.rodando = false;
+      if (cancelado) { renderOCA(); var pg = document.getElementById("lq_prog"); if (pg) pg.textContent = "Execução cancelada."; return; }
+      LQ.msRanking = (performance.now() - t0) / Math.max(1, units.length);
+      consolidar(); renderOCA();
+      console.log("MPL OCA: concluído em " + Math.round((performance.now() - t0) / 1000) + " s.");
+    }
+    setTimeout(passo, 30);
+  }
+
+  /* ---------------- CONSOLIDAÇÃO ---------------- */
+  function est(arr, sh, a, b, meta) {
+    var n = 0, s = 0, ok = 0, curto = 0;
+    for (var i = a; i < b; i++) { var v = arr[i]; if (v < 0) continue; n++; s += v; if (v >= meta) ok++; if (sh[i]) curto++; }
+    return { n: n, media: n ? s / n : 0, taxa: n ? ok / n : 0, curto: n ? curto / n : 0 };
+  }
+  function consolidar() {
+    var nT = P.targets.length, corte = Math.floor(nT * P.treino / 100);
+    var S = P.ss ? 7 : P.m.dezenasSorteadas, U = P.ss ? 10 : P.m.universo;
+    var linhas = [];
+    Object.keys(P.hits).forEach(function (key) {
+      var pt = key.split("|"), pi = +pt[0], r = pt[1], ji = +pt[2];
+      P.kList.forEach(function (K, ki) {
+        var tr = est(P.hits[key][ki], P.short[key][ki], 0, corte, P.meta);
+        var te = est(P.hits[key][ki], P.short[key][ki], corte, nT, P.meta);
+        if (!tr.n || !te.n) return;
+        linhas.push({
+          pi: pi, perfil: P.perfis[pi].nome, r: r, jan: P.ss ? null : P.janList[ji], K: K,
+          tr: tr, te: te, valida: tr.curto <= 0.10,
+          acaso: acaso(K, P.meta), lift: te.media - S * K / U, estab: tr.taxa - te.taxa
+        });
+      });
+    });
+    /* finalista por K: melhor no TREINO */
+    var fin = {};
+    linhas.forEach(function (l) {
+      if (!l.valida) return;
+      var a = fin[l.K];
+      if (!a || l.tr.taxa > a.tr.taxa || (l.tr.taxa === a.tr.taxa && l.tr.media > a.tr.media)) fin[l.K] = l;
+    });
+    var finais = P.kList.map(function (k) { return fin[k]; }).filter(Boolean);
+    var venc = finais.filter(function (l) { return l.te.taxa >= P.conf; })[0] || null;
+    var melhorTeste = finais.slice().sort(function (a, b) { return b.te.taxa - a.te.taxa; })[0] || null;
+    LQ.res = {
+      linhas: linhas, finais: finais, venc: venc, melhorTeste: melhorTeste,
+      kAcaso: kMinimoAcaso(P.meta, P.conf), meta: P.meta, conf: P.conf, S: S,
+      ss: P.ss, nTreino: corte, nTeste: nT - corte, periodo: [P.base[P.targets[0]].numero, P.base[P.targets[nT - 1]].numero],
+      corteNumero: P.base[P.targets[Math.min(corte, nT - 1)]].numero, perfis: P.perfis, sorteio: P.sorteio
+    };
+  }
+
+  /* ---------------- RESULTADO ---------------- */
+  function renderResultado() {
+    var el = document.getElementById("lq_resultado"); if (!el) return;
+    var R = LQ.res, c = cor(), unid = R.ss ? "d" : "K";
+    var cab = '<div class="card"><h3 style="margin-top:0;">D · Resultado</h3>' +
+      '<div class="muted" style="font-size:11.5px;margin-bottom:8px;">Período ' + R.periodo[0] + '→' + R.periodo[1] +
+      ' · treino ' + R.nTreino + ' alvos (até ~' + R.corteNumero + ') · <b>teste ' + R.nTeste + ' alvos</b> · meta ≥' + R.meta + ' de ' + R.S +
+      ' em ' + Math.round(R.conf * 100) + '% dos concursos</div>' +
+      '<canvas id="lq_canvas" width="760" height="330" style="width:100%;max-width:760px;background:#070c16;border:1px solid #1c2434;border-radius:10px;"></canvas>';
+
+    var resumo;
+    if (R.venc) {
+      var v = R.venc, poup = R.kAcaso ? R.kAcaso - v.K : null;
+      var est = v.estab <= 0.05 ? '<span style="color:#10b981;">✓ estável</span>' : (v.estab <= 0.12 ? '<span style="color:#eab308;">moderada</span>' : '<span style="color:#ef4444;">instável</span>');
+      resumo = '<div class="stat-card" style="border-top:3px solid ' + c + ';margin-top:12px;padding:12px;">' +
+        '<div style="font-size:15px;font-weight:700;color:' + c + ';">🎯 Menor radar viável: ' + unid + ' = ' + v.K + '</div>' +
+        '<div style="font-size:12.5px;line-height:1.75;margin-top:6px;">' +
+        'Configuração: ' + (v.jan ? 'janela <b>' + v.jan + '</b> · ' : '') + 'perfil <b>' + v.perfil + '</b>' + (v.r === "R" ? ' · scores restritos ao mapa' : '') + '<br>' +
+        'No TESTE: <b>' + pct(v.te.taxa) + '</b> dos concursos com ≥' + R.meta + ' (acaso com o mesmo ' + unid + ': ' + pct(v.acaso) + ')<br>' +
+        (R.kAcaso ? 'O acaso precisaria de ' + unid + ' = <b>' + R.kAcaso + '</b> → <b>' + poup + '</b> ' + (R.ss ? 'dígito(s)' : 'dezena(s)') + ' poupada(s)<br>' : '') +
+        'Média no teste: <b>' + v.te.media.toFixed(2) + '</b> acertos · Lift <b>' + (v.lift >= 0 ? "+" : "") + v.lift.toFixed(2) + '</b> acima do acaso<br>' +
+        'Estabilidade: treino ' + pct(v.tr.taxa) + ' → teste ' + pct(v.te.taxa) + ' ' + est +
+        (!R.ss ? '<br>Combinações de ' + R.S + ' em RR(' + v.K + '): <b>' + C(v.K, R.S).toLocaleString("pt-BR") + '</b>' : '') +
+        '</div><div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px;">' +
+        '<button id="lq_salvar" class="btn-primary" style="margin:0;">💾 Salvar como preset</button>' +
+        '<button id="lq_aplicar" class="btn-secondary" style="margin:0;">➜ Aplicar no Radar / Target Lock</button>' +
+        '<button id="lq_csv" class="btn-secondary" style="margin:0;">Exportar CSV</button></div></div>';
+    } else {
+      var mt = R.melhorTeste;
+      resumo = '<div class="alert alert-warn" style="margin-top:12px;">Nenhuma configuração atingiu ' + Math.round(R.conf * 100) + '% no teste.' +
+        (mt ? ' A melhor foi ' + unid + '=' + mt.K + ' (' + mt.perfil + (mt.jan ? ', janela ' + mt.jan : '') + ') com <b>' + pct(mt.te.taxa) + '</b>.' : '') +
+        ' Tente reduzir a meta ou a confiança, ou ampliar a faixa de ' + unid + '. Esse resultado também é informativo: nessa faixa o método não supera a meta pedida.</div>' +
+        '<button id="lq_csv" class="btn-secondary">Exportar CSV</button>';
+    }
+
+    var tabFin = '<h4 style="margin:16px 0 6px;">Finalistas por ' + unid + ' (escolhidos no treino, medidos no teste)</h4>' +
+      '<div class="table-wrap" style="max-height:300px;"><table style="font-size:11.5px;"><tr><th>' + unid + '</th><th>Perfil</th>' + (R.ss ? '' : '<th>Janela</th><th>Scores</th>') +
+      '<th>Treino</th><th>Teste</th><th>Acaso</th><th>Lift</th><th>Média teste</th></tr>' +
+      R.finais.map(function (l) {
+        var ok = l.te.taxa >= R.conf, cc = ok ? "#10b981" : (l.te.taxa > l.acaso ? "#eab308" : "#ef4444");
+        return '<tr' + (R.venc === l ? ' style="background:rgba(34,211,238,.08);"' : '') + '><td><b>' + l.K + '</b></td><td>' + l.perfil + '</td>' +
+          (R.ss ? '' : '<td>' + l.jan + '</td><td>' + (l.r === "R" ? "mapa" : "completo") + '</td>') +
+          '<td>' + pct(l.tr.taxa) + '</td><td style="color:' + cc + ';font-weight:700;">' + pct(l.te.taxa) + '</td><td>' + pct(l.acaso) +
+          '</td><td>' + (l.lift >= 0 ? "+" : "") + l.lift.toFixed(2) + '</td><td>' + l.te.media.toFixed(2) + '</td></tr>';
+      }).join("") + '</table></div>' +
+      '<details style="margin-top:8px;"><summary class="muted" style="cursor:pointer;font-size:12px;">Ver todas as ' + R.linhas.length + ' configurações</summary>' +
+      '<div class="table-wrap" style="max-height:340px;margin-top:6px;"><table style="font-size:11px;"><tr><th>' + unid + '</th><th>Perfil</th>' + (R.ss ? '' : '<th>Jan.</th><th>Scores</th>') +
+      '<th>Treino</th><th>Teste</th><th>Lift</th><th>K insuf.</th></tr>' +
+      R.linhas.slice().sort(function (a, b) { return a.K - b.K || b.te.taxa - a.te.taxa; }).map(function (l) {
+        return '<tr' + (l.valida ? '' : ' style="opacity:.5;"') + '><td>' + l.K + '</td><td>' + l.perfil + '</td>' +
+          (R.ss ? '' : '<td>' + l.jan + '</td><td>' + (l.r === "R" ? "mapa" : "completo") + '</td>') +
+          '<td>' + pct(l.tr.taxa) + '</td><td>' + pct(l.te.taxa) + '</td><td>' + l.lift.toFixed(2) + '</td><td>' + pct(l.tr.curto) + '</td></tr>';
+      }).join("") + '</table></div><p class="muted" style="font-size:10.5px;">Linhas esmaecidas: em mais de 10% dos concursos o radar não tinha dezenas suficientes para o ' + unid + ' pedido (janela curta demais).</p></details>' +
+      '<div class="info-box" style="font-size:11px;margin-top:10px;">O OCA não escolhe jogos nem prevê resultados: ele mede o menor radar que, no passado e em concursos não vistos na escolha, manteve a cobertura pedida.</div></div>';
+
+    el.innerHTML = cab + resumo + tabFin;
+    desenharGrafico();
+    var s = document.getElementById("lq_salvar"); if (s) s.addEventListener("click", salvarPreset);
+    var a = document.getElementById("lq_aplicar"); if (a) a.addEventListener("click", aplicarNoRadar);
+    var x = document.getElementById("lq_csv"); if (x) x.addEventListener("click", exportarCSV);
+  }
+
+  function desenharGrafico() {
+    var cv = document.getElementById("lq_canvas"); if (!cv) return;
+    var R = LQ.res, ctx = cv.getContext("2d"), W = cv.width, H = cv.height, c = cor();
+    var L = 54, Rr = 20, T = 22, B = 44, ks = P.kList;
+    ctx.clearRect(0, 0, W, H);
+    var x = function (k) { return L + (ks.length > 1 ? (k - ks[0]) / (ks[ks.length - 1] - ks[0]) : .5) * (W - L - Rr); };
+    var y = function (v) { return T + (1 - v) * (H - T - B); };
+    ctx.font = "11px 'Courier New',monospace"; ctx.fillStyle = "#6b7f9e"; ctx.strokeStyle = "#1c2434"; ctx.lineWidth = 1;
+    for (var g = 0; g <= 10; g += 2) {
+      var yy = y(g / 10); ctx.beginPath(); ctx.moveTo(L, yy); ctx.lineTo(W - Rr, yy); ctx.stroke();
+      ctx.textAlign = "right"; ctx.fillText(g * 10 + "%", L - 6, yy + 4);
+    }
+    ctx.textAlign = "center";
+    ks.forEach(function (k) { ctx.fillText(k, x(k), H - B + 18); });
+    ctx.fillText(R.ss ? "dígitos por coluna" : "K (tamanho do radar)", (W + L) / 2, H - 8);
+    /* meta */
+    ctx.setLineDash([6, 4]); ctx.strokeStyle = "#eab308"; ctx.beginPath(); ctx.moveTo(L, y(R.conf)); ctx.lineTo(W - Rr, y(R.conf)); ctx.stroke();
+    ctx.fillStyle = "#eab308"; ctx.textAlign = "left"; ctx.fillText("META " + Math.round(R.conf * 100) + "%", L + 6, y(R.conf) - 6);
+    /* acaso */
+    ctx.strokeStyle = "#64748b"; ctx.beginPath();
+    ks.forEach(function (k, i) { var yy = y(acaso(k, R.meta)); if (i) ctx.lineTo(x(k), yy); else ctx.moveTo(x(k), yy); });
+    ctx.stroke(); ctx.setLineDash([]);
+    ctx.fillStyle = "#94a3b8"; ctx.textAlign = "right";
+    ctx.fillText("ACASO", x(ks[ks.length - 1]) - 4, y(acaso(ks[ks.length - 1], R.meta)) - 8);
+    /* método (teste) */
+    ctx.strokeStyle = c; ctx.lineWidth = 2.5; ctx.shadowColor = c; ctx.shadowBlur = 8; ctx.beginPath();
+    R.finais.forEach(function (l, i) { var yy = y(l.te.taxa); if (i) ctx.lineTo(x(l.K), yy); else ctx.moveTo(x(l.K), yy); });
+    ctx.stroke(); ctx.shadowBlur = 0;
+    R.finais.forEach(function (l) { ctx.fillStyle = c; ctx.beginPath(); ctx.arc(x(l.K), y(l.te.taxa), 3.5, 0, 6.3); ctx.fill(); });
+    ctx.fillStyle = c; ctx.textAlign = "left";
+    if (R.finais.length) { var l0 = R.finais[0]; ctx.fillText("MÉTODO (teste)", x(l0.K) + 6, y(l0.te.taxa) - 10); }
+    /* diamante */
+    if (R.venc) {
+      var vx = x(R.venc.K), vy = y(R.venc.te.taxa);
+      ctx.fillStyle = "#fff"; ctx.beginPath(); ctx.moveTo(vx, vy - 9); ctx.lineTo(vx + 9, vy); ctx.lineTo(vx, vy + 9); ctx.lineTo(vx - 9, vy); ctx.closePath(); ctx.fill();
+      ctx.font = "bold 12px 'Courier New',monospace"; ctx.textAlign = "center";
+      ctx.fillText("◆ " + (R.ss ? "d" : "K") + "=" + R.venc.K, vx, vy - 16);
+    }
+  }
+
+  /* ---------------- ações ---------------- */
+  function montarPreset() {
+    var v = LQ.res.venc, pf = LQ.res.perfis[v.pi], m = M(), cfg = MPL_STATE.config;
+    var mod = pf.mod || {}; if (!pf.mod) MODS.forEach(function (k) { mod[k] = (pf.p[k] || 0) > 0; });
+    return {
+      id: "p_" + Date.now() + "_" + Math.random().toString(36).slice(2, 7),
+      nome: "OCA · " + (m.sigla || m.nome) + " · " + (LQ.res.ss ? "d" : "K") + v.K + (v.jan ? " · jan " + v.jan : "") + " · " + v.perfil,
+      modalidade: m.presetKey, modalidadeNome: m.nome, criadoEm: new Date().toISOString(),
+      config: {
+        pesosPerfil: JSON.parse(JSON.stringify(pf.p)), modulosAtivos: mod,
+        camadas: JSON.parse(JSON.stringify(cfg.camadas)), janelasFrequencia: JSON.parse(JSON.stringify(cfg.janelasFrequencia)),
+        caixaJanela: v.jan || cfg.caixaJanela, K: v.K, su: JSON.parse(JSON.stringify(cfg.su))
+      },
+      restringirScores: v.r === "R", calibracao: null,
+      validacoes: [{ origem: "OCA", quando: new Date().toISOString(), meta: LQ.res.meta, confianca: LQ.res.conf,
+        periodo: LQ.res.periodo, treino: Number((v.tr.taxa * 100).toFixed(1)), teste: Number((v.te.taxa * 100).toFixed(1)),
+        acaso: Number((v.acaso * 100).toFixed(1)), lift: Number(v.lift.toFixed(2)), alvosTeste: LQ.res.nTeste }]
+    };
+  }
+  function salvarPreset() {
+    var p = montarPreset();
+    var nome = prompt("Nome do preset:", p.nome); if (!nome) return;
+    p.nome = nome;
+    try {
+      var l = JSON.parse(localStorage.getItem("mplPresets") || "[]"); l.push(p);
+      localStorage.setItem("mplPresets", JSON.stringify(l));
+      alert("Preset salvo. Ele aparece no card de Presets da aba Radar.");
+    } catch (e) { alert("Não foi possível salvar: " + e.message); }
+  }
+  function aplicarNoRadar() {
+    var p = montarPreset();
+    if (window.MPL_PRESETS && typeof MPL_PRESETS.aplicar === "function") MPL_PRESETS.aplicar(p);
+    else { MPL_STATE.config.pesosPerfil = p.config.pesosPerfil; MPL_STATE.config.modulosAtivos = p.config.modulosAtivos; MPL_STATE.config.K = p.config.K; MPL_STATE.config.caixaJanela = p.config.caixaJanela; MPL_STATE.config.caixaConfirmada = true; }
+    if (LQ.res.ss) MPL_STATE.config.ssDigitosPorColuna = p.config.K;
+    if (window.MPL_VCA) { window.MPL_VCA.kOverride = p.config.K; window.MPL_VCA.restringirScores = p.restringirScores; }
+    if (typeof agendarRAE === "function") agendarRAE("oca", 200);
+    var t = document.querySelector('.tab-btn[data-tab="radar"]'); if (t) t.click();
+  }
+  function exportarCSV() {
+    var R = LQ.res, sep = ";";
+    var linhas = ["K" + sep + "perfil" + sep + "janela" + sep + "scores" + sep + "treino_taxa" + sep + "teste_taxa" + sep + "acaso" + sep + "lift" + sep + "media_teste" + sep + "valida"];
+    R.linhas.forEach(function (l) {
+      linhas.push([l.K, l.perfil, l.jan || "", l.r === "R" ? "mapa" : "completo", (l.tr.taxa * 100).toFixed(1), (l.te.taxa * 100).toFixed(1),
+        (l.acaso * 100).toFixed(1), l.lift.toFixed(2), l.te.media.toFixed(2), l.valida ? "sim" : "nao"].join(sep));
+    });
+    var txt = "\uFEFF" + linhas.join("\n"), nome = "MPL_OCA_" + (M().sigla || "MOD") + ".csv";
+    if (typeof baixarArquivo === "function") baixarArquivo(txt, nome, "text/csv");
+    else { var a = document.createElement("a"); a.href = URL.createObjectURL(new Blob([txt], { type: "text/csv" })); a.download = nome; a.click(); }
+  }
+
+  /* ---------------- boot ---------------- */
+  var tent = 0, vig = setInterval(function () { tent++; if (criarAba() || tent > 40) clearInterval(vig); }, 300);
+  setInterval(function () {
+    if (!LQ.aberta || LQ.rodando || !M()) return;
+    if (LQ.pk !== M().presetKey) { iniciarForm(); render(); setTimeout(calibrar, 300); }
+  }, 1000);
+
+  console.log("MPL Lab Quant ★★★: aba criada · OCA (Otimizador de Configuração) ativo.");
+})();

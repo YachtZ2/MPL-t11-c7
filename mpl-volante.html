@@ -1,0 +1,278 @@
+/* ============================================================
+   MPL — mpl-volante.js
+   Volante Dinâmico (replica visual do volante oficial da Caixa)
+   v1.2 — dezenas sorteadas agora usam a cor de referência da marca
+   de cada modalidade (aproximação de mercado; ajuste os hex abaixo
+   se quiser bater exatamente com a identidade visual oficial da Caixa).
+   ============================================================ */
+
+/* Paleta por modalidade — ajuste os valores "principal"/"texto" aqui
+   se tiver os hex exatos da identidade visual oficial. */
+const CORES_MODALIDADE = {
+  megaSena:               { principal: "#00A65C", texto: "#ffffff" }, // verde
+  lotofacil:              { principal: "#930089", texto: "#ffffff" }, // rosa/roxo
+  quina:                  { principal: "#2B0A78", texto: "#ffffff" }, // azul/roxo
+  lotomania:              { principal: "#F5821F", texto: "#241400" }, // laranja
+  timemania:              { principal: "#4CAF3D", texto: "#062b02" }, // verde (seleção)
+  duplaSena:              { principal: "#A61324", texto: "#ffffff" }, // vermelho
+  diaDeSorte:             { principal: "#FCB315", texto: "#241a00" }, // dourado
+  superSete:              { principal: "#00A19A", texto: "#022321" }, // verde-água
+  maisMilionaria:         { principal: "#2E3092", texto: "#ffffff" }, // azul marinho
+  lotofacilIndependencia: { principal: "#930089", texto: "#ffffff" },
+  megaDaVirada:           { principal: "#00A65C", texto: "#ffffff" },
+  quinaSaoJoao:           { principal: "#2B0A78", texto: "#ffffff" },
+  personalizada:          { principal: "#22d3ee", texto: "#03121a" }
+};
+
+function obterCorModalidade(modalidade) {
+  return CORES_MODALIDADE[modalidade?.presetKey] || CORES_MODALIDADE.personalizada;
+}
+
+/* Layout de linhas/colunas por modalidade — replica o volante oficial impresso */
+function obterLayoutVolante(modalidade) {
+  if (!modalidade) return { colunas: 10, linhas: 0 };
+  if (isSuperSete(modalidade)) return { colunas: 7, linhas: 10, especial: "superSete" };
+  const colunas = modalidade.colunas || 10;
+  const linhas = Math.ceil(modalidade.universo / colunas);
+  return { colunas, linhas };
+}
+
+/* Retorna {linha, coluna} (base 0) de uma dezena dentro do volante oficial.
+   Não se aplica a modalidades posicionais (Super Sete). */
+function posicaoNoVolante(dezena, modalidade) {
+  const { colunas } = obterLayoutVolante(modalidade);
+  const idx = dezena - 1;
+  return { linha: Math.floor(idx / colunas), coluna: idx % colunas };
+}
+
+/*
+  renderVolante — desenha o volante dinâmico dentro de containerId.
+  opcoes:
+    navegacao: true|false  -> mostra controles de navegação entre concursos
+    clicavel: true|false   -> permite clicar em dezenas (uso em Filtros)
+    marcarExtras: array de dezenas adicionais a destacar (ex.: PIN atual)
+    onNavigate(concurso)   -> callback quando o concurso exibido muda
+    onClickDezena(dz, el)  -> callback quando uma dezena é clicada
+*/
+function renderVolante(containerId, modalidade, concurso, opcoes = {}) {
+  const el = document.getElementById(containerId);
+  if (!el) return;
+  if (!modalidade) { el.innerHTML = `<p class="muted">Nenhuma modalidade ativa.</p>`; return; }
+
+  if (isSuperSete(modalidade)) { renderVolanteSuperSete(containerId, modalidade, concurso, opcoes); return; }
+
+  const layout = obterLayoutVolante(modalidade);
+  const cor = obterCorModalidade(modalidade);
+  const marcadas = new Set(concurso ? concurso.dezenas : []);
+  const extras = new Set(opcoes.marcarExtras || []);
+
+  let grid = `<div class="volante-grid" style="grid-template-columns:repeat(${layout.colunas},1fr);">`;
+  const totalCelulas = layout.colunas * layout.linhas;
+  for (let d = 1; d <= totalCelulas; d++) {
+    if (d > modalidade.universo) { grid += `<div class="volante-cell volante-cell-empty"></div>`; continue; }
+    const marcado = marcadas.has(d);
+    const extra = extras.has(d);
+    const pos = posicaoNoVolante(d, modalidade);
+    const classes = ["volante-cell"];
+    if (marcado) classes.push("marcada");
+    if (extra) classes.push("marcada-extra");
+    if (opcoes.clicavel) classes.push("volante-cell-click");
+    const estiloCor = (marcado && !extra) ? ` style="background:${cor.principal};color:${cor.texto};border-color:${cor.principal};"` : "";
+    grid += `<div class="${classes.join(" ")}"${estiloCor} ${opcoes.clicavel ? `data-dz="${d}"` : ""} title="Linha ${pos.linha + 1} · Coluna ${pos.coluna + 1}">${String(d).padStart(2, "0")}</div>`;
+  }
+  grid += `</div>`;
+
+  const header = concurso
+    ? `<div class="volante-header"><b>${modalidade.nome}</b> · Concurso <b>${concurso.numero}</b>${concurso.data ? " · " + concurso.data : ""}${concurso.campoExtra ? " · " + concurso.campoExtra : ""}${concurso.sintetico ? ' <span class="pill">demo</span>' : ""}</div>`
+    : `<div class="volante-header"><b>${modalidade.nome}</b> · Nenhum concurso na base ainda</div>`;
+
+  const nav = construirNavVolante(containerId, concurso, opcoes.navegacao);
+  el.innerHTML = `<div class="volante-box" style="border-top:4px solid ${cor.principal};">${header}${grid}${nav}</div>`;
+
+  ativarNavegacaoVolante(el, containerId, modalidade, opcoes);
+
+  if (opcoes.clicavel) {
+    el.querySelectorAll(".volante-cell-click").forEach(cell => {
+      cell.addEventListener("click", () => {
+        const dz = Number(cell.dataset.dz);
+        if (opcoes.onClickDezena) opcoes.onClickDezena(dz, cell);
+      });
+    });
+  }
+}
+
+/* Volante especial do Super Sete: 7 colunas independentes, 10 linhas (dígitos 0-9).
+   O dígito sorteado em cada coluna é a posição concurso.dezenas[c] (0 a 9). */
+function renderVolanteSuperSete(containerId, modalidade, concurso, opcoes = {}) {
+  const el = document.getElementById(containerId);
+  const NUM_COLUNAS = 7, NUM_LINHAS = 10;
+  const cor = obterCorModalidade(modalidade);
+
+  let grid = `<div class="volante-grid" style="grid-template-columns:repeat(${NUM_COLUNAS},1fr);">`;
+  for (let c = 0; c < NUM_COLUNAS; c++) {
+    grid += `<div class="volante-cell volante-cell-label" style="color:${cor.principal};">Col ${c + 1}</div>`;
+  }
+  for (let r = 0; r < NUM_LINHAS; r++) {
+    for (let c = 0; c < NUM_COLUNAS; c++) {
+      const marcado = !!(concurso && Array.isArray(concurso.dezenas) && Number(concurso.dezenas[c]) === r);
+      const classes = ["volante-cell"];
+      if (marcado) classes.push("marcada");
+      if (opcoes.clicavel) classes.push("volante-cell-click");
+      const estiloCor = marcado ? ` style="background:${cor.principal};color:${cor.texto};border-color:${cor.principal};"` : "";
+      grid += `<div class="${classes.join(" ")}"${estiloCor} ${opcoes.clicavel ? `data-dz="${r}" data-col="${c}"` : ""} title="Coluna ${c + 1} · Dígito ${r}">${r}</div>`;
+    }
+  }
+  grid += `</div>`;
+
+  const header = concurso
+    ? `<div class="volante-header"><b>${modalidade.nome}</b> · Concurso <b>${concurso.numero}</b>${concurso.data ? " · " + concurso.data : ""}${concurso.sintetico ? ' <span class="pill">demo</span>' : ""} · Resultado por coluna: <b>${(concurso.dezenas || []).join(" · ")}</b></div>`
+    : `<div class="volante-header"><b>${modalidade.nome}</b> · Nenhum concurso na base ainda</div>`;
+
+  const nav = construirNavVolante(containerId, concurso, opcoes.navegacao);
+  el.innerHTML = `<div class="volante-box" style="border-top:4px solid ${cor.principal};">${header}${grid}${nav}</div>`;
+
+  ativarNavegacaoVolante(el, containerId, modalidade, opcoes);
+
+  if (opcoes.clicavel) {
+    el.querySelectorAll(".volante-cell-click").forEach(cell => {
+      cell.addEventListener("click", () => {
+        if (opcoes.onClickDezena) opcoes.onClickDezena(Number(cell.dataset.dz), cell, Number(cell.dataset.col));
+      });
+    });
+  }
+}
+
+function construirNavVolante(containerId, concurso, navegacao) {
+  if (!navegacao) return "";
+  return `
+    <div class="volante-nav">
+      <button class="btn-secondary" data-nav="primeiro" title="Primeiro concurso">|&lt;</button>
+      <button class="btn-secondary" data-nav="anterior" title="Concurso anterior">&lt;</button>
+      <input type="number" id="${containerId}_input" value="${concurso ? concurso.numero : ""}" style="width:110px;display:inline-block;">
+      <button class="btn-secondary" data-nav="ir">Ir</button>
+      <button class="btn-secondary" data-nav="proximo" title="Próximo concurso">&gt;</button>
+      <button class="btn-secondary" data-nav="ultimo" title="Último concurso (mais recente)">&gt;|</button>
+    </div>`;
+}
+
+function ativarNavegacaoVolante(el, containerId, modalidade, opcoes) {
+  if (!opcoes.navegacao) return;
+  el.querySelectorAll("[data-nav]").forEach(btn => {
+    btn.addEventListener("click", () => {
+      const base = MPL_STATE.base;
+      if (!base.length) return;
+      let idx = base.findIndex(c => c.numero === (opcoes.estadoAtual ? opcoes.estadoAtual.numero : null));
+      if (idx < 0) idx = base.length - 1;
+      const acao = btn.dataset.nav;
+      if (acao === "primeiro") idx = 0;
+      else if (acao === "anterior") idx = Math.max(0, idx - 1);
+      else if (acao === "proximo") idx = Math.min(base.length - 1, idx + 1);
+      else if (acao === "ultimo") idx = base.length - 1;
+      else if (acao === "ir") {
+        const num = Number(document.getElementById(containerId + "_input").value);
+        const found = base.findIndex(c => c.numero === num);
+        idx = found >= 0 ? found : idx;
+      }
+      opcoes.estadoAtual = base[idx];
+      renderVolante(containerId, modalidade, base[idx], opcoes);
+      if (opcoes.onNavigate) opcoes.onNavigate(base[idx]);
+    });
+  });
+}
+/* ============================================================
+   #pessoal
+   MPL — PATCH K — CORES LUMINOSAS NO VOLANTE (estilo FORTUNA)
+   COLE ESTE BLOCO NO FINAL DE js/mpl-volante.js — não apaga nada.
+
+   Aplica um brilho neon pulsante às dezenas marcadas de qualquer
+   volante (Dashboard, Filtros, Super Sete), usando a cor oficial
+   de cada modalidade (CORES_MODALIDADE) como base do brilho — sem
+   precisar reescrever renderVolante/renderVolanteSuperSete: apenas
+   embrulha a função e "pinta" o resultado depois de desenhado.
+   ============================================================ */
+(function () {
+  "use strict";
+
+  var estilo = document.createElement("style");
+  estilo.id = "mplBrilhoVolante";
+  estilo.textContent =
+    "@keyframes mplPulseGlow { 0%,100% { filter:brightness(1) saturate(1); } 50% { filter:brightness(1.35) saturate(1.25); } }" +
+    ".volante-cell-glow { animation: mplPulseGlow 1.9s ease-in-out infinite; }" +
+    ".volante-cell-glow-extra { animation: mplPulseGlow 1.4s ease-in-out infinite; }";
+  document.head.appendChild(estilo);
+
+  function aplicarBrilho(containerId, modalidade) {
+    var el = document.getElementById(containerId);
+    if (!el || !modalidade) return;
+    var cor = (typeof obterCorModalidade === "function") ? obterCorModalidade(modalidade) : { principal: "#22d3ee" };
+
+    el.querySelectorAll(".volante-cell.marcada").forEach(function (cell) {
+      var extra = cell.classList.contains("marcada-extra");
+      var corBrilho = extra ? "#10b981" : cor.principal; // extras (ex.: PIN) brilham em esmeralda
+      cell.style.boxShadow = "0 0 8px 2px " + corBrilho + ", 0 0 16px 5px " + corBrilho + "66";
+      cell.style.textShadow = "0 0 6px rgba(255,255,255,.65)";
+      cell.classList.add(extra ? "volante-cell-glow-extra" : "volante-cell-glow");
+    });
+  }
+
+  /* t11-C3 Fase 3: migrado para hooks */
+  if (typeof mplOn === "function") {
+    mplOn("volante", function (containerId, modalidade) {
+      aplicarBrilho(containerId, modalidade);
+    }, 20);
+  }
+})();
+/* ============================================================
+   #pessoal
+   MPL — PATCH S — TRANSIÇÃO LUMINOSA AO ALTERNAR CONCURSOS
+   (reproduz o efeito iluminarVolante() do FORTUNA)
+   COLE ESTE BLOCO NO FINAL DE js/mpl-volante.js — DEPOIS do
+   Patch K (cores luminosas). Não apaga nada.
+
+   No FORTUNA, ao trocar de concurso: o volante apaga tudo e cada
+   dezena sorteada "acende" com um pequeno atraso sequencial (i*60ms)
+   mais um efeito de "ping" (pulso de brilho mais forte por 500ms).
+   Aqui replicamos exatamente essa cadência, por cima do nosso
+   renderVolante — sem precisar reescrevê-lo.
+   ============================================================ */
+(function () {
+  "use strict";
+
+  var estilo = document.createElement("style");
+  estilo.id = "mplTransicaoFortuna";
+  estilo.textContent =
+    "@keyframes mplPingFortuna { 0% { transform:scale(1); filter:brightness(1.9) saturate(1.5); } 100% { transform:scale(1); filter:brightness(1) saturate(1); } }" +
+    ".volante-cell-ping { animation: mplPingFortuna .5s ease-out; }" +
+    ".volante-cell.mpl-apagando { opacity:.35; transform:scale(.94); transition: opacity .15s, transform .15s; }";
+
+  document.head.appendChild(estilo);
+
+  /* Acende as células marcadas em sequência (uma a uma), com o mesmo
+     espaçamento de 60ms por dezena que o FORTUNA usa. */
+  function transicaoLuminosa(containerId, modalidade) {
+    var el = document.getElementById(containerId);
+    if (!el) return;
+    var celulasMarcadas = Array.prototype.slice.call(el.querySelectorAll(".volante-cell.marcada"));
+    if (!celulasMarcadas.length) return;
+
+    // fase 1: "apaga" tudo por um instante (efeito de suspense antes de acender)
+    celulasMarcadas.forEach(function (cell) { cell.classList.add("mpl-apagando"); });
+
+    setTimeout(function () {
+      celulasMarcadas.forEach(function (cell, i) {
+        setTimeout(function () {
+          cell.classList.remove("mpl-apagando");
+          cell.classList.add("volante-cell-ping");
+          setTimeout(function () { cell.classList.remove("volante-cell-ping"); }, 500);
+        }, i * 60);
+      });
+    }, 120);
+  }
+
+  /* t11-C3 Fase 3: p30 garante que roda DEPOIS do brilho (p20) */
+  if (typeof mplOn === "function") {
+    mplOn("volante", function (containerId, modalidade) {
+      setTimeout(function () { transicaoLuminosa(containerId, modalidade); }, 10);
+    }, 30);
+  }
+})();

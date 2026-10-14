@@ -1,0 +1,3387 @@
+/* ============================================================
+   MPL — mpl-ui.js  (v1.4)
+   Interface, Dashboard + Volante Dinâmico + Cockpit de Insights,
+   Gráficos, API, Ordenação A-Z/Z-A, Filtros detalhados por
+   linha/coluna, Pesos STJ editáveis, Otimizador de K, Exportação,
+   Glossário, Restauração Automática de Sessão
+   ============================================================ */
+
+let sortStateDezenas = { campo: null, asc: false };
+let sortStateJogos = { campo: null, asc: false };
+
+function compararGenerico(a, b, asc) {
+  if (typeof a === "string" || typeof b === "string") {
+    return asc ? String(a).localeCompare(String(b)) : String(b).localeCompare(String(a));
+  }
+  return asc ? a - b : b - a;
+}
+
+document.addEventListener("DOMContentLoaded", async () => {
+  wireTabs();
+  popularPresets();
+  renderModalidadeForm();
+  renderEscopoForm();
+  renderSuForm();
+  renderPesosForm();
+  renderRadarForm();
+  renderGeradorForm();
+  renderFiltrosForm();
+  renderBacktestForm();
+  renderExportForm();
+  renderGlossario();
+  renderDashboard();
+  wireBaseTab();
+  wireApiTab();
+  wireBotoesPrincipais();
+  await tentarRestaurarSessao();
+});
+
+/* ---------------- Restauração Automática de Sessão ---------------- */
+async function tentarRestaurarSessao() {
+  const key = localStorage.getItem("mplUltimaModalidade");
+  if (!key || !PRESETS_MODALIDADES[key]) return;
+
+  const preset = JSON.parse(JSON.stringify(PRESETS_MODALIDADES[key]));
+  preset.presetKey = key;
+  MPL_STATE.modalidade = preset;
+  MPL_STATE.config.K = preset.radarK;
+  MPL_STATE.config.A = preset.dezenasSorteadas;
+  inicializarFiltrosLinhaColuna(preset);
+
+  try {
+    const baseSalva = await carregarBaseIndexedDB(preset.sigla);
+    if (baseSalva && baseSalva.length) MPL_STATE.base = baseSalva;
+  } catch (e) { console.warn("Não foi possível restaurar a base salva:", e); }
+
+  renderModalidadeForm();
+  renderFiltrosForm();
+  atualizarBadgeEscopo();
+  renderBaseTable();
+  renderDashboard();
+  renderApiStatus();
+
+  if (MPL_STATE.base.length) {
+    document.getElementById("vbeReport").innerHTML = `<div class="alert alert-ok">Sessão restaurada automaticamente: ${MPL_STATE.base.length} concursos de ${preset.nome} recuperados do IndexedDB.</div>`;
+  }
+}
+
+/* ---------------- Navegação por abas ---------------- */
+function wireTabs() {
+  document.querySelectorAll(".tab-btn").forEach(btn => {
+    btn.addEventListener("click", () => {
+      document.querySelectorAll(".tab-btn").forEach(b => b.classList.remove("active"));
+      document.querySelectorAll(".tab-panel").forEach(p => p.classList.remove("active"));
+      btn.classList.add("active");
+      document.getElementById("tab-" + btn.dataset.tab).classList.add("active");
+      MPL_STATE.ui.activeTab = btn.dataset.tab;
+      if (btn.dataset.tab === "dashboard") renderDashboard();
+      if (btn.dataset.tab === "api") renderApiStatus();
+      if (btn.dataset.tab === "filtros") renderFiltrosVolante();
+      if (btn.dataset.tab === "caixa") renderCaixaRBCard();
+    });
+  });
+}
+
+function atualizarBadgeEscopo() {
+  const el = document.getElementById("scopeBadge");
+  if (!MPL_STATE.modalidade) { el.textContent = "Nenhuma modalidade ativa"; return; }
+  el.textContent = `${MPL_STATE.modalidade.nome} · ${MPL_STATE.base.length} concursos · U=${MPL_STATE.modalidade.universo}`;
+}
+
+/* ---------------- Modalidade ---------------- */
+function popularPresets() {
+  const sel = document.getElementById("presetSelect");
+  sel.innerHTML = Object.keys(PRESETS_MODALIDADES).map(k => `<option value="${k}">${PRESETS_MODALIDADES[k].nome}</option>`).join("");
+}
+
+function renderModalidadeForm() {
+  const el = document.getElementById("modalidadeForm");
+  const m = MPL_STATE.modalidade;
+  el.innerHTML = m ? `
+    <h3>Modalidade Ativa: ${m.nome} (${m.sigla})</h3>
+    <div class="row-flex">
+      <div><label>Universo (U)</label><input id="mUniverso" type="number" value="${m.universo}"></div>
+      <div><label>Dezenas sorteadas (S)</label><input id="mS" type="number" value="${m.dezenasSorteadas}"></div>
+      <div><label>Aposta mínima</label><input id="mAmin" type="number" value="${m.apostaMinima}"></div>
+      <div><label>Aposta máxima</label><input id="mAmax" type="number" value="${m.apostaMaxima}"></div>
+      <div><label>K — Radar Reduzido</label><input id="mK" type="number" value="${m.radarK}"></div>
+    </div>
+    <div class="row-flex">
+      <div class="stat-card"><div class="label">FE — Frequência Esperada</div><div class="value">${(calcularFE(m.dezenasSorteadas, m.universo) * 100).toFixed(2)}%</div></div>
+      <div class="stat-card"><div class="label">IE — Intervalo Esperado</div><div class="value">${calcularIE(m.universo, m.dezenasSorteadas).toFixed(2)}</div></div>
+      <div class="stat-card"><div class="label">AE — Ausência Esperada</div><div class="value">${calcularAE(m.universo, m.dezenasSorteadas).toFixed(2)}</div></div>
+    </div>
+    <button id="btnSalvarModalidade" class="btn-secondary">Aplicar Alterações</button>
+    <p class="muted">Adaptador de API: ${MAPA_API_CAIXA[m.presetKey] ? `disponível (<b>${MAPA_API_CAIXA[m.presetKey]}</b>)` : "não disponível para esta modalidade (usar importação manual)"} · Volante oficial: ${isSuperSete(m) ? "7 colunas × 10 linhas (estrutura posicional)" : `${obterLayoutVolante(m).linhas} linhas × ${m.colunas} colunas`}.</p>
+  ` : `<p class="muted">Selecione um preset acima para começar.</p>`;
+
+  const btnSalvar = document.getElementById("btnSalvarModalidade");
+  if (btnSalvar) btnSalvar.addEventListener("click", () => {
+    m.universo = Number(document.getElementById("mUniverso").value);
+    m.dezenasSorteadas = Number(document.getElementById("mS").value);
+    m.apostaMinima = Number(document.getElementById("mAmin").value);
+    m.apostaMaxima = Number(document.getElementById("mAmax").value);
+    m.radarK = Number(document.getElementById("mK").value);
+    MPL_STATE.config.K = m.radarK;
+    MPL_STATE.config.A = m.dezenasSorteadas;
+    inicializarFiltrosLinhaColuna(m);
+    atualizarBadgeEscopo();
+    renderDashboard();
+  });
+}
+
+function wireBotoesPrincipais() {
+  document.getElementById("btnAplicarPreset").addEventListener("click", () => {
+    const key = document.getElementById("presetSelect").value;
+    const preset = JSON.parse(JSON.stringify(PRESETS_MODALIDADES[key]));
+    preset.presetKey = key;
+    MPL_STATE.modalidade = preset;
+    MPL_STATE.config.K = preset.radarK;
+    MPL_STATE.config.A = preset.dezenasSorteadas;
+    MPL_STATE.config.caixaConfirmada = false;
+    MPL_STATE.config.caixaJanela = null;
+    MPL_STATE.config.filtrosDuros.pin.dezenas = [];
+    inicializarFiltrosLinhaColuna(preset);
+    MPL_STATE.base = [];
+    MPL_STATE.ui.volanteDashboardAtual = null;
+    localStorage.setItem("mplUltimaModalidade", key);
+    renderModalidadeForm();
+    renderFiltrosForm();
+    atualizarBadgeEscopo();
+    renderDashboard();
+    renderApiStatus();
+  });
+
+  document.getElementById("btnDemo").addEventListener("click", () => {
+    if (!MPL_STATE.modalidade) { alert("Selecione e aplique um preset de modalidade primeiro."); return; }
+    MPL_STATE.base = gerarBaseSintetica(MPL_STATE.modalidade, 300);
+    document.getElementById("vbeReport").innerHTML = `<div class="alert alert-warn">Base sintética (DEMONSTRAÇÃO — dados fictícios) carregada: 300 concursos gerados aleatoriamente. Não representa dados reais da loteria.</div>`;
+    renderBaseTable();
+    atualizarBadgeEscopo();
+    renderDashboard();
+  });
+}
+
+/* ---------------- Base Histórica ---------------- */
+function wireBaseTab() {
+  document.getElementById("btnImportar").addEventListener("click", async () => {
+    try {
+      if (!MPL_STATE.modalidade) { alert("Configure uma modalidade antes de importar."); return; }
+      const manterOrdem = !isSuperSete(MPL_STATE.modalidade);
+      let registros = [];
+      const file = document.getElementById("fileImport").files[0];
+      if (file) {
+        const texto = await file.text();
+        registros = file.name.endsWith(".json") ? parseJSONTexto(texto, manterOrdem) : parseCSVTexto(texto, manterOrdem);
+      } else {
+        const texto = document.getElementById("pasteArea").value;
+        if (!texto.trim()) { alert("Nenhum arquivo selecionado nem dado colado."); return; }
+        registros = texto.trim().startsWith("[") ? parseJSONTexto(texto, manterOrdem) : parseCSVTexto(texto, manterOrdem);
+      }
+
+      const { resultado, qtdAdicionados } = atualizarBaseIncremental(MPL_STATE.base, registros);
+      const validacao = validarBase(resultado, MPL_STATE.modalidade);
+      MPL_STATE.base = resultado;
+
+      document.getElementById("vbeReport").innerHTML = renderVBEReport(validacao, qtdAdicionados);
+      renderBaseTable();
+      atualizarBadgeEscopo();
+      renderDashboard();
+    } catch (e) {
+      document.getElementById("vbeReport").innerHTML = `<div class="alert alert-danger">Erro ao importar: ${e.message}</div>`;
+    }
+  });
+
+  document.getElementById("btnSalvarBase").addEventListener("click", async () => {
+    if (!MPL_STATE.modalidade) return alert("Nenhuma modalidade ativa.");
+    await salvarBaseIndexedDB(MPL_STATE.base, MPL_STATE.modalidade.sigla);
+    localStorage.setItem("mplUltimaModalidade", MPL_STATE.modalidade.presetKey);
+    alert(`Base salva no IndexedDB (PBS): ${MPL_STATE.base.length} concursos. Ao reabrir o navegador, ela será restaurada automaticamente.`);
+  });
+
+  document.getElementById("btnCarregarBase").addEventListener("click", async () => {
+    if (!MPL_STATE.modalidade) return alert("Nenhuma modalidade ativa.");
+    const base = await carregarBaseIndexedDB(MPL_STATE.modalidade.sigla);
+    if (!base) return alert("Nenhuma base salva encontrada para esta modalidade.");
+    MPL_STATE.base = base;
+    renderBaseTable(); atualizarBadgeEscopo(); renderDashboard();
+  });
+
+  document.getElementById("btnLimparBase").addEventListener("click", async () => {
+    if (!confirm("Apagar a base carregada em memória e no storage local?")) return;
+    if (MPL_STATE.modalidade) await apagarBaseIndexedDB(MPL_STATE.modalidade.sigla);
+    MPL_STATE.base = [];
+    renderBaseTable(); atualizarBadgeEscopo(); renderDashboard();
+  });
+}
+
+function renderVBEReport(v, qtdAdicionados) {
+  const cls = v.valido ? "alert-ok" : "alert-danger";
+  let html = `<div class="alert ${cls}">Validação: ${v.valido ? "OK" : "ERROS ENCONTRADOS"} · ${qtdAdicionados ?? 0} concurso(s) novos adicionados (AIB) · Total na base: ${v.totalConcursos}</div>`;
+  if (v.erros?.length) html += `<div class="alert alert-danger">${v.erros.slice(0, 10).join("<br>")}</div>`;
+  if (v.avisos?.length) html += `<div class="alert alert-warn">${v.avisos.slice(0, 10).join("<br>")}</div>`;
+  return html;
+}
+
+function renderBaseTable() {
+  const el = document.getElementById("baseTable");
+  const ultimos = MPL_STATE.base.slice(-30).reverse();
+  if (!ultimos.length) { el.innerHTML = `<p class="muted">Nenhum concurso na base.</p>`; return; }
+  el.innerHTML = `<table><thead><tr><th>Concurso</th><th>Data</th><th>Dezenas</th></tr></thead><tbody>
+    ${ultimos.map(c => `<tr><td>${c.numero}</td><td>${c.data || "-"}</td><td>${c.dezenas.join(" ")}</td></tr>`).join("")}
+  </tbody></table>`;
+}
+
+/* ---------------- API Pública (Caixa) ---------------- */
+function wireApiTab() {
+  const input = document.getElementById("apiBaseUrlInput");
+  input.value = getApiBaseUrl();
+
+  document.getElementById("btnSalvarApiBaseUrl").addEventListener("click", () => {
+    setApiBaseUrl(input.value.trim());
+    alert("Endpoint da API salvo. Ele será usado em todas as próximas sincronizações.");
+  });
+
+  document.getElementById("btnRestaurarApiBaseUrl").addEventListener("click", () => {
+    setApiBaseUrl(MPL_API_DEFAULT_BASEURL);
+    input.value = MPL_API_DEFAULT_BASEURL;
+  });
+
+  document.getElementById("btnBuscarUltimo").addEventListener("click", async () => {
+    if (!MPL_STATE.modalidade?.presetKey) return alert("Selecione uma modalidade oficial (com adaptador de API) primeiro.");
+    const el = document.getElementById("apiProgress");
+    el.textContent = "Consultando API da Caixa...";
+    try {
+      const c = await getUltimoConcursoAPI(MPL_STATE.modalidade.presetKey);
+      el.innerHTML = `<div class="alert alert-ok">Último concurso na API: <b>${c.numero}</b> (${c.data || "sem data"}) — Dezenas: ${c.dezenas.join(" ")}</div>`;
+      salvarStatusSincronizacao(MPL_STATE.modalidade.presetKey, { ultimoConcurso: c.numero, fonte: c.fonte });
+      renderApiStatus();
+    } catch (e) {
+      el.innerHTML = `<div class="alert alert-danger">Falha ao consultar a API: ${e.message}. Isso costuma ocorrer por bloqueio de CORS no navegador — configure um endpoint/proxy alternativo acima ou utilize a importação manual na aba Base.</div>`;
+    }
+  });
+
+  document.getElementById("btnAtualizarAPI").addEventListener("click", async () => {
+    if (!MPL_STATE.modalidade?.presetKey) return alert("Selecione uma modalidade oficial (com adaptador de API) primeiro.");
+    const el = document.getElementById("apiProgress");
+    el.textContent = "Sincronizando concursos novos...";
+    try {
+      const r = await atualizarBasePorAPI(MPL_STATE.modalidade.presetKey, MPL_STATE.base, MPL_STATE.modalidade,
+        (n, total) => { el.textContent = `Buscando concurso ${n} de ${total}...`; });
+
+      if (r.mensagem) { el.innerHTML = `<div class="alert alert-ok">${r.mensagem}</div>`; return; }
+
+      if (r.novos.length) {
+        const { resultado } = atualizarBaseIncremental(MPL_STATE.base, r.novos);
+        MPL_STATE.base = resultado;
+        await salvarBaseIndexedDB(MPL_STATE.base, MPL_STATE.modalidade.sigla);
+        localStorage.setItem("mplUltimaModalidade", MPL_STATE.modalidade.presetKey);
+      }
+      renderBaseTable(); atualizarBadgeEscopo(); renderDashboard();
+
+      salvarStatusSincronizacao(MPL_STATE.modalidade.presetKey, {
+        ultimoConcurso: r.ultimoAPI, fonte: "Caixa (servicebus2)", qtdAdicionados: r.novos.length
+      });
+
+      el.innerHTML = `<div class="alert alert-ok">Sincronização concluída: ${r.novos.length} concurso(s) novo(s) adicionados via API (AIB) e salvos automaticamente. Falhas: ${r.falhas.length}.</div>`;
+      renderApiConflitos(r.conflitos);
+      renderApiStatus();
+    } catch (e) {
+      el.innerHTML = `<div class="alert alert-danger">Falha na atualização via API: ${e.message}. Utilize a importação manual como alternativa (aba Base).</div>`;
+    }
+  });
+
+  renderApiStatus();
+}
+
+function renderApiStatus() {
+  const el = document.getElementById("apiStatus");
+  if (!el || !MPL_STATE.modalidade?.presetKey) { if (el) el.textContent = "Selecione uma modalidade oficial para sincronizar."; return; }
+  const status = lerStatusSincronizacao(MPL_STATE.modalidade.presetKey);
+  const ultimoLocal = MPL_STATE.base.length ? Math.max(...MPL_STATE.base.map(c => c.numero)) : 0;
+  el.innerHTML = status
+    ? `Fonte: <b>${status.fonte}</b> · Última sincronização: ${new Date(status.quando).toLocaleString("pt-BR")} · Último concurso conhecido na API: <b>${status.ultimoConcurso}</b> · Último concurso na base local: <b>${ultimoLocal}</b>`
+    : `Nenhuma sincronização realizada ainda para ${MPL_STATE.modalidade.nome}. Último concurso na base local: ${ultimoLocal}.`;
+}
+
+function renderApiConflitos(conflitos) {
+  const el = document.getElementById("apiConflitos");
+  if (!conflitos?.length) { el.innerHTML = `<p class="muted">Nenhum conflito detectado.</p>`; return; }
+  el.innerHTML = `<div class="alert alert-warn">${conflitos.length} concurso(s) com divergência entre base local e API — não foram sobrescritos automaticamente.</div>
+    <table><thead><tr><th>Concurso</th><th>Base Local</th><th>API</th></tr></thead><tbody>
+    ${conflitos.map(c => `<tr><td>${c.numero}</td><td>${c.local.join(" ")}</td><td>${c.api.join(" ")}</td></tr>`).join("")}
+    </tbody></table>`;
+}
+
+/* ---------------- Escopo de Análise ---------------- */
+function renderEscopoForm() {
+  const el = document.getElementById("escopoForm");
+  el.innerHTML = `
+    <label>Modo de seleção</label>
+    <select id="escopoModo">
+      <option value="completa">Base completa</option>
+      <option value="ultimosN">Últimos N concursos</option>
+      <option value="intervalo">Intervalo por número de concurso</option>
+    </select>
+    <div class="row-flex">
+      <div><label>N (últimos)</label><input id="escopoN" type="number" value="200"></div>
+      <div><label>Concurso inicial</label><input id="escopoIni" type="number"></div>
+      <div><label>Concurso final</label><input id="escopoFim" type="number"></div>
+    </div>
+    <button id="btnAplicarEscopo" class="btn-primary">Aplicar Escopo</button>
+    <p class="muted" id="escopoInfo">Escopo atual: base completa. Nenhuma análise altera a base original.</p>
+  `;
+  document.getElementById("btnAplicarEscopo").addEventListener("click", () => {
+    MPL_STATE.escopo.modo = document.getElementById("escopoModo").value;
+    MPL_STATE.escopo.qtd = Number(document.getElementById("escopoN").value);
+    MPL_STATE.escopo.concursoInicial = Number(document.getElementById("escopoIni").value) || null;
+    MPL_STATE.escopo.concursoFinal = Number(document.getElementById("escopoFim").value) || null;
+    const efetiva = aplicarEscopo(MPL_STATE.base, MPL_STATE.escopo);
+    document.getElementById("escopoInfo").textContent = `Escopo atual: ${MPL_STATE.escopo.modo} · ${efetiva.length} concursos selecionados de ${MPL_STATE.base.length} totais.`;
+  });
+}
+
+function baseEfetiva() { return aplicarEscopo(MPL_STATE.base, MPL_STATE.escopo); }
+
+/* ---------------- Caixa / RECH / JMCT ---------------- */
+document.addEventListener("DOMContentLoaded", () => {
+  document.getElementById("btnCalcularCaixa").addEventListener("click", () => {
+    const base = baseEfetiva();
+    if (base.length < 15) return alert("Base insuficiente para calcular a caixa estatística (mínimo ~15 concursos).");
+    const mce = calcularMCE(base);
+    MPL_STATE.cache.caixa = mce;
+    renderCaixaStats(mce);
+    const tjf = testeJanelasFixas(base);
+    MPL_STATE.cache.tjf = tjf;
+    renderTJFTable(tjf);
+    renderCaixaRBCard();
+    renderDashboard();
+  });
+});
+
+function renderCaixaStats(mce) {
+  document.getElementById("caixaStatsCard").innerHTML = `
+    <h3>MCE — Mensuração da Caixa Estatística (JMCT)</h3>
+    <div class="grid-cards">
+      ${["media","mediana","moda","minimo","maximo","desvioPadrao","p75","p80","p85","p90","p95","p99"].map(k =>
+        `<div class="stat-card"><div class="label">${k}</div><div class="value">${Number(mce[k]).toFixed(2)}</div></div>`).join("")}
+    </div>`;
+  desenharHistogramaJMCT(mce.jmctArray.map(x => x.jmct));
+}
+
+function renderTJFTable(tjf) {
+  document.getElementById("tjfTable").innerHTML = `<table><thead><tr>
+    <th>Janela</th><th>Radar médio</th><th>Cobertura média</th><th>Taxa cobertura total</th><th>Taxa S-1</th><th>Taxa S-2</th><th>Amostras</th>
+  </tr></thead><tbody>
+    ${tjf.map(r => `<tr><td>${r.janela}</td><td>${r.tamanhoMedioRadar}</td><td>${r.coberturaMedia}</td><td>${r.taxaCoberturaTotal}</td><td>${r.taxaS1}</td><td>${r.taxaS2}</td><td>${r.amostras}</td></tr>`).join("")}
+  </tbody></table>`;
+}
+
+function renderCaixaRBCard() {
+  const el = document.getElementById("caixaRBCard");
+  if (!el) return;
+  const mce = MPL_STATE.cache.caixa;
+  const sugerida = mce ? Math.round(mce.mediana) : (MPL_STATE.modalidade ? Math.round(calcularIE(MPL_STATE.modalidade.universo, MPL_STATE.modalidade.dezenasSorteadas) * 3) : 20);
+  const atual = MPL_STATE.config.caixaJanela || sugerida;
+
+  el.innerHTML = `
+    <h3>Configuração do Radar Bruto (RB) — Janela da Caixa</h3>
+    <p class="muted">Esta janela define quantos concursos recentes serão unidos para formar o <b>Radar Bruto</b> (o conjunto inicial de dezenas candidatas, antes da pontuação). Janelas menores tornam o radar mais reativo ao curto prazo; janelas maiores aproximam o RB do universo completo, reduzindo o efeito da redução.</p>
+    <div class="row-flex">
+      <div><label>Janela (N) para o Radar Bruto</label><input id="caixaJanelaInput" type="number" value="${atual}"></div>
+    </div>
+    <button id="btnUsarMedianaJMCT" class="btn-secondary" ${mce ? "" : "disabled"}>Usar Mediana da JMCT (${mce ? Math.round(mce.mediana) : "—"})</button>
+    <button id="btnConfirmarCaixa" class="btn-primary">Confirmar Configuração da Caixa e Liberar Próxima Etapa</button>
+    <div id="caixaConfirmStatus" class="muted" style="margin-top:8px;">
+      ${MPL_STATE.config.caixaConfirmada ? `<span class="alert alert-ok">Configuração confirmada: janela = ${MPL_STATE.config.caixaJanela} concursos.</span>` : "Configuração ainda não confirmada — as próximas abas usarão um valor padrão até você confirmar aqui."}
+    </div>
+  `;
+  const btnMediana = document.getElementById("btnUsarMedianaJMCT");
+  if (btnMediana) btnMediana.addEventListener("click", () => {
+    document.getElementById("caixaJanelaInput").value = Math.round(mce.mediana);
+  });
+  document.getElementById("btnConfirmarCaixa").addEventListener("click", () => {
+    MPL_STATE.config.caixaJanela = Number(document.getElementById("caixaJanelaInput").value);
+    MPL_STATE.config.caixaConfirmada = true;
+    renderCaixaRBCard();
+    renderDashboard();
+  });
+}
+
+/* ---------------- Scores das Dezenas ---------------- */
+function renderSuForm() {
+  const el = document.getElementById("suForm");
+  el.innerHTML = `
+    <h3>SU — Score do Usuário (nível dezena)</h3>
+    <div class="row-flex">
+      <div><label>Fixas (separadas por vírgula)</label><input id="suFixas"></div>
+      <div><label>Proibidas</label><input id="suProibidas"></div>
+      <div><label>Preferenciais</label><input id="suPreferenciais"></div>
+      <div><label>Evitar</label><input id="suEvitar"></div>
+    </div>
+    <button id="btnSalvarSU" class="btn-secondary">Aplicar Preferências</button>
+  `;
+  document.getElementById("btnSalvarSU").addEventListener("click", () => {
+    const parseList = (id) => document.getElementById(id).value.split(",").map(s => Number(s.trim())).filter(n => !isNaN(n));
+    MPL_STATE.config.su.fixas = parseList("suFixas");
+    MPL_STATE.config.su.proibidas = parseList("suProibidas");
+    MPL_STATE.config.su.preferenciais = parseList("suPreferenciais");
+    MPL_STATE.config.su.evitar = parseList("suEvitar");
+    alert("Preferências SU aplicadas.");
+  });
+}
+
+document.addEventListener("DOMContentLoaded", () => {
+  document.getElementById("btnCalcularScores").addEventListener("click", () => {
+    if (!MPL_STATE.modalidade) return alert("Configure uma modalidade primeiro.");
+    const base = baseEfetiva();
+    if (base.length < 20) return alert("Base insuficiente (mínimo ~20 concursos).");
+    const { ranking, teia, pesosAtivos } = gerarRankingDezenas(base, MPL_STATE.modalidade, MPL_STATE.config);
+    MPL_STATE.cache.scoresDezenas = ranking;
+    MPL_STATE.cache.teia = teia;
+    sortStateDezenas = { campo: null, asc: false };
+    renderRankingDezenas(ranking);
+    renderTeia(teia, ranking);
+    renderDashboard();
+  });
+});
+
+const COLUNAS_RANKING_DEZENAS = [
+  { campo: "dezena", label: "Dezena" }, { campo: "STF", label: "STF" }, { campo: "classe", label: "Classe" },
+  { campo: "SIC", label: "SIC" }, { campo: "SF", label: "SF" }, { campo: "SA", label: "SA" },
+  { campo: "SC", label: "SC" }, { campo: "SRT", label: "SRT" }, { campo: "SEI", label: "SEI" }, { campo: "SU", label: "SU" }
+];
+
+function renderRankingDezenas(ranking) {
+  let dados = [...ranking];
+  if (sortStateDezenas.campo) {
+    dados.sort((a, b) => compararGenerico(a[sortStateDezenas.campo], b[sortStateDezenas.campo], sortStateDezenas.asc));
+  }
+  const setaFor = (campo) => sortStateDezenas.campo === campo ? (sortStateDezenas.asc ? " ▲" : " ▼") : "";
+
+  document.getElementById("rankingDezenasTable").innerHTML = `<table><thead><tr>
+    <th>#</th>
+    ${COLUNAS_RANKING_DEZENAS.map(c => `<th class="sortable ${sortStateDezenas.campo === c.campo ? "sort-active" : ""}" data-campo="${c.campo}">${c.label}${setaFor(c.campo)}</th>`).join("")}
+  </tr></thead><tbody>
+    ${dados.map((d, i) => `<tr>
+      <td>${i + 1}</td><td><b>${String(d.dezena).padStart(2,"0")}</b></td><td>${d.STF.toFixed(1)}</td>
+      <td><span class="badge badge-${d.classe}">${d.classe}</span></td>
+      <td>${d.SIC.toFixed(0)}</td><td>${d.SF.toFixed(0)}</td><td>${d.SA.toFixed(0)}</td>
+      <td>${d.SC.toFixed(0)}</td><td>${d.SRT.toFixed(0)}</td><td>${d.SEI.toFixed(0)}</td><td>${d.SU.toFixed(0)}</td>
+    </tr>`).join("")}
+  </tbody></table>`;
+
+  document.querySelectorAll("#rankingDezenasTable th.sortable").forEach(th => {
+    th.addEventListener("click", () => {
+      const campo = th.dataset.campo;
+      if (sortStateDezenas.campo === campo) sortStateDezenas.asc = !sortStateDezenas.asc;
+      else { sortStateDezenas.campo = campo; sortStateDezenas.asc = true; }
+      renderRankingDezenas(MPL_STATE.cache.scoresDezenas);
+    });
+  });
+}
+
+/* ---------------- Teia (Duplas e Triplas) ---------------- */
+function calcularLiftTriplas(teia) {
+  const out = {};
+  Object.keys(teia.contagemTriplas).forEach(key => {
+    const [a, b, c] = key.split("-").map(Number);
+    const pA = teia.contagemIndividual[a] / teia.totalConcursos;
+    const pB = teia.contagemIndividual[b] / teia.totalConcursos;
+    const pC = teia.contagemIndividual[c] / teia.totalConcursos;
+    const pABC = teia.contagemTriplas[key] / teia.totalConcursos;
+    out[key] = (pA * pB * pC) > 0 ? pABC / (pA * pB * pC) : 0;
+  });
+  return out;
+}
+
+function renderTeia(teia, ranking) {
+  const duplas = Object.keys(teia.liftDuplas).map(k => ({ key: k, lift: teia.liftDuplas[k], count: teia.contagemDuplas[k] }));
+  duplas.sort((a, b) => b.lift - a.lift);
+  const topDuplas = duplas.slice(0, 25);
+  document.getElementById("topDuplasTable").innerHTML = `<table><thead><tr><th>Dupla</th><th>Ocorrências</th><th>Lift</th></tr></thead><tbody>
+    ${topDuplas.map(d => `<tr><td>${d.key}</td><td>${d.count}</td><td>${d.lift.toFixed(2)}</td></tr>`).join("")}
+  </tbody></table>`;
+
+  const liftTriplas = calcularLiftTriplas(teia);
+  const triplas = Object.keys(teia.contagemTriplas).map(k => ({ key: k, lift: liftTriplas[k], count: teia.contagemTriplas[k] }));
+  triplas.sort((a, b) => b.lift - a.lift);
+  const topTriplas = triplas.slice(0, 25);
+  document.getElementById("topTriplasTable").innerHTML = topTriplas.length ? `<table><thead><tr><th>Tripla</th><th>Ocorrências</th><th>Lift</th></tr></thead><tbody>
+    ${topTriplas.map(t => `<tr><td>${t.key}</td><td>${t.count}</td><td>${t.lift.toFixed(2)}</td></tr>`).join("")}
+  </tbody></table>` : `<p class="muted">Nenhuma tripla com ocorrência relevante na base atual.</p>`;
+
+  desenharRedeTeia(topDuplas, ranking);
+}
+
+function desenharRedeTeia(topDuplas, ranking) {
+  const canvas = document.getElementById("chartTeia");
+  const ctx = canvas.getContext("2d");
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  const dezenasEnvolvidas = Array.from(new Set(topDuplas.flatMap(d => d.key.split("-").map(Number))));
+  const cx = canvas.width / 2, cy = canvas.height / 2, raio = Math.min(cx, cy) - 40;
+  const posicoes = {};
+  dezenasEnvolvidas.forEach((d, i) => {
+    const ang = (2 * Math.PI * i) / dezenasEnvolvidas.length;
+    posicoes[d] = { x: cx + raio * Math.cos(ang), y: cy + raio * Math.sin(ang) };
+  });
+  const mapaSTF = {}; (ranking || []).forEach(r => mapaSTF[r.dezena] = r.STF);
+
+  topDuplas.forEach(d => {
+    const [a, b] = d.key.split("-").map(Number);
+    ctx.beginPath();
+    ctx.moveTo(posicoes[a].x, posicoes[a].y);
+    ctx.lineTo(posicoes[b].x, posicoes[b].y);
+    ctx.strokeStyle = `rgba(34,211,238,${Math.min(1, d.lift / 3)})`;
+    ctx.lineWidth = Math.max(1, Math.min(4, d.lift));
+    ctx.stroke();
+  });
+  dezenasEnvolvidas.forEach(d => {
+    const p = posicoes[d];
+    const stf = mapaSTF[d] || 30;
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, 6 + stf / 12, 0, 2 * Math.PI);
+    ctx.fillStyle = "#eab308";
+    ctx.fill();
+    ctx.fillStyle = "#0b1220";
+    ctx.font = "10px sans-serif";
+    ctx.textAlign = "center";
+    ctx.fillText(String(d).padStart(2, "0"), p.x, p.y + 3);
+  });
+}
+
+function desenharHistogramaJMCT(valores) {
+  const canvas = document.getElementById("chartJMCT");
+  const ctx = canvas.getContext("2d");
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  if (!valores.length) return;
+  const min = Math.min(...valores), max = Math.max(...valores);
+  const bins = 15;
+  const largura = (max - min) / bins || 1;
+  const contagem = Array(bins).fill(0);
+  valores.forEach(v => { const idx = Math.min(bins - 1, Math.floor((v - min) / largura)); contagem[idx]++; });
+  const maxC = Math.max(...contagem);
+  const w = canvas.width / bins;
+  contagem.forEach((c, i) => {
+    const h = (c / maxC) * (canvas.height - 30);
+    ctx.fillStyle = "#22d3ee";
+    ctx.fillRect(i * w + 2, canvas.height - h - 20, w - 4, h);
+    ctx.fillStyle = "#8fa3c4";
+    ctx.font = "9px sans-serif";
+    ctx.textAlign = "center";
+    ctx.fillText((min + i * largura).toFixed(0), i * w + w / 2, canvas.height - 6);
+  });
+}
+
+/* ---------------- Módulos e Pesos (CAM/FAM/RAP) ---------------- */
+function avaliarPesosCriticos(pesosEfetivos, modulosAtivos) {
+  const alertas = [];
+  const ativosCount = Object.values(modulosAtivos).filter(Boolean).length;
+
+  Object.entries(pesosEfetivos).forEach(([k, v]) => {
+    if (v >= 0.45) alertas.push(`<b>${k}</b> concentra ${(v*100).toFixed(0)}% do STF — o ranking passa a depender quase exclusivamente deste único critério, perdendo a robustez de combinar múltiplos sinais.`);
+  });
+  if (pesosEfetivos.SU && pesosEfetivos.SU > 0.20) alertas.push(`<b>SU</b> acima de 20% faz o ranking refletir mais suas preferências manuais do que evidência estatística — isso é válido, mas muda a natureza do método.`);
+  if (pesosEfetivos.SIC && pesosEfetivos.SIC > 0.45) alertas.push(`<b>SIC</b> muito alto valoriza fortemente a presença recente (curto prazo) e pode ignorar frequência/ciclo de longo prazo, tornando o radar mais sensível a "rajadas" recentes.`);
+  if (pesosEfetivos.SRT && pesosEfetivos.SRT > 0.35) alertas.push(`<b>SRT</b> muito alto prioriza fortemente relações históricas entre dezenas (duplas/triplas), podendo ofuscar sinais individuais de frequência e ausência.`);
+  if (ativosCount <= 2) alertas.push(`Apenas ${ativosCount} módulo(s) ativo(s): o STF fica pouco robusto, pois passa a refletir uma visão muito estreita do histórico.`);
+  if (!alertas.length) alertas.push("Distribuição de pesos dentro de faixas equilibradas — nenhum módulo domina excessivamente o cálculo do STF.");
+  return alertas;
+}
+
+function renderPesosForm() {
+  const el = document.getElementById("pesosForm");
+  const p = MPL_STATE.config.pesosPerfil;
+  const ativos = MPL_STATE.config.modulosAtivos;
+  el.innerHTML = `
+    <h3>Perfil de Pesos (Equilibrado — padrão oficial)</h3>
+    ${Object.keys(p).map(k => `
+      <div class="checkbox-row">
+        <input type="checkbox" id="ativo_${k}" ${ativos[k] ? "checked" : ""}>
+        <label style="margin:0;flex:0 0 60px;">${k}</label>
+        <input type="number" id="peso_${k}" value="${p[k]}" step="0.01" style="width:90px;">
+      </div>`).join("")}
+    <button id="btnAplicarPesos" class="btn-primary">Aplicar (RAP recalcula automaticamente)</button>
+    <div id="pesosEfetivos" class="muted" style="margin-top:8px;"></div>
+    <div id="pesosAdvisory" style="margin-top:10px;"></div>
+  `;
+  document.getElementById("btnAplicarPesos").addEventListener("click", () => {
+    Object.keys(p).forEach(k => {
+      MPL_STATE.config.modulosAtivos[k] = document.getElementById(`ativo_${k}`).checked;
+      MPL_STATE.config.pesosPerfil[k] = Number(document.getElementById(`peso_${k}`).value);
+    });
+    const efetivos = reescalonarPesos(MPL_STATE.config.pesosPerfil, MPL_STATE.config.modulosAtivos);
+    document.getElementById("pesosEfetivos").innerHTML = "Pesos efetivos (RAP): " +
+      Object.keys(efetivos).map(k => `<span class="pill">${k}: ${(efetivos[k]*100).toFixed(1)}%</span>`).join("");
+    const alertas = avaliarPesosCriticos(efetivos, MPL_STATE.config.modulosAtivos);
+    document.getElementById("pesosAdvisory").innerHTML = `<div class="info-box"><b>Indicador crítico:</b><ul style="margin:6px 0 0 18px;">${alertas.map(a => `<li>${a}</li>`).join("")}</ul></div>`;
+  });
+}
+
+/* ---------------- Radar (RB restrito pela Caixa + Backtest + Otimizador de K) ---------------- */
+function renderRadarForm() {
+  document.getElementById("radarForm").innerHTML = `
+    <button id="btnGerarRadar" class="btn-primary">Gerar RB → RA → RR(K)</button>
+  `;
+  document.getElementById("btnGerarRadar").addEventListener("click", () => {
+    if (!MPL_STATE.cache.scoresDezenas) return alert("Calcule os scores das dezenas primeiro (aba Scores).");
+    const ranking = MPL_STATE.cache.scoresDezenas;
+    const m = MPL_STATE.modalidade;
+    const base = baseEfetiva();
+
+    let avisoJanela = "";
+    let janela = MPL_STATE.config.caixaJanela;
+    if (!MPL_STATE.config.caixaConfirmada || !janela) {
+      janela = janela || (MPL_STATE.cache.caixa ? Math.round(MPL_STATE.cache.caixa.mediana) : 20);
+      avisoJanela = `<div class="alert alert-warn">Você ainda não confirmou a janela da Caixa Estatística (aba Caixa/RECH/JMCT). Usando janela padrão de ${janela} concursos.</div>`;
+    }
+
+    const rb = gerarRadarBruto(base, janela);
+    const ra = ranking.filter(r => rb.includes(r.dezena) && !MPL_STATE.config.su.proibidas.includes(r.dezena));
+
+    let K = MPL_STATE.config.K;
+    let avisoK = "";
+    if (ra.length < K) {
+      avisoK = `<div class="alert alert-warn">O Radar Ajustado (RA) tem apenas ${ra.length} dezenas — menor que o K desejado (${K}). K foi ajustado para ${ra.length}. Considere aumentar a janela da Caixa.</div>`;
+      K = ra.length;
+    }
+
+    const rr = gerarRR(ra, K, MPL_STATE.config.su.fixas, MPL_STATE.config.su.proibidas);
+    MPL_STATE.cache.radar = { bruto: rb, ajustado: ra.map(r => r.dezena), reduzido: rr };
+
+    const A = MPL_STATE.config.A || m.dezenasSorteadas;
+    const rc = calcularRC(K, A, m.universo);
+    const totalOriginal = combinacao(m.universo, A);
+    const totalReduzido = combinacao(K, A);
+
+    document.getElementById("radarResult").innerHTML = `
+      ${avisoJanela}${avisoK}
+      <h3>RR(K) — Radar Reduzido (K=${K}, a partir de RB com janela=${janela})</h3>
+      <div>${rr.map(d => `<span class="pill badge-${d.classe}">${String(d.dezena).padStart(2,"0")} · ${d.STF.toFixed(0)}</span>`).join(" ")}</div>
+      <div class="grid-cards" style="margin-top:14px;">
+        <div class="stat-card"><div class="label">RB (Radar Bruto)</div><div class="value">${rb.length}</div></div>
+        <div class="stat-card"><div class="label">RA (Radar Ajustado)</div><div class="value">${ra.length}</div></div>
+        <div class="stat-card"><div class="label">Combinações antes (C(U,A))</div><div class="value">${totalOriginal.toLocaleString()}</div></div>
+        <div class="stat-card"><div class="label">Combinações depois (C(K,A))</div><div class="value">${totalReduzido.toLocaleString()}</div></div>
+        <div class="stat-card"><div class="label">RC — Redução Combinatória</div><div class="value">${(rc*100).toFixed(3)}%</div></div>
+      </div>`;
+    renderDashboard();
+    renderRadarBacktestCard();
+  });
+  renderRadarBacktestCard();
+}
+
+function renderRadarBacktestCard() {
+  const el = document.getElementById("radarBacktestCard");
+  if (!el) return;
+  el.innerHTML = `
+    <h3>Validação do Radar Antes de Gerar Jogos</h3>
+    <p class="muted">Filosofia do MPL: de nada adianta gerar e ranquear jogos sobre um radar que nunca foi validado. Use o BTM aqui para confirmar a cobertura histórica do K atual antes de avançar para o Gerador de Jogos — e, se quiser, rode o Otimizador de K para comparar vários tamanhos de radar e escolher o <b>menor</b> K com desempenho histórico aceitável.</p>
+    <div class="row-flex">
+      <div><label>Histórico mínimo para o BTM</label><input id="radarBtmMinHist" type="number" value="40"></div>
+    </div>
+    <button id="btnValidarRadarBTM" class="btn-primary">Validar Radar Atual via Backtest (BTM)</button>
+    <button id="btnOtimizadorK" class="btn-secondary">Rodar Otimizador de K (curva K × Cobertura)</button>
+    <div id="radarBtmResult" style="margin-top:12px;"></div>
+    <div id="otimizadorKResult" style="margin-top:12px;"></div>
+  `;
+  document.getElementById("btnValidarRadarBTM").addEventListener("click", () => {
+    if (!MPL_STATE.modalidade) return alert("Configure a modalidade.");
+    const base = baseEfetiva();
+    const minHist = Number(document.getElementById("radarBtmMinHist").value);
+    const btm = executarBTM(base, MPL_STATE.modalidade, MPL_STATE.config, minHist, 1);
+    MPL_STATE.cache.btm = btm;
+    document.getElementById("radarBtmResult").innerHTML = `
+      <div class="grid-cards">
+        <div class="stat-card"><div class="label">Cobertura média (K=${MPL_STATE.config.K})</div><div class="value">${(btm.coberturaMedia*100).toFixed(2)}%</div></div>
+        <div class="stat-card"><div class="label">Cobertura total</div><div class="value">${(btm.coberturaTotal*100).toFixed(2)}%</div></div>
+        <div class="stat-card"><div class="label">RC</div><div class="value">${(btm.rc*100).toFixed(2)}%</div></div>
+        <div class="stat-card"><div class="label">IER</div><div class="value">${(btm.ier*100).toFixed(2)}%</div></div>
+        <div class="stat-card"><div class="label">Amostras</div><div class="value">${btm.amostras}</div></div>
+      </div>
+      <p class="muted">Resultado histórico não garante desempenho futuro — use como referência comparativa entre configurações, não como previsão.</p>`;
+    renderDashboard();
+  });
+
+  document.getElementById("btnOtimizadorK").addEventListener("click", () => {
+    if (!MPL_STATE.modalidade) return alert("Configure a modalidade.");
+    const base = baseEfetiva();
+    if (base.length < 60) return alert("Base insuficiente para o otimizador (mínimo ~60 concursos).");
+    const m = MPL_STATE.modalidade;
+    const Kbase = MPL_STATE.config.K;
+    const candidatos = Array.from(new Set([
+      Math.max(m.dezenasSorteadas + 2, Math.round(Kbase * 0.6)),
+      Math.round(Kbase * 0.8), Kbase, Math.round(Kbase * 1.2), Math.round(Kbase * 1.4),
+      Math.min(m.universo, Kbase + 10)
+    ].filter(k => k >= m.dezenasSorteadas && k <= m.universo))).sort((a, b) => a - b);
+
+    document.getElementById("otimizadorKResult").innerHTML = `<p class="muted">Processando ${candidatos.length} valores de K, isso pode levar alguns segundos...</p>`;
+    setTimeout(() => {
+      const resultados = executarOtimizadorK(base, m, MPL_STATE.config, candidatos, 12, 30);
+      MPL_STATE.cache.otimizadorK = resultados;
+      document.getElementById("otimizadorKResult").innerHTML = `
+        <h3>Curva K × Cobertura Histórica</h3>
+        <table><thead><tr><th>K</th><th>Cobertura média</th><th>Cobertura total</th><th>RC</th><th>IER</th><th>C(K,A)</th></tr></thead><tbody>
+        ${resultados.map(r => `<tr ${r.K === Kbase ? 'style="color:#eab308;font-weight:700;"' : ""}><td>${r.K}</td><td>${(r.coberturaMedia*100).toFixed(1)}%</td><td>${(r.coberturaTotal*100).toFixed(1)}%</td><td>${(r.rc*100).toFixed(1)}%</td><td>${(r.ier*100).toFixed(1)}%</td><td>${r.combinacoes.toLocaleString()}</td></tr>`).join("")}
+        </tbody></table>
+        <p class="muted">Linha em destaque = K atualmente configurado (aba Modalidade). Busque o <b>menor</b> K cuja cobertura média/total ainda seja satisfatória para o seu objetivo — não existe valor "correto" universal, apenas o melhor equilíbrio entre redução e cobertura histórica.</p>`;
+    }, 50);
+  });
+}
+
+/* ---------------- Gerador de Jogos ---------------- */
+function renderGeradorForm() {
+  document.getElementById("geradorForm").innerHTML = `
+    <div class="row-flex">
+      <div><label>A — dezenas por jogo</label><input id="genA" type="number" value="${MPL_STATE.config.A || 7}"></div>
+      <div><label>Estratégia</label>
+        <select id="genEstrategia"><option value="auto">Automática</option><option value="completa">Completa</option><option value="amostral">Amostral</option></select>
+      </div>
+      <div><label>Qtd. amostra (se amostral)</label><input id="genQtd" type="number" value="20000"></div>
+      <div><label>Seed (reprodutibilidade)</label><input id="genSeed" type="number" value="42"></div>
+    </div>
+    <button id="btnGerarJogos" class="btn-primary">Gerar Jogos Candidatos (JC)</button>
+    <div class="info-box">
+      <b>Automática:</b> o sistema calcula quantas combinações C(K,A) o radar reduzido produziria; se for administrável (≤ 200.000), gera todas (modo completa); senão, gera uma amostra aleatória (modo amostral) para evitar travar o navegador.<br><br>
+      <b>Completa:</b> gera literalmente todas as combinações possíveis dentro do radar reduzido. É 100% exata, mas pode ficar pesada se K/A resultarem em muitas combinações.<br><br>
+      <b>Amostral:</b> sorteia um subconjunto aleatório de combinações (controlado pela "Qtd. amostra"). Não é exaustiva, mas viabiliza radares grandes.<br><br>
+      <b>Seed:</b> número que inicializa o gerador aleatório usado na amostragem. A mesma seed + os mesmos parâmetros sempre produzem exatamente os mesmos jogos (reprodutibilidade — importante para comparar cenários). Alterar a seed muda <i>quais</i> combinações são sorteadas, mas não torna o resultado estatisticamente "melhor" ou "pior" — apenas diferente. Use uma seed fixa quando quiser comparar mudanças de filtros/pesos sobre a mesma amostra de jogos.
+    </div>
+  `;
+  document.getElementById("btnGerarJogos").addEventListener("click", () => {
+    if (!MPL_STATE.cache.radar.reduzido?.length) return alert("Gere o Radar Reduzido primeiro.");
+    const dezenas = MPL_STATE.cache.radar.reduzido.map(d => d.dezena);
+    const A = Number(document.getElementById("genA").value);
+    const estrategia = document.getElementById("genEstrategia").value;
+    const qtd = Number(document.getElementById("genQtd").value);
+    const seed = Number(document.getElementById("genSeed").value);
+
+    let out;
+    if (estrategia === "completa") out = { jogos: gerarJogosCompleto(dezenas, A), estrategia: "completa", totalPossivel: combinacao(dezenas.length, A) };
+    else if (estrategia === "amostral") out = { jogos: gerarJogosAmostral(dezenas, A, qtd, seed), estrategia: "amostral", totalPossivel: combinacao(dezenas.length, A) };
+    else out = gerarJogosCandidatos(dezenas, A, { qtdAmostra: qtd, seed });
+
+    MPL_STATE.cache.jogos = out.jogos;
+    MPL_STATE.config.A = A;
+
+    document.getElementById("geradorResult").innerHTML = `
+      <div class="alert ${out.estrategia === "completa" ? "alert-ok" : "alert-warn"}">
+        Estratégia: ${out.estrategia} · Universo combinatório teórico: ${out.totalPossivel.toLocaleString()} ·
+        Jogos candidatos (JC) gerados: ${out.jogos.length.toLocaleString()}
+      </div>`;
+    renderDashboard();
+  });
+}
+
+/* ---------------- Filtros (PIN, linha/coluna DETALHADOS + Volante espelhado) ---------------- */
+function renderFiltrosVolante() {
+  const el = document.getElementById("filtrosVolanteCard");
+  if (!el) return;
+  const m = MPL_STATE.modalidade;
+  if (!m) { el.innerHTML = `<p class="muted">Configure uma modalidade primeiro.</p>`; return; }
+  const base = MPL_STATE.base;
+  const atual = MPL_STATE.ui.volanteDashboardAtual || (base.length ? base[base.length - 1] : null);
+  const layout = obterLayoutVolante(m);
+
+  el.innerHTML = `
+    <h3>Volante Visual — Referência para seus Filtros</h3>
+    <p class="muted">Layout oficial desta modalidade: <b>${isSuperSete(m) ? "7 colunas independentes × 10 linhas (0-9)" : `${layout.linhas} linhas × ${layout.colunas} colunas`}</b>. ${isSuperSete(m) ? "" : "Clique em uma dezena para adicionar/remover do PIN (dezenas obrigatórias em todos os jogos)."} Navegue entre concursos para inspirar suas ideias de filtro.</p>
+    <div id="volanteFiltros"></div>
+    ${isSuperSete(m) ? "" : `<div style="margin-top:10px;">PIN atual: <span id="pinAtualPills">${MPL_STATE.config.filtrosDuros.pin.dezenas.length ? MPL_STATE.config.filtrosDuros.pin.dezenas.map(d => `<span class="pill">${String(d).padStart(2,"0")}</span>`).join("") : '<span class="muted">nenhuma</span>'}</span></div>`}
+  `;
+  renderVolante("volanteFiltros", m, atual, {
+    navegacao: true,
+    clicavel: !isSuperSete(m),
+    estadoAtual: atual,
+    marcarExtras: MPL_STATE.config.filtrosDuros.pin.dezenas,
+    onNavigate: (c) => { MPL_STATE.ui.volanteDashboardAtual = c; },
+    onClickDezena: (dz) => {
+      const pin = MPL_STATE.config.filtrosDuros.pin.dezenas;
+      const idx = pin.indexOf(dz);
+      if (idx >= 0) pin.splice(idx, 1); else pin.push(dz);
+      renderFiltrosVolante();
+      sincronizarPinInput();
+    }
+  });
+}
+
+function sincronizarPinInput() {
+  const input = document.getElementById("fPin");
+  if (input) input.value = MPL_STATE.config.filtrosDuros.pin.dezenas.join(", ");
+}
+
+function renderFiltrosLinhaColunaTabelas() {
+  const m = MPL_STATE.modalidade;
+  if (!m || isSuperSete(m)) {
+    return `<p class="muted">Filtros por linha/coluna não se aplicam ao Super Sete (estrutura posicional por coluna independente).</p>`;
+  }
+  inicializarFiltrosLinhaColuna(m);
+  const f = MPL_STATE.config.filtrosDuros;
+  const layout = obterLayoutVolante(m);
+
+  const tabelaLinha = `
+    <h4 style="color:var(--gold);font-size:13px;">Por Linha (${layout.linhas} linhas)</h4>
+    <table><thead><tr><th>Ativar</th><th>Linha</th><th>Mín.</th><th>Máx.</th></tr></thead><tbody>
+      ${f.porLinha.map((fl, i) => `<tr>
+        <td><input type="checkbox" id="fLinha_${i}_ativo" ${fl.ativo ? "checked" : ""}></td>
+        <td>Linha ${i + 1}</td>
+        <td><input type="number" id="fLinha_${i}_min" value="${fl.min}" style="width:70px;"></td>
+        <td><input type="number" id="fLinha_${i}_max" value="${fl.max}" style="width:70px;"></td>
+      </tr>`).join("")}
+    </tbody></table>`;
+
+  const tabelaColuna = `
+    <h4 style="color:var(--gold);font-size:13px;">Por Coluna (${layout.colunas} colunas)</h4>
+    <table><thead><tr><th>Ativar</th><th>Coluna</th><th>Mín.</th><th>Máx.</th></tr></thead><tbody>
+      ${f.porColuna.map((fc, i) => `<tr>
+        <td><input type="checkbox" id="fColuna_${i}_ativo" ${fc.ativo ? "checked" : ""}></td>
+        <td>Coluna ${i + 1}</td>
+        <td><input type="number" id="fColuna_${i}_min" value="${fc.min}" style="width:70px;"></td>
+        <td><input type="number" id="fColuna_${i}_max" value="${fc.max}" style="width:70px;"></td>
+      </tr>`).join("")}
+    </tbody></table>`;
+
+  return `<div class="row-flex"><div>${tabelaLinha}</div><div>${tabelaColuna}</div></div>`;
+}
+
+function renderFiltrosForm() {
+  const f = MPL_STATE.config.filtrosDuros;
+  document.getElementById("filtrosForm").innerHTML = `
+    <div class="row-flex">
+      <div><label>Paridade min/max (pares)</label>
+        <input id="fParMin" type="number" value="${f.paridade.min ?? ""}" placeholder="min">
+        <input id="fParMax" type="number" value="${f.paridade.max ?? ""}" placeholder="max"></div>
+      <div><label>Soma min/max</label>
+        <input id="fSomaMin" type="number" value="${f.soma.min ?? ""}" placeholder="min">
+        <input id="fSomaMax" type="number" value="${f.soma.max ?? ""}" placeholder="max"></div>
+      <div><label>Máx. consecutivas</label><input id="fCons" type="number" value="${f.consecutivas.max}"></div>
+      <div><label>Repetidas min/max (vs. concurso anterior)</label>
+        <input id="fRepMin" type="number" value="${f.repetidas.min ?? ""}" placeholder="min">
+        <input id="fRepMax" type="number" value="${f.repetidas.max ?? ""}" placeholder="max"></div>
+      <div><label>Mín. dezenas Classe A</label><input id="fClasseA" type="number" value="${f.classesSTF.minA}"></div>
+    </div>
+    <div class="checkbox-row"><input type="checkbox" id="fHistorico" checked><label style="margin:0;">Aplicar Filtro Histórico Pós-Geração (remover jogos idênticos a resultados já sorteados)</label></div>
+
+    <h3 style="margin-top:16px;">PIN — Dezenas Obrigatórias em Todos os Jogos</h3>
+    <div class="checkbox-row"><input type="checkbox" id="fPinAtivo" ${f.pin.ativo ? "checked" : ""}><label style="margin:0;">Ativar filtro PIN</label></div>
+    <label>Dezenas PIN (separadas por vírgula — ou clique no volante acima)</label>
+    <input id="fPin" value="${f.pin.dezenas.join(", ")}">
+
+    <h3 style="margin-top:16px;">Filtros Detalhados por Linha e por Coluna do Volante Oficial</h3>
+    <p class="muted">Configure regras específicas para cada linha e cada coluna individualmente — ex.: "a linha 3 não pode ter nenhuma dezena" ou "a coluna 1 deve ter no máximo 2 dezenas".</p>
+    <div id="filtrosLinhaColunaTabelas">${renderFiltrosLinhaColunaTabelas()}</div>
+
+    <button id="btnAplicarFiltros" class="btn-primary" style="margin-top:10px;">Aplicar Pipeline de Filtros</button>
+  `;
+  document.getElementById("btnAplicarFiltros").addEventListener("click", () => {
+    if (!MPL_STATE.cache.jogos.length) return alert("Gere os jogos candidatos primeiro.");
+    f.paridade.min = document.getElementById("fParMin").value ? Number(document.getElementById("fParMin").value) : null;
+    f.paridade.max = document.getElementById("fParMax").value ? Number(document.getElementById("fParMax").value) : null;
+    f.soma.min = document.getElementById("fSomaMin").value ? Number(document.getElementById("fSomaMin").value) : null;
+    f.soma.max = document.getElementById("fSomaMax").value ? Number(document.getElementById("fSomaMax").value) : null;
+    f.consecutivas.max = Number(document.getElementById("fCons").value);
+    f.repetidas.min = document.getElementById("fRepMin").value ? Number(document.getElementById("fRepMin").value) : null;
+    f.repetidas.max = document.getElementById("fRepMax").value ? Number(document.getElementById("fRepMax").value) : null;
+    f.classesSTF.minA = Number(document.getElementById("fClasseA").value);
+    f.classesSTF.ativo = f.classesSTF.minA > 0;
+
+    f.pin.ativo = document.getElementById("fPinAtivo").checked;
+    f.pin.dezenas = document.getElementById("fPin").value.split(",").map(s => Number(s.trim())).filter(n => !isNaN(n));
+
+    if (!isSuperSete(MPL_STATE.modalidade)) {
+      f.porLinha.forEach((fl, i) => {
+        const chkAtivo = document.getElementById(`fLinha_${i}_ativo`);
+        if (!chkAtivo) return;
+        fl.ativo = chkAtivo.checked;
+        fl.min = Number(document.getElementById(`fLinha_${i}_min`).value);
+        fl.max = Number(document.getElementById(`fLinha_${i}_max`).value);
+      });
+      f.porColuna.forEach((fc, i) => {
+        const chkAtivo = document.getElementById(`fColuna_${i}_ativo`);
+        if (!chkAtivo) return;
+        fc.ativo = chkAtivo.checked;
+        fc.min = Number(document.getElementById(`fColuna_${i}_min`).value);
+        fc.max = Number(document.getElementById(`fColuna_${i}_max`).value);
+      });
+    }
+
+    const base = baseEfetiva();
+    const concursoAnterior = base.length ? base[base.length - 1].dezenas : null;
+    const { aprovados, eliminados } = aplicarPipelineFiltros(MPL_STATE.cache.jogos, f, {
+      universo: MPL_STATE.modalidade.universo, concursoAnterior,
+      rankingDezenas: MPL_STATE.cache.scoresDezenas,
+      fixas: MPL_STATE.config.su.fixas, proibidas: MPL_STATE.config.su.proibidas,
+      layout: obterLayoutVolante(MPL_STATE.modalidade)
+    });
+
+    let finalJogos = aprovados;
+    let removidosHistorico = 0;
+    if (document.getElementById("fHistorico").checked) {
+      const r = filtrarResultadosHistoricos(finalJogos, base);
+      finalJogos = r.mantidos; removidosHistorico = r.removidos;
+    }
+    MPL_STATE.cache.jogosAprovados = finalJogos;
+
+    document.getElementById("filtrosResult").innerHTML = `
+      <div class="alert alert-ok">Jogos aprovados: ${finalJogos.length.toLocaleString()} de ${MPL_STATE.cache.jogos.length.toLocaleString()} candidatos.</div>
+      <div class="muted">Eliminados por filtros duros: ${eliminados.total.toLocaleString()} · Motivos: ${Object.entries(eliminados.motivos).map(([m,c]) => `${m}(${c})`).join(", ") || "-"}</div>
+      <div class="muted">Removidos por resultado histórico idêntico: ${removidosHistorico}</div>`;
+    renderDashboard();
+  });
+
+  renderFiltrosVolante();
+}
+
+/* ---------------- Ranking de Jogos (ordenação + filtros de score + pesos STJ) ---------------- */
+const COLUNAS_RANKING_JOGOS = [
+  { campo: "stfMedio", label: "STF médio" }, { campo: "sej", label: "SEJ" },
+  { campo: "suj", label: "SUJ" }, { campo: "scoj", label: "SCOJ" },
+  { campo: "stj", label: "STJ" }, { campo: "classeSTJ", label: "Classe" }
+];
+
+document.addEventListener("DOMContentLoaded", () => {
+  document.getElementById("btnRankearJogos").addEventListener("click", () => {
+    if (!MPL_STATE.cache.jogosAprovados?.length) return alert("Aplique os filtros primeiro (aba Filtros).");
+    const base = baseEfetiva();
+    const ranqueados = ranquearJogos(
+      MPL_STATE.cache.jogosAprovados.slice(0, 5000),
+      MPL_STATE.cache.scoresDezenas, MPL_STATE.cache.teia, MPL_STATE.modalidade, base, MPL_STATE.config.su, MPL_STATE.config.stjPesos
+    );
+    MPL_STATE.cache.ranking = ranqueados;
+    MPL_STATE.cache.rankingExibicao = ranqueados.slice();
+    sortStateJogos = { campo: null, asc: false };
+    renderRankingJogosFiltros();
+    renderRankingJogos(MPL_STATE.cache.rankingExibicao);
+    renderDashboard();
+  });
+});
+
+function renderRankingJogosFiltros() {
+  const el = document.getElementById("rankingJogosFiltros");
+  if (!el) return;
+  const p = MPL_STATE.config.stjPesos;
+  el.innerHTML = `
+    <h3>Filtrar por Faixa de Score</h3>
+    <div class="row-flex">
+      <div><label>STF médio (min/max)</label><input id="rjStfMin" type="number" placeholder="min"><input id="rjStfMax" type="number" placeholder="max"></div>
+      <div><label>SEJ (min/max)</label><input id="rjSejMin" type="number" placeholder="min"><input id="rjSejMax" type="number" placeholder="max"></div>
+      <div><label>SUJ (min/max)</label><input id="rjSujMin" type="number" placeholder="min"><input id="rjSujMax" type="number" placeholder="max"></div>
+      <div><label>SCOJ (min/max)</label><input id="rjScojMin" type="number" placeholder="min"><input id="rjScojMax" type="number" placeholder="max"></div>
+      <div><label>STJ (min/max)</label><input id="rjStjMin" type="number" placeholder="min"><input id="rjStjMax" type="number" placeholder="max"></div>
+    </div>
+    <button id="btnFiltrarRankingJogos" class="btn-primary">Aplicar Filtro de Score</button>
+    <button id="btnLimparFiltroRankingJogos" class="btn-secondary">Limpar Filtro</button>
+
+    <h3 style="margin-top:16px;">Ajuste Manual dos Pesos do STJ (avançado)</h3>
+    <p class="muted">Fórmula oficial (Volume 2): STJ = 0,40×STF médio + 0,35×SEJ + 0,20×SCOJ + 0,05×SUJ. Você pode reponderar — os valores são reescalonados automaticamente para somar 100%.</p>
+    <div class="row-flex">
+      <div><label>Peso STF médio (%)</label><input id="stjWStf" type="number" value="${(p.stf*100).toFixed(0)}"></div>
+      <div><label>Peso SEJ (%)</label><input id="stjWSej" type="number" value="${(p.sej*100).toFixed(0)}"></div>
+      <div><label>Peso SCOJ (%)</label><input id="stjWScoj" type="number" value="${(p.scoj*100).toFixed(0)}"></div>
+      <div><label>Peso SUJ (%)</label><input id="stjWSuj" type="number" value="${(p.suj*100).toFixed(0)}"></div>
+    </div>
+    <button id="btnRecalcularSTJ" class="btn-secondary">Recalcular Ranking com Novos Pesos</button>
+    <button id="btnRestaurarSTJ" class="btn-secondary">Restaurar Pesos Oficiais</button>
+  `;
+
+  document.getElementById("btnFiltrarRankingJogos").addEventListener("click", () => {
+    const faixa = (idMin, idMax) => ({
+      min: document.getElementById(idMin).value !== "" ? Number(document.getElementById(idMin).value) : -Infinity,
+      max: document.getElementById(idMax).value !== "" ? Number(document.getElementById(idMax).value) : Infinity
+    });
+    const fStf = faixa("rjStfMin", "rjStfMax"), fSej = faixa("rjSejMin", "rjSejMax"),
+          fSuj = faixa("rjSujMin", "rjSujMax"), fScoj = faixa("rjScojMin", "rjScojMax"), fStj = faixa("rjStjMin", "rjStjMax");
+
+    MPL_STATE.cache.rankingExibicao = MPL_STATE.cache.ranking.filter(r =>
+      r.stfMedio >= fStf.min && r.stfMedio <= fStf.max &&
+      r.sej >= fSej.min && r.sej <= fSej.max &&
+      r.suj >= fSuj.min && r.suj <= fSuj.max &&
+      r.scoj >= fScoj.min && r.scoj <= fScoj.max &&
+      r.stj >= fStj.min && r.stj <= fStj.max
+    );
+    renderRankingJogos(MPL_STATE.cache.rankingExibicao);
+  });
+
+  document.getElementById("btnLimparFiltroRankingJogos").addEventListener("click", () => {
+    MPL_STATE.cache.rankingExibicao = MPL_STATE.cache.ranking.slice();
+    ["rjStfMin","rjStfMax","rjSejMin","rjSejMax","rjSujMin","rjSujMax","rjScojMin","rjScojMax","rjStjMin","rjStjMax"].forEach(id => document.getElementById(id).value = "");
+    renderRankingJogos(MPL_STATE.cache.rankingExibicao);
+  });
+
+  document.getElementById("btnRecalcularSTJ").addEventListener("click", () => {
+    if (!MPL_STATE.cache.jogosAprovados?.length) return alert("Gere e ranqueie os jogos primeiro.");
+    const stf = Number(document.getElementById("stjWStf").value) || 0;
+    const sej = Number(document.getElementById("stjWSej").value) || 0;
+    const scoj = Number(document.getElementById("stjWScoj").value) || 0;
+    const suj = Number(document.getElementById("stjWSuj").value) || 0;
+    MPL_STATE.config.stjPesos = { stf: stf / 100, sej: sej / 100, scoj: scoj / 100, suj: suj / 100 };
+
+    const base = baseEfetiva();
+    const ranqueados = ranquearJogos(
+      MPL_STATE.cache.jogosAprovados.slice(0, 5000),
+      MPL_STATE.cache.scoresDezenas, MPL_STATE.cache.teia, MPL_STATE.modalidade, base, MPL_STATE.config.su, MPL_STATE.config.stjPesos
+    );
+    MPL_STATE.cache.ranking = ranqueados;
+    MPL_STATE.cache.rankingExibicao = ranqueados.slice();
+    renderRankingJogosFiltros();
+    renderRankingJogos(MPL_STATE.cache.rankingExibicao);
+    renderDashboard();
+  });
+
+  document.getElementById("btnRestaurarSTJ").addEventListener("click", () => {
+    MPL_STATE.config.stjPesos = { stf: 0.40, sej: 0.35, scoj: 0.20, suj: 0.05 };
+    renderRankingJogosFiltros();
+  });
+}
+
+function renderRankingJogos(lista) {
+  let dados = [...lista];
+  if (sortStateJogos.campo) {
+    dados.sort((a, b) => compararGenerico(a[sortStateJogos.campo], b[sortStateJogos.campo], sortStateJogos.asc));
+  }
+  const setaFor = (campo) => sortStateJogos.campo === campo ? (sortStateJogos.asc ? " ▲" : " ▼") : "";
+  const top = dados.slice(0, 200);
+
+  document.getElementById("rankingJogosTable").innerHTML = `<table><thead><tr>
+    <th>#</th><th>Jogo</th>
+    ${COLUNAS_RANKING_JOGOS.map(c => `<th class="sortable ${sortStateJogos.campo === c.campo ? "sort-active" : ""}" data-campo="${c.campo}">${c.label}${setaFor(c.campo)}</th>`).join("")}
+  </tr></thead><tbody>
+    ${top.map((r, i) => `<tr>
+      <td>${i + 1}</td><td>${r.jogo.map(d => String(d).padStart(2,"0")).join(" ")}</td>
+      <td>${r.stfMedio.toFixed(1)}</td><td>${r.sej.toFixed(1)}</td><td>${r.suj.toFixed(1)}</td><td>${r.scoj.toFixed(1)}</td>
+      <td><b>${r.stj.toFixed(1)}</b></td><td><span class="badge badge-${r.classeSTJ}">${r.classeSTJ}</span></td>
+    </tr>`).join("")}
+  </tbody></table>
+  <p class="muted">Exibindo ${top.length} de ${dados.length} jogos (após filtro de score, se aplicado). Exportações usam a lista filtrada/ordenada atual.</p>`;
+
+  document.querySelectorAll("#rankingJogosTable th.sortable").forEach(th => {
+    th.addEventListener("click", () => {
+      const campo = th.dataset.campo;
+      if (sortStateJogos.campo === campo) sortStateJogos.asc = !sortStateJogos.asc;
+      else { sortStateJogos.campo = campo; sortStateJogos.asc = true; }
+      renderRankingJogos(MPL_STATE.cache.rankingExibicao);
+    });
+  });
+}
+
+/* ---------------- Backtest ---------------- */
+function renderBacktestForm() {
+  document.getElementById("backtestForm").innerHTML = `
+    <div class="row-flex">
+      <div><label>Histórico mínimo (BTM)</label><input id="btMinHist" type="number" value="40"></div>
+      <div><label>Top N (BTJ)</label><input id="btTopN" type="number" value="10"></div>
+      <div><label>Passo de amostragem (BTJ)</label><input id="btPasso" type="number" value="8"></div>
+    </div>
+    <button id="btnBTM" class="btn-primary">Executar BTM (Radar)</button>
+    <button id="btnBTJ" class="btn-secondary">Executar BTJ (Jogos)</button>
+    <button id="btnWalkForward" class="btn-secondary">Executar Walk-Forward + Overfitting</button>
+    <p class="muted">Regra absoluta: para avaliar o concurso T, o sistema usa apenas dados anteriores a T (sem vazamento temporal). Veja também a aba Radar Reduzido, que agora traz uma validação rápida do radar (BTM) e o Otimizador de K antes mesmo de gerar jogos.</p>
+  `;
+  document.getElementById("btnBTM").addEventListener("click", () => {
+    if (!MPL_STATE.modalidade) return alert("Configure a modalidade.");
+    const base = baseEfetiva();
+    const minHist = Number(document.getElementById("btMinHist").value);
+    const btm = executarBTM(base, MPL_STATE.modalidade, MPL_STATE.config, minHist, 1);
+    MPL_STATE.cache.btm = btm;
+    renderBacktestResult("BTM — Backtest Modular do Radar", `
+      <div class="grid-cards">
+        <div class="stat-card"><div class="label">Cobertura média</div><div class="value">${(btm.coberturaMedia*100).toFixed(2)}%</div></div>
+        <div class="stat-card"><div class="label">Taxa cobertura total</div><div class="value">${(btm.coberturaTotal*100).toFixed(2)}%</div></div>
+        <div class="stat-card"><div class="label">Taxa cobertura S-1</div><div class="value">${(btm.coberturaS1*100).toFixed(2)}%</div></div>
+        <div class="stat-card"><div class="label">RC</div><div class="value">${(btm.rc*100).toFixed(2)}%</div></div>
+        <div class="stat-card"><div class="label">IER</div><div class="value">${(btm.ier*100).toFixed(2)}%</div></div>
+        <div class="stat-card"><div class="label">Amostras</div><div class="value">${btm.amostras}</div></div>
+      </div>`);
+  });
+
+  document.getElementById("btnBTJ").addEventListener("click", () => {
+    if (!MPL_STATE.modalidade) return alert("Configure a modalidade.");
+    const base = baseEfetiva();
+    const topN = Number(document.getElementById("btTopN").value);
+    const passo = Number(document.getElementById("btPasso").value);
+    const btj = executarBTJ(base, MPL_STATE.modalidade, MPL_STATE.config, { topN, passo });
+    MPL_STATE.cache.btj = btj;
+    renderBacktestResult("BTJ — Backtest de Jogos", `
+      <div class="grid-cards">
+        <div class="stat-card"><div class="label">Melhor acerto médio (Top ${topN})</div><div class="value">${btj.melhorAcertoMedio.toFixed(2)}</div></div>
+        <div class="stat-card"><div class="label">Melhor acerto mediana</div><div class="value">${btj.melhorAcertoMediana.toFixed(2)}</div></div>
+        <div class="stat-card"><div class="label">Amostras (concursos testados)</div><div class="value">${btj.amostras}</div></div>
+      </div>
+      <p class="muted">Resultado histórico não constitui garantia de desempenho em concursos futuros.</p>`);
+  });
+
+  document.getElementById("btnWalkForward").addEventListener("click", () => {
+    if (!MPL_STATE.modalidade) return alert("Configure a modalidade.");
+    const base = baseEfetiva();
+    if (base.length < 60) return alert("Base insuficiente para walk-forward (mínimo ~60 concursos).");
+    const wf = executarWalkForward(base, MPL_STATE.modalidade, MPL_STATE.config);
+    const of = avaliarOverfitting(base, MPL_STATE.config, wf);
+    renderBacktestResult("Walk-Forward (Treino / Validação / Teste)", `
+      <div class="grid-cards">
+        <div class="stat-card"><div class="label">Treino</div><div class="value">${(wf.treino.coberturaMedia*100).toFixed(1)}%</div></div>
+        <div class="stat-card"><div class="label">Validação</div><div class="value">${(wf.validacao.coberturaMedia*100).toFixed(1)}%</div></div>
+        <div class="stat-card"><div class="label">Teste</div><div class="value">${(wf.teste.coberturaMedia*100).toFixed(1)}%</div></div>
+        <div class="stat-card"><div class="label">Diferença Treino/Teste</div><div class="value">${(wf.diferencaTreinoTeste*100).toFixed(1)}%</div></div>
+      </div>`);
+    document.getElementById("overfittingPanel").innerHTML = `
+      <h3>Risco Estatístico e Overfitting</h3>
+      <div class="alert ${of.nivel === "alto" ? "alert-danger" : of.nivel === "moderado" ? "alert-warn" : "alert-ok"}">
+        Nível de confiança operacional: <b>${of.nivel.toUpperCase()}</b>
+      </div>
+      <ul>${of.alertas.map(a => `<li>${a}</li>`).join("")}</ul>
+      <p class="muted">Parâmetros ativos: ${of.nParametros} · Concursos analisados: ${of.nConcursos} · Razão parâmetros/amostra: ${of.razaoParamAmostra.toFixed(4)}</p>`;
+  });
+}
+
+function renderBacktestResult(titulo, html) {
+  document.getElementById("backtestResult").innerHTML = `<h3>${titulo}</h3>${html}`;
+}
+
+/* ---------------- Exportação ---------------- */
+function baixarArquivo(conteudo, nome, tipo) {
+  const blob = new Blob([conteudo], { type: tipo });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url; a.download = nome; a.click();
+  URL.revokeObjectURL(url);
+}
+
+function paraCSV(linhas) {
+  return linhas.map(l => l.map(v => `"${String(v).replace(/"/g, '""')}"`).join(",")).join("\n");
+}
+
+function listaJogosParaExportar() {
+  return (MPL_STATE.cache.rankingExibicao && MPL_STATE.cache.rankingExibicao.length)
+    ? MPL_STATE.cache.rankingExibicao : MPL_STATE.cache.ranking;
+}
+
+function nomeArquivoJogos(qtdJogos, dezenasPorJogo) {
+  const nomeMod = normalizarNomeModalidade(MPL_STATE.modalidade ? MPL_STATE.modalidade.nome : "MODALIDADE");
+  return `MPL_${nomeMod}_${qtdJogos}x${dezenasPorJogo}`;
+}
+
+function exportarJogosTXT(qtdDesejada) {
+  const origem = listaJogosParaExportar();
+  if (!origem?.length) { alert("Ranqueie os jogos primeiro (aba Ranking de Jogos)."); return; }
+  const n = Math.max(1, Math.min(qtdDesejada, origem.length));
+  const selecionados = origem.slice(0, n);
+  const m = MPL_STATE.modalidade;
+  const dezenasPorJogo = selecionados[0].jogo.length;
+
+  const linhas = [];
+  linhas.push("========================================");
+  linhas.push("MPL — Mapa Parametrizável das Loterias");
+  linhas.push(`Modalidade: ${m ? m.nome : "-"}`);
+  linhas.push(`Escopo: ${MPL_STATE.escopo.modo} · Base: ${MPL_STATE.base.length} concursos`);
+  linhas.push(`Radar Reduzido: K=${MPL_STATE.config.K} · A=${MPL_STATE.config.A}`);
+  linhas.push(`Jogos exportados: ${n} de ${origem.length} disponíveis`);
+  linhas.push(`Gerado em: ${new Date().toLocaleString("pt-BR")}`);
+  linhas.push("========================================");
+  linhas.push("");
+  selecionados.forEach((r, i) => {
+    const numeros = r.jogo.map(d => String(d).padStart(2, "0")).join(" ");
+    linhas.push(`Jogo ${String(i + 1).padStart(3, "0")}: ${numeros}   [STJ ${r.stj.toFixed(1)} · Classe ${r.classeSTJ}]`);
+  });
+  linhas.push("");
+  linhas.push("----------------------------------------");
+  linhas.push('"A análise histórica não elimina a aleatoriedade; ela organiza decisões, reduz universos e permite validação objetiva."');
+  linhas.push("O MPL não promete acerto, não prevê sorteios e não elimina a aleatoriedade.");
+
+  baixarArquivo(linhas.join("\n"), `${nomeArquivoJogos(n, dezenasPorJogo)}.txt`, "text/plain");
+}
+
+function exportarJogosTXTSimples(qtdDesejada) {
+  const origem = listaJogosParaExportar();
+  if (!origem?.length) { alert("Ranqueie os jogos primeiro (aba Ranking de Jogos)."); return; }
+  const n = Math.max(1, Math.min(qtdDesejada, origem.length));
+  const selecionados = origem.slice(0, n);
+  const dezenasPorJogo = selecionados[0].jogo.length;
+  const linhas = selecionados.map(r => r.jogo.map(d => String(d).padStart(2, "0")).join(" "));
+  baixarArquivo(linhas.join("\n"), `${nomeArquivoJogos(n, dezenasPorJogo)}.txt`, "text/plain");
+}
+
+function renderExportForm() {
+  document.getElementById("exportForm").innerHTML = `
+    <button id="expBase" class="btn-secondary">Exportar Base (JSON)</button>
+    <button id="expRankingDez" class="btn-secondary">Exportar Ranking de Dezenas (CSV)</button>
+    <button id="expRR" class="btn-secondary">Exportar Radar Reduzido (CSV)</button>
+    <button id="expJogos" class="btn-secondary">Exportar Jogos Ranqueados (CSV)</button>
+    <button id="expConfig" class="btn-secondary">Exportar Configuração do Cenário (JSON)</button>
+
+    <div class="card" style="margin-top:16px;background:var(--graphite);">
+      <h3>Exportar Jogos em TXT (quantidade desejada)</h3>
+      <div class="row-flex">
+        <div><label>Quantidade de jogos a exportar</label><input id="expTxtQtd" type="number" value="10" min="1"></div>
+      </div>
+      <button id="expJogosTXT" class="btn-primary">Exportar TXT (com scores)</button>
+      <button id="expJogosTXTSimples" class="btn-secondary">Exportar TXT (somente números)</button>
+      <p class="muted">Nome do arquivo segue o padrão <code>MPL_MODALIDADE_QTDxDEZENAS</code> — ex.: Quina com 20 jogos de 5 dezenas → <code>MPL_QUINA_20x5.txt</code>; Dia de Sorte com 10 jogos de 7 dezenas → <code>MPL_DIA_DE_SORTE_10x7.txt</code>. Usa a lista atualmente filtrada/ordenada na aba Ranking de Jogos.</p>
+    </div>
+  `;
+  document.getElementById("expBase").addEventListener("click", () => {
+    baixarArquivo(JSON.stringify(MPL_STATE.base, null, 2), "mpl-base.json", "application/json");
+  });
+  document.getElementById("expRankingDez").addEventListener("click", () => {
+    if (!MPL_STATE.cache.scoresDezenas) return alert("Calcule os scores primeiro.");
+    const linhas = [["Dezena","STF","Classe","SIC","SF","SA","SC","SRT","SEI","SU"]];
+    MPL_STATE.cache.scoresDezenas.forEach(d => linhas.push([d.dezena,d.STF.toFixed(2),d.classe,d.SIC.toFixed(2),d.SF.toFixed(2),d.SA.toFixed(2),d.SC.toFixed(2),d.SRT.toFixed(2),d.SEI.toFixed(2),d.SU.toFixed(2)]));
+    baixarArquivo(paraCSV(linhas), "mpl-ranking-dezenas.csv", "text/csv");
+  });
+  document.getElementById("expRR").addEventListener("click", () => {
+    if (!MPL_STATE.cache.radar.reduzido?.length) return alert("Gere o radar primeiro.");
+    const linhas = [["Dezena","STF","Classe"]];
+    MPL_STATE.cache.radar.reduzido.forEach(d => linhas.push([d.dezena,d.STF.toFixed(2),d.classe]));
+    baixarArquivo(paraCSV(linhas), "mpl-radar-reduzido.csv", "text/csv");
+  });
+  document.getElementById("expJogos").addEventListener("click", () => {
+    const origem = listaJogosParaExportar();
+    if (!origem?.length) return alert("Ranqueie os jogos primeiro.");
+    const linhas = [["Jogo","STF_medio","SEJ","SUJ","SCOJ","STJ","Classe"]];
+    origem.forEach(r => linhas.push([r.jogo.join(" "), r.stfMedio.toFixed(2), r.sej.toFixed(2), r.suj.toFixed(2), r.scoj.toFixed(2), r.stj.toFixed(2), r.classeSTJ]));
+    baixarArquivo(paraCSV(linhas), "mpl-jogos-ranqueados.csv", "text/csv");
+  });
+  document.getElementById("expConfig").addEventListener("click", () => {
+    const cfg = { modalidade: MPL_STATE.modalidade, escopo: MPL_STATE.escopo, config: MPL_STATE.config, versaoMetodo: "MPL v1 — Canônico 2.0", dataExportacao: new Date().toISOString() };
+    baixarArquivo(JSON.stringify(cfg, null, 2), "mpl-cenario.json", "application/json");
+  });
+  document.getElementById("expJogosTXT").addEventListener("click", () => {
+    const qtd = Number(document.getElementById("expTxtQtd").value) || 10;
+    exportarJogosTXT(qtd);
+  });
+  document.getElementById("expJogosTXTSimples").addEventListener("click", () => {
+    const qtd = Number(document.getElementById("expTxtQtd").value) || 10;
+    exportarJogosTXTSimples(qtd);
+  });
+}
+
+/* ---------------- Dashboard: Volante + Cockpit de Insights + Resumo ---------------- */
+function renderDashboard() {
+  const m = MPL_STATE.modalidade;
+  const base = baseEfetiva();
+
+  const concursoAtual = MPL_STATE.ui.volanteDashboardAtual || (MPL_STATE.base.length ? MPL_STATE.base[MPL_STATE.base.length - 1] : null);
+  renderVolante("volanteDashboard", m, concursoAtual, {
+    navegacao: true,
+    estadoAtual: concursoAtual,
+    onNavigate: (c) => { MPL_STATE.ui.volanteDashboardAtual = c; renderInsightsCockpit(c); }
+  });
+
+  renderInsightsCockpit(concursoAtual);
+  renderResumoEstatisticas();
+
+  const cards = [];
+  cards.push(card("Modalidade ativa", m ? m.nome : "—"));
+  cards.push(card("Concursos na base", MPL_STATE.base.length));
+  cards.push(card("Concursos no escopo", base.length));
+  cards.push(card("Último concurso", base.length ? base[base.length - 1].numero : "—"));
+  cards.push(card("K — Radar Reduzido", MPL_STATE.config.K));
+  cards.push(card("Radar bruto (RB)", MPL_STATE.cache.radar.bruto?.length || 0));
+  cards.push(card("Radar reduzido (RR)", MPL_STATE.cache.radar.reduzido?.length || 0));
+  cards.push(card("Jogos candidatos (JC)", MPL_STATE.cache.jogos.length.toLocaleString()));
+  cards.push(card("Jogos aprovados (JA)", MPL_STATE.cache.jogosAprovados.length.toLocaleString()));
+  cards.push(card("Jogos ranqueados", MPL_STATE.cache.ranking.length.toLocaleString()));
+  cards.push(card("Módulos ativos", Object.values(MPL_STATE.config.modulosAtivos).filter(Boolean).length + "/7"));
+  cards.push(card("BTM cobertura média", MPL_STATE.cache.btm ? (MPL_STATE.cache.btm.coberturaMedia*100).toFixed(1) + "%" : "—"));
+  cards.push(card("Caixa confirmada?", MPL_STATE.config.caixaConfirmada ? "Sim" : "Não"));
+  const statusApi = m?.presetKey ? lerStatusSincronizacao(m.presetKey) : null;
+  cards.push(card("Última sync. API", statusApi ? new Date(statusApi.quando).toLocaleDateString("pt-BR") : "—"));
+  document.getElementById("dashboardCards").innerHTML = cards.join("");
+
+  if (MPL_STATE.cache.caixa) desenharHistogramaJMCT(MPL_STATE.cache.caixa.jmctArray.map(x => x.jmct));
+}
+
+/* Cockpit de Insights do concurso exibido no Volante Dinâmico:
+   soma, pares/ímpares, consecutivas, repetidas do concurso anterior,
+   e campos extras específicos (Mês da Sorte, Trevos, Time do Coração). */
+function renderInsightsCockpit(concurso) {
+  const el = document.getElementById("insightsCockpit");
+  if (!el) return;
+  const m = MPL_STATE.modalidade;
+  if (!m) { el.innerHTML = `<h3>Insights do Concurso</h3><p class="muted">Configure uma modalidade primeiro.</p>`; return; }
+  if (!concurso) { el.innerHTML = `<h3>Insights do Concurso</h3><p class="muted">Nenhum concurso na base ainda.</p>`; return; }
+
+  if (isSuperSete(m)) {
+    el.innerHTML = `<h3>Insights do Concurso</h3>
+      <div class="grid-cards"><div class="stat-card"><div class="label">Resultado por coluna</div><div class="value" style="font-size:16px;">${(concurso.dezenas || []).join(" · ")}</div></div></div>
+      <p class="muted">Métricas de paridade/consecutivas não se aplicam ao Super Sete (estrutura posicional por coluna independente).</p>`;
+    return;
+  }
+
+  const base = MPL_STATE.base;
+  const idx = base.findIndex(c => c.numero === concurso.numero);
+  const anterior = idx > 0 ? base[idx - 1] : null;
+
+  const soma = concurso.dezenas.reduce((a, b) => a + b, 0);
+  const pares = concurso.dezenas.filter(d => d % 2 === 0).length;
+  const impares = concurso.dezenas.length - pares;
+  const maxSeq = contarConsecutivasMax(concurso.dezenas);
+  const repetidas = anterior ? concurso.dezenas.filter(d => anterior.dezenas.includes(d)) : [];
+
+  const cards = [
+    card("Soma do concurso", soma),
+    card("Pares", pares),
+    card("Ímpares", impares),
+    card("Maior sequência consecutiva", maxSeq),
+    card("Repetidas do concurso anterior", anterior ? `${repetidas.length}${repetidas.length ? " (" + repetidas.map(d => String(d).padStart(2,"0")).join(", ") + ")" : ""}` : "—")
+  ];
+
+  if (m.presetKey === "diaDeSorte" && concurso.campoExtra) cards.push(card("Mês da Sorte", concurso.campoExtra));
+  if (m.presetKey === "maisMilionaria" && concurso.campoExtra) cards.push(card("Trevos da Sorte", concurso.campoExtra));
+  if (m.presetKey === "timemania" && concurso.campoExtra) cards.push(card("Time do Coração", concurso.campoExtra));
+
+  el.innerHTML = `<h3>Insights do Concurso Exibido</h3><div class="grid-cards">${cards.join("")}</div>`;
+}
+
+function renderResumoEstatisticas() {
+  const el = document.getElementById("resumoEstatisticas");
+  if (!el) return;
+  const m = MPL_STATE.modalidade;
+  if (!m) { el.innerHTML = `<h3>Resumo Estatístico</h3><p class="muted">Configure uma modalidade primeiro.</p>`; return; }
+
+  const partes = [];
+  if (MPL_STATE.cache.caixa) partes.push(`JMCT mediana: <b>${Math.round(MPL_STATE.cache.caixa.mediana)}</b> concursos`);
+  if (MPL_STATE.cache.scoresDezenas) {
+    const top5 = MPL_STATE.cache.scoresDezenas.slice(0, 5).map(d => String(d.dezena).padStart(2, "0")).join(", ");
+    partes.push(`Top 5 dezenas por STF: <b>${top5}</b>`);
+  }
+  if (MPL_STATE.cache.radar.reduzido?.length) partes.push(`Radar Reduzido atual: <b>${MPL_STATE.cache.radar.reduzido.length}</b> dezenas`);
+  if (MPL_STATE.cache.btm) partes.push(`Cobertura média do BTM: <b>${(MPL_STATE.cache.btm.coberturaMedia*100).toFixed(1)}%</b>`);
+  if (MPL_STATE.cache.ranking?.length) partes.push(`Jogos ranqueados disponíveis: <b>${MPL_STATE.cache.ranking.length.toLocaleString()}</b>`);
+
+  el.innerHTML = `<h3>Resumo Estatístico</h3>
+    ${partes.length ? `<p>${partes.join(" · ")}</p>` : `<p class="muted">Calcule a Caixa, os Scores e o Radar para ver o resumo aqui.</p>`}`;
+}
+
+function card(label, value) {
+  return `<div class="stat-card"><div class="label">${label}</div><div class="value">${value}</div></div>`;
+}
+
+/* ---------------- Glossário ---------------- */
+function renderGlossario() {
+  const termos = {
+    MPL: "Método Parametrizável de Loterias — metodologia canônica que organiza análise histórica, sem prever sorteios.",
+    PBM: "Parâmetros-Base da Modalidade (U, S, Amin, Amax, A, K).",
+    PBS: "Persistência da Base em Storage — salva a base para reutilização (IndexedDB), com restauração automática de sessão.",
+    AIB: "Atualização Incremental da Base — adiciona concursos novos sem reconstruir a base (manual ou via API).",
+    RAE: "Reprocessamento Automático Estatístico — recalcula tudo quando a base muda.",
+    VBE: "Validação da Base Estatística — verifica quantidade de dezenas, faixa válida, duplicidade e ordenação (com regra especial para o Super Sete).",
+    API: "Adaptador de API Pública (Caixa) — busca o último concurso ou concurso específico e sincroniza incrementalmente.",
+    "Volante Dinâmico": "Representação visual do volante oficial da Caixa, com cores de referência por modalidade, navegável concurso a concurso.",
+    "Cockpit de Insights": "Painel do Dashboard com soma, pares/ímpares, consecutivas, repetidas do concurso anterior e campos extras (Mês da Sorte, Trevos, Time do Coração).",
+    RECH: "Radar Estatístico de Cobertura Histórica — união das dezenas dos últimos N concursos.",
+    JMCT: "Janela Mínima de Cobertura Total — menor N que contém 100% do resultado seguinte.",
+    SIC: "Score Inicial de Camadas — mede presença por proximidade em camadas (C1..C5).",
+    SF: "Score de Frequência — mede se a dezena aparece mais/menos que o esperado (FE).",
+    SA: "Score de Ausência — mede atraso sem premiar ausência infinita.",
+    SC: "Score de Ciclo — mede ritmo histórico de reaparição.",
+    SRT: "Score de Relevância na Teia — mede força relacional (duplas/triplas, lift, centralidade).",
+    SEI: "Score Estrutural Individual — contribuição da dezena para paridade/faixas/extremos.",
+    SU: "Score do Usuário — fixas, proibidas, preferenciais, evitar, grupos, pesos manuais.",
+    STF: "Score Total Final da Dezena — soma ponderada de SIC/SF/SA/SC/SRT/SEI/SU.",
+    RQR: "Redução Qualificada — transforma Radar Ajustado em Radar Reduzido RR(K).",
+    "RR(K)": "Radar Reduzido — conjunto final de K dezenas selecionadas.",
+    RC: "Redução Combinatória — 1 - C(K,A)/C(U,A).",
+    IER: "Índice de Eficiência de Redução — cobertura relativa × RC.",
+    "Otimizador de K": "Ferramenta da aba Radar que compara vários tamanhos de K via BTM, ajudando a escolher o menor radar com cobertura histórica aceitável.",
+    GJ: "Gerador de Jogos — transforma RR(K) em Jogos Candidatos (JC).",
+    FD: "Filtros Duros — regras eliminatórias (paridade, soma, faixas, consecutivas, repetidas, fixas, proibidas, PIN, linha e coluna detalhados).",
+    PIN: "Dezena(s) que devem obrigatoriamente estar presentes em TODOS os jogos gerados.",
+    SEJ: "Score Estrutural do Jogo — paridade, faixas, soma, consecutivas, repetidas, dispersão, coerência.",
+    SUJ: "Score do Usuário no Jogo — preferências, restrições, grupos e perfil estratégico aplicados ao jogo.",
+    SCOJ: "Score de Coocorrência do Jogo — força relacional interna (duplas/triplas via teia).",
+    STJ: "Score Total do Jogo — 0,40×STF médio + 0,35×SEJ + 0,20×SCOJ + 0,05×SUJ (pesos editáveis na aba Ranking de Jogos).",
+    BTM: "Backtest Modular — valida a cobertura do radar concurso a concurso, sem vazamento temporal.",
+    BTJ: "Backtest de Jogos — valida o desempenho do Top-N de jogos ranqueados contra resultados reais.",
+    "Super Sete": "Modalidade posicional: 7 colunas independentes, cada uma com dígitos 0-9 (repetição entre colunas é normal). Tratada com regras próprias de validação, importação e exibição.",
+    PWA: "Progressive Web App — estrutura preparada para instalação como aplicativo."
+  };
+  document.getElementById("glossarioCard").innerHTML = `
+    <p class="muted">"O MPL não promete acerto, não prevê sorteios e não elimina a aleatoriedade. O método organiza dados históricos, reduz universos, ranqueia alternativas e permite validação por backtest."</p>
+    <table><thead><tr><th>Sigla</th><th>Significado</th></tr></thead><tbody>
+      ${Object.entries(termos).map(([k, v]) => `<tr><td><b>${k}</b></td><td style="text-align:left;">${v}</td></tr>`).join("")}
+    </tbody></table>`;
+}
+/* ============================================================
+   #pessoal
+   MPL — PATCH ADITIVO: RAE (Reprocessamento Automático Estatístico)
+   v1.5 — COLE ESTE BLOCO NO FINAL DE js/mpl-ui.js (não apaga nada)
+   ============================================================ */
+(function () {
+  "use strict";
+
+  let __mplFpBase = null;
+  let __mplFpConfig = null;
+  let __raeEmExecucao = false;
+  let __raeTimer = null;
+  let __raeAtivo = localStorage.getItem("mplRaeAtivo") !== "false";
+
+  function fpBase() {
+    const b = MPL_STATE.base;
+    if (!b || !b.length) return "vazia|" + (MPL_STATE.modalidade?.sigla || "?");
+    const u = b[b.length - 1];
+    return [MPL_STATE.modalidade?.sigla || "?", b.length, b[0].numero, u.numero, (u.dezenas || []).join("-")].join("|");
+  }
+  function fpConfig() {
+    const c = MPL_STATE.config;
+    try {
+      return JSON.stringify({
+        pesos: c.pesosPerfil, ativos: c.modulosAtivos, K: c.K,
+        camadas: c.camadas, jf: c.janelasFrequencia,
+        janela: c.caixaJanela, confirmada: c.caixaConfirmada,
+        su: c.su, escopo: MPL_STATE.escopo
+      });
+    } catch (e) { return String(Date.now()); }
+  }
+
+  function raeIndicador(texto, tipo) {
+    let el = document.getElementById("raeIndicador");
+    if (!el) {
+      el = document.createElement("div");
+      el.id = "raeIndicador";
+      el.style.cssText = "position:fixed;right:16px;bottom:16px;z-index:9999;font-size:12px;padding:8px 14px;border-radius:20px;border:1px solid var(--border);background:#0d1526;color:var(--muted);box-shadow:0 4px 18px rgba(0,0,0,.35);transition:opacity .3s;opacity:0;";
+      document.body.appendChild(el);
+    }
+    const cor = tipo === "ok" ? "var(--emerald)" : (tipo === "run" ? "var(--cyan)" : "var(--muted)");
+    el.style.color = cor; el.style.borderColor = cor; el.textContent = texto; el.style.opacity = "1";
+    clearTimeout(el.__t);
+    if (tipo === "ok") el.__t = setTimeout(() => { el.style.opacity = "0"; }, 2200);
+  }
+
+  function reprocessarTudo(opcoes) {
+    opcoes = opcoes || {};
+    if (__raeEmExecucao) return;
+    if (!MPL_STATE.modalidade) { if (typeof renderDashboard === "function") renderDashboard(); return; }
+    if (typeof isSuperSete === "function" && isSuperSete(MPL_STATE.modalidade) && typeof window.__reprocessarTudoSS === "function") { window.__reprocessarTudoSS(); return; }
+    const base = (typeof baseEfetiva === "function") ? baseEfetiva() : MPL_STATE.base;
+    if (!base || base.length < 20) { if (typeof renderDashboard === "function") renderDashboard(); return; }
+
+    __raeEmExecucao = true;
+    raeIndicador("RAE: recalculando…", "run");
+
+    setTimeout(function () {
+      try {
+        if (typeof calcularMCE === "function") {
+          const mce = calcularMCE(base);
+          MPL_STATE.cache.caixa = mce;
+          if (typeof renderCaixaStats === "function" && document.getElementById("caixaStatsCard")) renderCaixaStats(mce);
+        }
+        if (typeof testeJanelasFixas === "function") {
+          const tjf = testeJanelasFixas(base);
+          MPL_STATE.cache.tjf = tjf;
+          if (typeof renderTJFTable === "function" && document.getElementById("tjfTable")) renderTJFTable(tjf);
+        }
+        if (typeof renderCaixaRBCard === "function" && document.getElementById("caixaRBCard")) renderCaixaRBCard();
+
+        const pack = gerarRankingDezenas(base, MPL_STATE.modalidade, MPL_STATE.config);
+        MPL_STATE.cache.scoresDezenas = pack.ranking;
+        MPL_STATE.cache.teia = pack.teia;
+        if (typeof renderRankingDezenas === "function" && document.getElementById("rankingDezenasTable")) renderRankingDezenas(pack.ranking);
+        if (typeof renderTeia === "function" && document.getElementById("topDuplasTable")) renderTeia(pack.teia, pack.ranking);
+
+        const m = MPL_STATE.modalidade;
+        const cfg = MPL_STATE.config;
+        let janela = cfg.caixaJanela;
+        if (!cfg.caixaConfirmada || !janela) janela = janela || (MPL_STATE.cache.caixa ? Math.round(MPL_STATE.cache.caixa.mediana) : 20);
+        const rb = gerarRadarBruto(base, janela);
+        const ra = pack.ranking.filter(function (r) { return rb.includes(r.dezena) && !cfg.su.proibidas.includes(r.dezena); });
+        let K = cfg.K;
+        if (ra.length < K) K = ra.length;
+        const rr = gerarRR(ra, K, cfg.su.fixas, cfg.su.proibidas);
+        MPL_STATE.cache.radar = { bruto: rb, ajustado: ra.map(function (r) { return r.dezena; }), reduzido: rr };
+        atualizarResumoRadarAuto(rb, ra, rr, K, janela);
+
+        MPL_STATE.cache.jogos = [];
+        MPL_STATE.cache.jogosAprovados = [];
+        MPL_STATE.cache.ranking = [];
+        MPL_STATE.cache.rankingExibicao = [];
+
+        if (typeof renderDashboard === "function") renderDashboard();
+        raeIndicador("RAE: atualizado ✓", "ok");
+      } catch (e) {
+        console.error("RAE — falha ao reprocessar:", e);
+        raeIndicador("RAE: erro (ver console)", "err");
+      } finally {
+        __raeEmExecucao = false;
+        __mplFpBase = fpBase();
+        __mplFpConfig = fpConfig();
+      }
+    }, opcoes.delay != null ? opcoes.delay : 30);
+  }
+
+  function atualizarResumoRadarAuto(rb, ra, rr, K, janela) {
+    const el = document.getElementById("radarResult");
+    if (!el) return;
+    const m = MPL_STATE.modalidade;
+    const A = MPL_STATE.config.A || m.dezenasSorteadas;
+    const rc = calcularRC(K, A, m.universo);
+    el.innerHTML =
+      '<div class="alert alert-ok">Radar recalculado automaticamente (RAE) a partir da configuração atual. Para gerar jogos, use a aba <b>Gerador de Jogos</b>.</div>' +
+      '<h3>RR(K) — Radar Reduzido (K=' + K + ', janela da Caixa=' + janela + ')</h3>' +
+      '<div style="margin:8px 0;">' +
+      rr.map(function (d) { return '<span class="pill">' + String(d.dezena).padStart(2, "0") + ' · ' + d.STF.toFixed(0) + '</span>'; }).join(" ") +
+      '</div><div class="grid-cards">' +
+      card2("RB (Radar Bruto)", rb.length) + card2("RA (Radar Ajustado)", ra.length) +
+      card2("RR (Reduzido)", rr.length) + card2("RC — Redução Combinatória", (rc * 100).toFixed(3) + "%") +
+      '</div>';
+  }
+  function card2(label, value) {
+    return '<div class="stat-card"><div class="label">' + label + '</div><div class="value">' + value + '</div></div>';
+  }
+
+  function agendarRAE(motivo, delay) {
+    if (!__raeAtivo) return;
+    clearTimeout(__raeTimer);
+    __raeTimer = setTimeout(function () { reprocessarTudo({ delay: 10 }); }, delay != null ? delay : 350);
+  }
+
+  function iniciarWatcherRAE() {
+    __mplFpBase = fpBase();
+    __mplFpConfig = fpConfig();
+    setInterval(function () {
+      if (!__raeAtivo || __raeEmExecucao || !MPL_STATE.modalidade) return;
+      const nb = fpBase(), nc = fpConfig();
+      if (nb !== __mplFpBase || nc !== __mplFpConfig) { __mplFpBase = nb; __mplFpConfig = nc; agendarRAE("watcher"); }
+    }, 900);
+  }
+
+  function ligarGatilhosDiretos() {
+    ["btnImportar", "btnCarregarBase", "btnSalvarBase", "btnAtualizarAPI"].forEach(function (id) {
+      const b = document.getElementById(id);
+      if (b) b.addEventListener("click", function () { agendarRAE(id, 700); });
+    });
+    ["btnAplicarPesos", "btnAplicarEscopo", "btnSalvarSU", "btnConfirmarCaixa", "btnSalvarModalidade"].forEach(function (id) {
+      const b = document.getElementById(id);
+      if (b) b.addEventListener("click", function () { agendarRAE(id, 200); });
+    });
+  }
+
+  function injetarToggleRAE() {
+    const header = document.querySelector(".mpl-header");
+    if (!header || document.getElementById("raeToggleWrap")) return;
+    const wrap = document.createElement("label");
+    wrap.id = "raeToggleWrap";
+    wrap.style.cssText = "display:flex;align-items:center;gap:6px;margin:0 0 0 14px;font-size:12px;color:var(--muted);cursor:pointer;";
+    wrap.innerHTML = '<input type="checkbox" id="raeToggle" style="width:auto;margin:0;" ' + (__raeAtivo ? "checked" : "") + '><span title="Reprocessamento Automático Estatístico">RAE Auto</span>';
+    const badge = document.getElementById("scopeBadge");
+    if (badge && badge.parentNode) badge.parentNode.insertBefore(wrap, badge);
+    else header.appendChild(wrap);
+    document.getElementById("raeToggle").addEventListener("change", function (e) {
+      __raeAtivo = e.target.checked;
+      localStorage.setItem("mplRaeAtivo", __raeAtivo ? "true" : "false");
+      raeIndicador(__raeAtivo ? "RAE ligado" : "RAE desligado", __raeAtivo ? "ok" : "err");
+      if (__raeAtivo) agendarRAE("toggle", 50);
+    });
+  }
+
+  function bootRAE() {
+    injetarToggleRAE();
+    ligarGatilhosDiretos();
+    iniciarWatcherRAE();
+    if (__raeAtivo && MPL_STATE.modalidade && MPL_STATE.base && MPL_STATE.base.length >= 20) agendarRAE("boot", 600);
+  }
+
+  window.reprocessarTudo = reprocessarTudo;
+  window.agendarRAE = agendarRAE;
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", function () { setTimeout(bootRAE, 400); });
+  } else {
+    setTimeout(bootRAE, 400);
+  }
+})();
+/* ============================================================
+   #pessoal
+   MPL — PATCH A (Super Sete) — RENDER DE SCORES POR COLUNA
+   Append-only. Intercepta renderRankingDezenas apenas quando há
+   scores posicionais em cache (MPL_STATE.cache.scoresSuperSete).
+   ============================================================ */
+(function () {
+  "use strict";
+
+  function renderRankingSuperSete(colunas) {
+    const nomeCol = i => "Coluna " + (i + 1);
+    const cards = colunas.map(col => {
+      const linhas = col.ranking.map((r, i) =>
+        `<tr>
+          <td>${i + 1}</td>
+          <td><b>${r.digito}</b></td>
+          <td>${r.STF.toFixed(1)}</td>
+          <td>${r.classe}</td>
+          <td>${r.SF.toFixed(0)}</td>
+          <td>${r.SA.toFixed(0)}</td>
+          <td>${r.SC.toFixed(0)}</td>
+          <td>${r.ausencia}</td>
+        </tr>`).join("");
+      return `<div class="stat-card" style="min-width:230px;">
+        <h3 style="margin-top:0;">${nomeCol(col.coluna)}</h3>
+        <div class="table-wrap" style="max-height:none;">
+          <table>
+            <tr><th>#</th><th>Díg.</th><th class="sortable">STF</th><th>Cl.</th><th>SF</th><th>SA</th><th>SC</th><th>Aus.</th></tr>
+            ${linhas}
+          </table>
+        </div>
+      </div>`;
+    }).join("");
+
+    document.getElementById("rankingDezenasTable").innerHTML =
+      `<div class="info-box">Super Sete é <b>posicional</b>: cada uma das 7 colunas sorteia 1 dígito (0–9), e o mesmo dígito pode repetir entre colunas. Por isso os scores são calculados <b>por coluna</b> — não existe um ranking único de dezenas.</div>
+       <div class="row-flex" style="align-items:flex-start;">${cards}</div>`;
+  }
+
+  // monkey-patch: mantém o render original para todas as modalidades;
+  // só desvia quando há scores posicionais do Super Sete em cache.
+  const __origRenderRankingDezenas = renderRankingDezenas;
+  renderRankingDezenas = function (ranking) {
+    if (MPL_STATE.cache && MPL_STATE.cache.scoresSuperSete) {
+      return renderRankingSuperSete(MPL_STATE.cache.scoresSuperSete);
+    }
+    return __origRenderRankingDezenas(ranking);
+  };
+})();
+/* ============================================================
+   #pessoal
+   MPL — PATCH B (Super Sete) — RADAR POR COLUNA + GERADOR CARTESIANO (UI)
+   Append-only. Ativa apenas quando isSuperSete(modalidade).
+   ============================================================ */
+(function () {
+  "use strict";
+
+  if (MPL_STATE.config.ssDigitosPorColuna == null) MPL_STATE.config.ssDigitosPorColuna = 2;
+
+  function scoresColunas() {
+    if (MPL_STATE.cache && MPL_STATE.cache.scoresSuperSete) return MPL_STATE.cache.scoresSuperSete;
+    const base = baseEfetiva();
+    if (!base || base.length < 20) return null;
+    const pack = gerarRankingSuperSete(base, MPL_STATE.modalidade, MPL_STATE.config);
+    MPL_STATE.cache.scoresDezenas = pack.ranking;
+    MPL_STATE.cache.scoresSuperSete = pack.colunas;
+    return pack.colunas;
+  }
+
+  function computeRadarSS(N) {
+    const colunas = scoresColunas();
+    if (!colunas) return null;
+    const radar = colunas.map(col => {
+      const top = col.ranking.slice(0, Math.max(1, Math.min(10, N)));
+      return { coluna: col.coluna, digitos: top.map(t => ({ digito: t.digito, STF: t.STF })) };
+    });
+    MPL_STATE.cache.radarSuperSete = radar;
+    return radar;
+  }
+
+  function totalCombos(radar) { return radar.reduce((a, c) => a * c.digitos.length, 1); }
+
+  function renderRadarResumoSS(radar) {
+    const el = document.getElementById("radarResult"); if (!el) return;
+    const chips = radar.map(c => {
+      const ds = c.digitos.map(d => `<span class="pill">${d.digito} · ${d.STF.toFixed(0)}</span>`).join(" ");
+      return `<div style="margin-bottom:6px;"><b>Coluna ${c.coluna + 1}:</b> ${ds}</div>`;
+    }).join("");
+    const total = totalCombos(radar);
+    el.innerHTML =
+      `<div class="info-box">Radar <b>posicional</b> do Super Sete: os dígitos selecionados por coluna. A geração combina 1 dígito de cada coluna (produto cartesiano) — um mesmo dígito pode repetir entre colunas.</div>
+       ${chips}
+       <div class="grid-cards">
+         <div class="stat-card"><div class="label">Dígitos por coluna</div><div class="value">${MPL_STATE.config.ssDigitosPorColuna}</div></div>
+         <div class="stat-card"><div class="label">Jogos possíveis (produto)</div><div class="value">${total.toLocaleString()}</div></div>
+       </div>`;
+  }
+
+  function renderRadarSuperSete() {
+    const form = document.getElementById("radarForm");
+    form.innerHTML =
+      `<h3>Radar Posicional — Super Sete</h3>
+       <label>Dígitos por coluna (top-N por STF)</label>
+       <input type="number" id="ssRadarN" min="1" max="10" value="${MPL_STATE.config.ssDigitosPorColuna}">
+       <button id="btnRadarSS" class="btn-primary">Montar Radar por Coluna</button>
+       <div class="info-box">Diferente das demais modalidades, o Super Sete não tem um K único: cada coluna tem seu próprio conjunto de dígitos candidatos.</div>`;
+    document.getElementById("btnRadarSS").addEventListener("click", () => {
+      const N = Number(document.getElementById("ssRadarN").value) || 2;
+      MPL_STATE.config.ssDigitosPorColuna = N;
+      const radar = computeRadarSS(N);
+      if (!radar) return alert("Calcule os scores primeiro (aba Scores).");
+      renderRadarResumoSS(radar);
+      renderDashboard();
+    });
+    const bt = document.getElementById("radarBacktestCard");
+    if (bt) bt.innerHTML = `<div class="info-box">BTM/Otimizador de K não se aplicam ao Super Sete (modalidade posicional). Validação por coluna é prevista para evolução futura.</div>`;
+    if (MPL_STATE.cache && MPL_STATE.cache.scoresSuperSete) {
+      const radar = computeRadarSS(MPL_STATE.config.ssDigitosPorColuna);
+      if (radar) renderRadarResumoSS(radar);
+    }
+  }
+
+  function renderGeradorSuperSete() {
+    const form = document.getElementById("geradorForm");
+    form.innerHTML =
+      `<h3>Gerador Posicional — Super Sete</h3>
+       <label>Dígitos por coluna</label>
+       <input type="number" id="ssGenN" min="1" max="10" value="${MPL_STATE.config.ssDigitosPorColuna}">
+       <label>Limite de jogos (proteção)</label>
+       <input type="number" id="ssGenLimite" min="1" value="50000">
+       <button id="btnGenSS" class="btn-primary">Gerar Jogos (produto cartesiano)</button>
+       <div class="info-box">A geração escolhe 1 dígito por coluna, combinando as colunas entre si. Não são séries sequenciais: cada coluna é independente e um dígito pode repetir entre colunas.</div>`;
+    document.getElementById("btnGenSS").addEventListener("click", () => {
+      const N = Number(document.getElementById("ssGenN").value) || 2;
+      const limite = Number(document.getElementById("ssGenLimite").value) || 50000;
+      MPL_STATE.config.ssDigitosPorColuna = N;
+      const radar = computeRadarSS(N);
+      if (!radar) return alert("Calcule os scores primeiro (aba Scores).");
+      const listas = radar.map(c => c.digitos.map(d => d.digito));
+      const { jogos, total } = gerarJogosSuperSete(listas, limite);
+      MPL_STATE.cache.jogos = jogos;
+      MPL_STATE.cache.jogosAprovados = jogos; // filtros de conjunto não se aplicam ao SS
+      const base = baseEfetiva();
+      const ranq = ranquearJogos(jogos, MPL_STATE.cache.scoresDezenas, MPL_STATE.cache.teia,
+        MPL_STATE.modalidade, base, MPL_STATE.config.su, MPL_STATE.config.stjPesos);
+      MPL_STATE.cache.ranking = ranq;
+      MPL_STATE.cache.rankingExibicao = ranq.slice();
+      const amostra = jogos.slice(0, 12).map(j => `<span class="pill">${j.join(" · ")}</span>`).join(" ");
+      document.getElementById("geradorResult").innerHTML =
+        `<div class="alert alert-ok">Gerados ${jogos.length.toLocaleString()} de ${total.toLocaleString()} jogos possíveis (produto cartesiano por coluna).</div>
+         <div style="margin:8px 0;">${amostra}</div>
+         <div class="muted">Veja o ranking completo na aba <b>Ranking de Jogos</b> (ordenado por STF médio das colunas).</div>`;
+      if (typeof renderRankingJogos === "function") renderRankingJogos(MPL_STATE.cache.rankingExibicao);
+      renderDashboard();
+    });
+  }
+
+  /* ---- Reprocessamento SS (usado pelo RAE via window.__reprocessarTudoSS) ---- */
+  window.__reprocessarTudoSS = function () {
+    const m = MPL_STATE.modalidade;
+    const base = baseEfetiva();
+    if (!base || base.length < 20) { if (typeof renderDashboard === "function") renderDashboard(); return; }
+    try {
+      const pack = gerarRankingDezenas(base, m, MPL_STATE.config); // SS-aware (Patch A)
+      MPL_STATE.cache.scoresDezenas = pack.ranking;
+      MPL_STATE.cache.scoresSuperSete = pack.colunas;
+      MPL_STATE.cache.teia = pack.teia;
+      if (typeof renderRankingDezenas === "function" && document.getElementById("rankingDezenasTable"))
+        renderRankingDezenas(pack.ranking);
+      const radar = computeRadarSS(MPL_STATE.config.ssDigitosPorColuna);
+      if (radar && document.getElementById("radarResult")) renderRadarResumoSS(radar);
+      MPL_STATE.cache.jogos = []; MPL_STATE.cache.jogosAprovados = [];
+      MPL_STATE.cache.ranking = []; MPL_STATE.cache.rankingExibicao = [];
+      if (typeof renderDashboard === "function") renderDashboard();
+    } catch (e) { console.error("RAE-SS erro:", e); }
+  };
+
+  /* ---- Monkey-patch dos renders de formulário (Radar/Gerador) ---- */
+  /* t11-C3 Fase 4: p20 — reescreve o form antes dos demais módulos */
+  if (typeof mplOn === "function") {
+    mplOn("radar:form", function () {
+      if (MPL_STATE.modalidade && typeof isSuperSete === "function" && isSuperSete(MPL_STATE.modalidade)) renderRadarSuperSete();
+    }, 20);
+    mplOn("gerador:form", function () {
+      if (MPL_STATE.modalidade && typeof isSuperSete === "function" && isSuperSete(MPL_STATE.modalidade)) renderGeradorSuperSete();
+    }, 20);
+  }
+
+  /* ---- Re-render ao aplicar preset e ao trocar de aba ---- */
+  const btnPreset = document.getElementById("btnAplicarPreset");
+  if (btnPreset) btnPreset.addEventListener("click", () => setTimeout(() => { renderRadarForm(); renderGeradorForm(); }, 80));
+  document.querySelectorAll(".tab-btn").forEach(b => {
+    b.addEventListener("click", () => {
+      if (b.dataset.tab === "radar") renderRadarForm();
+      if (b.dataset.tab === "gerador") renderGeradorForm();
+    });
+  });
+
+  /* ---- Se a sessão já iniciar em Super Sete, aplica os renders ---- */
+  setTimeout(() => {
+    if (MPL_STATE.modalidade && typeof isSuperSete === "function" && isSuperSete(MPL_STATE.modalidade)) {
+      renderRadarForm(); renderGeradorForm();
+    }
+  }, 700);
+})();
+/* ============================================================
+   #pessoal
+   MPL — MODO HÍBRIDO (DZC) — UI no Gerador de Jogos
+   Toggle + campos (dz do radar / dz coringas / origem). Append-only.
+   Não aparece no Super Sete (posicional).
+   ============================================================ */
+(function () {
+  "use strict";
+
+  function ehSuperSete() {
+    return MPL_STATE.modalidade && typeof isSuperSete === "function" && isSuperSete(MPL_STATE.modalidade);
+  }
+
+  function montarPainelHibrido() {
+    const form = document.getElementById("geradorForm");
+    if (!form || ehSuperSete() || document.getElementById("dzcWrap")) return;
+
+    const div = document.createElement("div");
+    div.id = "dzcWrap";
+    div.style.marginTop = "14px";
+    div.innerHTML =
+      `<hr style="border-color:var(--border);opacity:.4;">
+       <div class="checkbox-row">
+         <input type="checkbox" id="dzcAtivo">
+         <label for="dzcAtivo" style="margin:0;"><b>Ativar Modo Híbrido (DZC — Dezenas Coringas)</b></label>
+       </div>
+       <div id="dzcPanel" style="display:none;">
+         <div class="info-box">Monta jogos com parte das dezenas <b>dentro</b> do Radar Reduzido (URR) e parte <b>fora</b> dele (UEX). Coringas são dezenas que o método considerou de menor relevância (STF baixo): aumentam <b>diversidade/cobertura</b>, mas <b>não elevam a relevância estatística</b> do jogo.</div>
+         <div class="row-flex">
+           <div>
+             <label>Dezenas do Radar (URR)</label>
+             <input type="number" id="dzcRadar" min="0" value="5">
+           </div>
+           <div>
+             <label>Dezenas Coringas (UEX)</label>
+             <input type="number" id="dzcCoringa" min="0" value="1">
+           </div>
+           <div>
+             <label>Origem das coringas</label>
+             <select id="dzcOrigem">
+               <option value="aleatoria">Aleatória (entre as excluídas)</option>
+               <option value="stf">Por STF (as "menos fracas" de fora)</option>
+             </select>
+           </div>
+         </div>
+         <div class="row-flex">
+           <div>
+             <label>Quantidade de jogos</label>
+             <input type="number" id="dzcQtd" min="1" value="20">
+           </div>
+           <div>
+             <label>Seed (reprodutibilidade)</label>
+             <input type="number" id="dzcSeed" value="42">
+           </div>
+         </div>
+         <div id="dzcInfo" class="muted" style="margin:6px 0;"></div>
+         <button id="btnGerarHibrido" class="btn-primary">Gerar Jogos Híbridos (DZC)</button>
+         <div id="dzcResult" style="margin-top:10px;"></div>
+       </div>`;
+    form.appendChild(div);
+
+    document.getElementById("dzcAtivo").addEventListener("change", function (e) {
+      document.getElementById("dzcPanel").style.display = e.target.checked ? "block" : "none";
+      atualizarInfoHibrido();
+    });
+    ["dzcRadar", "dzcCoringa", "dzcOrigem"].forEach(id => {
+      const el = document.getElementById(id);
+      if (el) el.addEventListener("input", atualizarInfoHibrido);
+    });
+
+    document.getElementById("btnGerarHibrido").addEventListener("click", gerarHibrido);
+    atualizarInfoHibrido();
+  }
+
+  function universos() {
+    const rr = (MPL_STATE.cache.radar.reduzido || []).map(d => d.dezena);
+    const U = MPL_STATE.modalidade.universo;
+    const proibidas = MPL_STATE.config.su.proibidas || [];
+    const rrSet = new Set(rr);
+    const uex = [];
+    for (let d = 1; d <= U; d++) {
+      if (!rrSet.has(d) && !proibidas.includes(d)) uex.push(d);
+    }
+    return { urr: rr, uex };
+  }
+
+  function atualizarInfoHibrido() {
+    const infoEl = document.getElementById("dzcInfo");
+    if (!infoEl) return;
+    const { urr, uex } = universos();
+    const nR = Number(document.getElementById("dzcRadar").value) || 0;
+    const nC = Number(document.getElementById("dzcCoringa").value) || 0;
+    const A = nR + nC;
+    infoEl.innerHTML =
+      `URR disponível: <b>${urr.length}</b> · UEX disponível: <b>${uex.length}</b> · ` +
+      `Cada jogo terá <b>A = ${A}</b> dezenas (${nR} do radar + ${nC} coringas).`;
+  }
+
+  function gerarHibrido() {
+    if (ehSuperSete()) return;
+    if (!MPL_STATE.cache.radar.reduzido || !MPL_STATE.cache.radar.reduzido.length) {
+      return alert("Gere o Radar Reduzido primeiro (aba Radar Reduzido).");
+    }
+    const { urr, uex } = universos();
+    const nR = Number(document.getElementById("dzcRadar").value) || 0;
+    const nC = Number(document.getElementById("dzcCoringa").value) || 0;
+    const A = nR + nC;
+    const qtd = Number(document.getElementById("dzcQtd").value) || 20;
+    const seed = Number(document.getElementById("dzcSeed").value) || 42;
+    const origem = document.getElementById("dzcOrigem").value;
+
+    if (A < 1) return alert("A soma (radar + coringas) deve ser pelo menos 1.");
+    if (nR > urr.length) return alert(`Você pediu ${nR} dezenas do radar, mas o URR só tem ${urr.length}.`);
+    if (nC > uex.length) return alert(`Você pediu ${nC} coringas, mas o UEX só tem ${uex.length}.`);
+
+    // Pool de coringas conforme a origem escolhida
+    let poolCoringa = uex.slice();
+    if (origem === "stf" && MPL_STATE.cache.scoresDezenas) {
+      const mapaSTF = {};
+      MPL_STATE.cache.scoresDezenas.forEach(d => { mapaSTF[d.dezena] = d.STF; });
+      poolCoringa = uex.slice().sort((a, b) => (mapaSTF[b] || 0) - (mapaSTF[a] || 0));
+      const tamPool = Math.max(nC * 4, 10);
+      poolCoringa = poolCoringa.slice(0, Math.min(tamPool, uex.length)); // "menos fracas" de fora
+    }
+
+    const { jogos, motivo } = gerarJogosHibridos(urr, poolCoringa, nR, nC, qtd, seed);
+    if (motivo) return alert(motivo);
+
+    MPL_STATE.cache.jogos = jogos;
+    MPL_STATE.config.A = A;
+
+    const amostra = jogos.slice(0, 12)
+      .map(j => `<span class="pill">${j.map(d => String(d).padStart(2, "0")).join(" ")}</span>`).join(" ");
+    document.getElementById("dzcResult").innerHTML =
+      `<div class="alert alert-ok">Gerados <b>${jogos.length}</b> jogos híbridos (${nR} do radar + ${nC} coringas · origem: ${origem === "stf" ? "por STF" : "aleatória"}).</div>
+       <div style="margin:8px 0;">${amostra}</div>
+       <div class="muted">Agora aplique os <b>Filtros</b> e depois o <b>Ranking de Jogos</b> normalmente. Lembre-se: coringas tendem a reduzir o STF médio do jogo — é o trade-off consciente de diversificação.</div>`;
+
+    if (typeof renderDashboard === "function") renderDashboard();
+  }
+
+  /* t11-C3 Fase 4 */
+  if (typeof mplOn === "function") {
+    mplOn("gerador:form", function () { setTimeout(montarPainelHibrido, 30); }, 40);
+  }
+
+  /* Reanexa ao entrar na aba Gerador */
+  document.querySelectorAll(".tab-btn").forEach(b => {
+    b.addEventListener("click", () => {
+      if (b.dataset.tab === "gerador") setTimeout(montarPainelHibrido, 40);
+    });
+  });
+
+  /* Primeira montagem se já iniciar na aba/modalidade certa */
+  setTimeout(montarPainelHibrido, 900);
+})();
+/* ============================================================
+   #pessoal
+   MPL — PATCH E (Dupla Sena) — UI: DOIS VOLANTES + SELETOR DE SORTEIO
+   COLE ESTE BLOCO NO FINAL DE js/mpl-ui.js — não apaga nada.
+
+   O que este bloco faz:
+   1) Injeta no cabeçalho um seletor "Sorteio ativo: 1º / 2º", visível
+      só quando a modalidade for Dupla Sena. Essa escolha decide qual
+      sorteio alimenta Caixa/Scores/Radar/Gerador/Filtros/Ranking/
+      Backtest — os dois pipelines nunca se misturam (Opção B).
+   2) Intercepta baseEfetiva() — ponto único por onde quase todo o app
+      já busca a base — trocando "dezenas" por "dezenas2" quando o
+      sorteio ativo for o 2º. Como consequência, NENHUMA outra função
+      (mpl-statistics.js, mpl-scoring.js, mpl-games.js, mpl-backtest.js)
+      precisa ser tocada: todas já recebem a base pelo baseEfetiva().
+   3) No Dashboard, cria um segundo Volante Dinâmico ("2º Sorteio") ao
+      lado do primeiro, sempre visível para Dupla Sena, navegando em
+      sincronia com o volante do 1º sorteio.
+   4) Acrescenta a coluna "2º Sorteio" na tabela de Base Histórica.
+   ============================================================ */
+(function () {
+  "use strict";
+
+  function ehDuplaSena() {
+    return typeof isDuplaSena === "function" && MPL_STATE.modalidade && isDuplaSena(MPL_STATE.modalidade);
+  }
+
+  /* ---------- 2) baseEfetiva: troca dezenas <-> dezenas2 ---------- */
+  var __origBaseEfetiva = baseEfetiva;
+  baseEfetiva = function () {
+    var base = __origBaseEfetiva();
+    if (!ehDuplaSena()) return base;
+    var sorteio = MPL_STATE.config.duplaSenaSorteioAtivo || 1;
+    if (sorteio === 1) return base; // dezenas já é o 1º sorteio, nada a fazer
+    return base
+      .filter(function (c) { return Array.isArray(c.dezenas2) && c.dezenas2.length; })
+      .map(function (c) {
+        var novo = {};
+        for (var k in c) novo[k] = c[k];
+        novo.dezenas = c.dezenas2;
+        return novo;
+      });
+  };
+
+  /* ---------- 1) Seletor "Sorteio ativo" no cabeçalho ---------- */
+  function injetarSeletorSorteio() {
+    var badge = document.getElementById("scopeBadge");
+    if (!badge) return;
+    var existente = document.getElementById("duplaSenaSorteioWrap");
+    if (!ehDuplaSena()) { if (existente) existente.remove(); return; }
+    if (existente) return; // já injetado
+
+    if (MPL_STATE.config.duplaSenaSorteioAtivo == null) MPL_STATE.config.duplaSenaSorteioAtivo = 1;
+
+    var wrap = document.createElement("label");
+    wrap.id = "duplaSenaSorteioWrap";
+    wrap.style.cssText = "display:flex;align-items:center;gap:6px;margin:0 14px 0 0;font-size:12px;color:var(--muted);";
+    wrap.innerHTML =
+      'Sorteio ativo (análise): ' +
+      '<select id="duplaSenaSorteioSelect" style="width:auto;margin:0;padding:4px 8px;">' +
+      '<option value="1">1º sorteio</option>' +
+      '<option value="2">2º sorteio</option>' +
+      '</select>';
+    badge.parentNode.insertBefore(wrap, badge);
+
+    document.getElementById("duplaSenaSorteioSelect").value = String(MPL_STATE.config.duplaSenaSorteioAtivo);
+    document.getElementById("duplaSenaSorteioSelect").addEventListener("change", function (e) {
+      MPL_STATE.config.duplaSenaSorteioAtivo = Number(e.target.value);
+      // zera caches da análise anterior para não misturar sorteios sem querer
+      MPL_STATE.cache.caixa = null; MPL_STATE.cache.tjf = null;
+      MPL_STATE.cache.scoresDezenas = null; MPL_STATE.cache.teia = null;
+      MPL_STATE.cache.radar = { bruto: [], ajustado: [], reduzido: [] };
+      MPL_STATE.cache.jogos = []; MPL_STATE.cache.jogosAprovados = [];
+      MPL_STATE.cache.ranking = []; MPL_STATE.cache.rankingExibicao = [];
+      MPL_STATE.cache.btm = null; MPL_STATE.cache.btj = null;
+      if (typeof renderDashboard === "function") renderDashboard();
+      if (typeof agendarRAE === "function") agendarRAE("sorteio-ativo", 100);
+      alert("Sorteio ativo alterado para o " + e.target.value + "º sorteio. Recalcule Caixa/Scores/Radar (ou aguarde o RAE automático, se estiver ligado).");
+    });
+  }
+
+  /* ---------- 3) Segundo volante no Dashboard ---------- */
+  function montarCardSegundoVolante() {
+    var primeiroCard = document.getElementById("volanteDashboard");
+    if (!primeiroCard) return null;
+    var card2 = document.getElementById("volanteDashboardCard2");
+    if (!ehDuplaSena()) { if (card2) card2.remove(); return null; }
+    if (!card2) {
+      card2 = document.createElement("div");
+      card2.className = "card";
+      card2.id = "volanteDashboardCard2";
+      card2.innerHTML = '<h3>Volante Dinâmico — 2º Sorteio</h3><div id="volanteDashboard2"></div>';
+      var cardPai = primeiroCard.closest(".card");
+      if (cardPai && cardPai.parentNode) cardPai.parentNode.insertBefore(card2, cardPai.nextSibling);
+    }
+    return card2;
+  }
+
+  function renderSegundoSorteioDashboard(concurso) {
+    if (!ehDuplaSena()) return;
+    montarCardSegundoVolante();
+    var m = MPL_STATE.modalidade;
+    if (!concurso) {
+      var elVazio = document.getElementById("volanteDashboard2");
+      if (elVazio) elVazio.innerHTML = '<p class="muted">Nenhum concurso na base ainda.</p>';
+      return;
+    }
+    if (!Array.isArray(concurso.dezenas2) || !concurso.dezenas2.length) {
+      var el = document.getElementById("volanteDashboard2");
+      if (el) el.innerHTML = '<p class="muted">Este concurso ainda não possui o 2º sorteio importado.</p>';
+      return;
+    }
+    var concurso2 = {};
+    for (var k in concurso) concurso2[k] = concurso[k];
+    concurso2.dezenas = concurso.dezenas2;
+    renderVolante("volanteDashboard2", m, concurso2, { navegacao: false });
+  }
+
+  /* Espelha a navegação do 1º volante no 2º: adiciona um segundo
+     listener nos mesmos botões (roda depois do listener original,
+     que já atualizou MPL_STATE.ui.volanteDashboardAtual). */
+  function sincronizarNavegacaoVolantes() {
+    var primeiro = document.getElementById("volanteDashboard");
+    if (!primeiro || !ehDuplaSena()) return;
+    primeiro.querySelectorAll("[data-nav]").forEach(function (btn) {
+      btn.addEventListener("click", function () {
+        renderSegundoSorteioDashboard(MPL_STATE.ui.volanteDashboardAtual);
+      });
+    });
+    var inputIr = document.getElementById("volanteDashboard_input");
+    if (inputIr) {
+      var btnIr = primeiro.querySelector('[data-nav="ir"]');
+      if (btnIr) btnIr.addEventListener("click", function () {
+        setTimeout(function () { renderSegundoSorteioDashboard(MPL_STATE.ui.volanteDashboardAtual); }, 0);
+      });
+    }
+  }
+
+  function __dsDashboardHook() {
+    injetarSeletorSorteio();
+    if (ehDuplaSena()) {
+      var concursoAtual = MPL_STATE.ui.volanteDashboardAtual ||
+        (MPL_STATE.base.length ? MPL_STATE.base[MPL_STATE.base.length - 1] : null);
+      renderSegundoSorteioDashboard(concursoAtual);
+      sincronizarNavegacaoVolantes();
+    } else {
+      var card2 = document.getElementById("volanteDashboardCard2");
+      if (card2) card2.remove();
+    }
+  }
+  if (typeof mplOn === "function") mplOn("dashboard", __dsDashboardHook, 40);
+
+  /* ---------- 4) Coluna extra na tabela de Base Histórica ---------- */
+  var __origRenderBaseTable = renderBaseTable;
+  renderBaseTable = function () {
+    if (!ehDuplaSena()) return __origRenderBaseTable();
+    var el = document.getElementById("baseTable");
+    var ultimos = MPL_STATE.base.slice(-30).reverse();
+    if (!ultimos.length) { el.innerHTML = '<p class="muted">Nenhum concurso na base.</p>'; return; }
+    el.innerHTML = "<table><thead><tr><th>Concurso</th><th>Data</th><th>1º Sorteio</th><th>2º Sorteio</th></tr></thead><tbody>" +
+      ultimos.map(function (c) {
+        var d2 = (Array.isArray(c.dezenas2) && c.dezenas2.length) ? c.dezenas2.join(" ") : '<span class="muted">pendente</span>';
+        return "<tr><td>" + c.numero + "</td><td>" + (c.data || "-") + "</td><td>" + c.dezenas.join(" ") + "</td><td>" + d2 + "</td></tr>";
+      }).join("") + "</tbody></table>";
+  };
+})();
+/* ============================================================
+   #pessoal
+   MPL — PATCH F (Dupla Sena) — CORREÇÃO: sincronização dos 2 volantes
+   parava de funcionar após 1 clique nos botões de navegação.
+   COLE ESTE BLOCO NO FINAL DE js/mpl-ui.js — DEPOIS do Patch E
+   (PATCH-mpl-ui-DuplaSena.js). Não apaga nada, só corrige o bug.
+
+   Causa raiz: o patch anterior anexava um "escutador extra" direto
+   nos botões (◀▶Ir) do 1º volante. Só que a cada clique, a função
+   original de navegação REDESENHA e RECRIA esses botões do zero —
+   então o escutador extra, colado no botão antigo, deixava de existir
+   já no clique seguinte. Por isso funcionava 1 vez e parava.
+
+   Correção: em vez de escutar o botão (descartável), agora envolvemos
+   o callback `onNavigate` que a função de navegação usa internamente
+   — esse callback pertence ao mesmo objeto de opções reaproveitado em
+   TODOS os cliques (não é recriado), então a sincronização passa a
+   sobreviver a qualquer quantidade de navegações.
+   ============================================================ */
+(function () {
+  "use strict";
+
+  function ehDuplaSena2() {
+    return typeof isDuplaSena === "function" && MPL_STATE.modalidade && isDuplaSena(MPL_STATE.modalidade);
+  }
+
+  /* t11-C3 Fase 3: hook dispara a cada render do volante do Dashboard,
+     inclusive após navegação — não depende mais de opcoes.onNavigate */
+  if (typeof mplOn === "function") {
+    mplOn("volante", function (containerId, modalidade, concurso) {
+      if (containerId !== "volanteDashboard" || !ehDuplaSena2()) return;
+      renderSegundoSorteioDashboardDS(concurso);
+    }, 50);
+  }
+
+  /* Renomeada para não colidir com a função homônima do patch anterior
+     (que continua existindo, mas agora é chamada só a partir daqui e
+     do render inicial do Dashboard — nunca mais via listener de botão). */
+  window.renderSegundoSorteioDashboardDS = function (concurso) {
+    if (!ehDuplaSena2()) return;
+    if (typeof montarCardSegundoVolante === "function") montarCardSegundoVolante();
+    if (!concurso) {
+      var elVazio = document.getElementById("volanteDashboard2");
+      if (elVazio) elVazio.innerHTML = '<p class="muted">Nenhum concurso na base ainda.</p>';
+      return;
+    }
+    if (!Array.isArray(concurso.dezenas2) || !concurso.dezenas2.length) {
+      var el = document.getElementById("volanteDashboard2");
+      if (el) el.innerHTML = '<p class="muted">Este concurso ainda não possui o 2º sorteio importado.</p>';
+      return;
+    }
+    var concurso2 = {};
+    for (var k in concurso) concurso2[k] = concurso[k];
+    concurso2.dezenas = concurso.dezenas2;
+    renderVolante("volanteDashboard2", MPL_STATE.modalidade, concurso2, { navegacao: false });
+  };
+
+  /* Reforça a primeira exibição (garante que o 2º volante já nasce
+     correto, sem depender de um clique inicial). */
+  function __dsFixHook() {
+    if (!ehDuplaSena2()) return;
+    var c = MPL_STATE.ui.volanteDashboardAtual ||
+      (MPL_STATE.base.length ? MPL_STATE.base[MPL_STATE.base.length - 1] : null);
+    renderSegundoSorteioDashboardDS(c);
+  }
+  if (typeof mplOn === "function") mplOn("dashboard", __dsFixHook, 45);
+})();
+/* ============================================================
+   #pessoal
+   MPL — PATCH I (UX/Gamificação) — ROLETA v2, AUTOSSUFICIENTE
+   COLE ESTE BLOCO NO FINAL DE js/mpl-ui.js.
+
+   Este patch SUBSTITUI o comportamento dos Patches G e H (não é
+   preciso apagá-los do arquivo — este aqui neutraliza qualquer
+   elemento que eles tenham criado e assume o controle sozinho,
+   sem depender de nenhuma função/estado privado deles). Se quiser
+   limpeza, pode remover os blocos dos Patches G e H depois de
+   confirmar que este aqui funciona — mas não é obrigatório.
+
+   Correções desta versão:
+   1) Rotação de verdade, via CSS (@keyframes + animation), rodando
+      no próprio navegador (GPU), sem depender de requestAnimationFrame
+      manual — muito mais robusto. Ângulo atual lido via matrix CSS
+      computada, só no momento do clique (não a cada frame).
+   2) A roleta agora é SEMPRE a primeira tela ao abrir o index.html,
+      mesmo que já exista uma modalidade/base restaurada de sessão
+      anterior (antes só aparecia se não houvesse nada salvo).
+   3) Removido o texto "GIRAR" do miolo.
+   4) Cada fatia agora mostra a sigla da modalidade + a quantidade
+      de concursos já salvos no IndexedDB para ela (ex.: "MS · 2.840").
+      Enquanto a contagem carrega, mostra "..." e atualiza sozinha.
+   ============================================================ */
+(function () {
+  "use strict";
+
+  var ORDEM_RODA = [
+    "megaSena", "lotofacil", "quina", "lotomania", "timemania",
+    "duplaSena", "diaDeSorte", "superSete", "maisMilionaria"
+  ];
+
+  /* ---------- 0) Limpa qualquer vestígio dos patches anteriores ---------- */
+  function neutralizarPatchesAntigos() {
+    ["mplRoletaOverlay", "mplPresetModal"].forEach(function (id) {
+      var el = document.getElementById(id);
+      if (el) el.remove();
+    });
+    var btnAntigo = document.getElementById("btnMplInicio");
+    if (btnAntigo) btnAntigo.remove();
+    var estiloAntigo = document.getElementById("mplOcultarAppAteRoleta");
+    if (estiloAntigo) estiloAntigo.remove();
+    document.body.classList.remove("mpl-aguardando-roleta");
+  }
+
+  /* ---------- 1) Esconder o app até decidir o que mostrar ---------- */
+  var estiloOcultar = document.createElement("style");
+  estiloOcultar.id = "mplOcultarAppV2";
+  estiloOcultar.textContent =
+    "body.mpl-v2-aguardando > .mpl-header, " +
+    "body.mpl-v2-aguardando > .mpl-disclaimer, " +
+    "body.mpl-v2-aguardando > .mpl-tabs, " +
+    "body.mpl-v2-aguardando > #mplMain, " +
+    "body.mpl-v2-aguardando > .mpl-footer { visibility:hidden !important; }" +
+    "@keyframes mplGiroV2 { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }" +
+    "#mplRoletaSpinV2 { animation: mplGiroV2 34s linear infinite; transform-origin: 50% 50%; }" +
+    "#mplRoletaSpinV2:hover { animation-play-state: paused; }";
+  document.head.appendChild(estiloOcultar);
+  document.body.classList.add("mpl-v2-aguardando");
+
+  function revelarApp() { document.body.classList.remove("mpl-v2-aguardando"); }
+
+  /* ---------- 2) Contagem de concursos salvos por modalidade ---------- */
+  function contarConcursosSalvos(sigla) {
+    if (typeof carregarBaseIndexedDB !== "function") return Promise.resolve(null);
+    return carregarBaseIndexedDB(sigla).then(function (base) {
+      return (base && base.length) ? base.length : 0;
+    }).catch(function () { return null; });
+  }
+
+  /* ---------- 3) Construção do overlay ---------- */
+  var contagens = {}; // key -> número ou null enquanto carrega
+
+  function montarOverlay() {
+    var overlay = document.createElement("div");
+    overlay.id = "mplRoletaOverlayV2";
+    overlay.style.cssText =
+      "position:fixed;inset:0;z-index:20000;display:flex;align-items:center;justify-content:center;" +
+      "flex-direction:column;gap:22px;background:radial-gradient(ellipse at center,#0d1730 0%,#05070d 100%);";
+
+    overlay.innerHTML =
+      '<div style="text-align:center;">' +
+      '  <div style="font-size:30px;font-weight:800;letter-spacing:3px;color:#22d3ee;text-shadow:0 0 18px rgba(34,211,238,.6);">MPL</div>' +
+      '  <div style="font-size:13px;color:#8fa3c4;margin-top:4px;">Escolha sua modalidade — clique em uma fatia da roleta</div>' +
+      '</div>' +
+      '<div style="position:relative;width:min(80vw,460px);height:min(80vw,460px);">' +
+      '  <div id="mplRoletaSpinV2" style="width:100%;height:100%;">' +
+      '    <canvas id="mplRoletaCanvasV2" width="460" height="460" style="width:100%;height:100%;display:block;filter:drop-shadow(0 0 30px rgba(34,211,238,.25));"></canvas>' +
+      '  </div>' +
+      '  <div style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);width:70px;height:70px;border-radius:50%;background:#0d1526;border:3px solid #eab308;box-shadow:0 0 22px rgba(234,179,8,.55);pointer-events:none;"></div>' +
+      '</div>' +
+      '<p style="color:#8fa3c4;font-size:12px;max-width:420px;text-align:center;">"A análise histórica não elimina a aleatoriedade; ela organiza decisões, reduz universos e permite validação objetiva."</p>';
+
+    document.body.appendChild(overlay);
+
+    var canvas = document.getElementById("mplRoletaCanvasV2");
+    canvas.addEventListener("click", function (e) {
+      var spinEl = document.getElementById("mplRoletaSpinV2");
+      var anguloAtual = obterAnguloAtual(spinEl);
+
+      var rect = canvas.getBoundingClientRect();
+      var scaleX = canvas.width / rect.width, scaleY = canvas.height / rect.height;
+      var x = (e.clientX - rect.left) * scaleX - canvas.width / 2;
+      var y = (e.clientY - rect.top) * scaleY - canvas.height / 2;
+      var dist = Math.sqrt(x * x + y * y);
+      if (dist < 42 || dist > 225) return;
+
+      var ang = Math.atan2(y, x) - anguloAtual;
+      ang = ((ang % (2 * Math.PI)) + 2 * Math.PI) % (2 * Math.PI);
+      var passo = (2 * Math.PI) / ORDEM_RODA.length;
+      var fatia = Math.floor(ang / passo);
+      abrirModalPreset(ORDEM_RODA[fatia]);
+    });
+
+    desenharRoleta();
+    // carrega as contagens de forma assíncrona e redesenha quando cada uma chegar
+    ORDEM_RODA.forEach(function (key) {
+      var preset = PRESETS_MODALIDADES[key];
+      contagens[key] = null;
+      contarConcursosSalvos(preset.sigla).then(function (n) {
+        contagens[key] = n;
+        desenharRoleta();
+      });
+    });
+
+    return overlay;
+  }
+
+  /* Lê o ângulo de rotação ATUAL do elemento animado por CSS,
+     a partir da matriz de transformação computada pelo navegador. */
+  function obterAnguloAtual(el) {
+    var tr = getComputedStyle(el).transform;
+    if (!tr || tr === "none") return 0;
+    var match = tr.match(/^matrix\(([^,]+),([^,]+),/);
+    if (!match) return 0;
+    var a = parseFloat(match[1]), b = parseFloat(match[2]);
+    return Math.atan2(b, a);
+  }
+
+  function formatarContagem(key) {
+    var n = contagens[key];
+    if (n === undefined || n === null) return "...";
+    return n.toLocaleString("pt-BR");
+  }
+
+  function desenharRoleta() {
+    var canvas = document.getElementById("mplRoletaCanvasV2");
+    if (!canvas) return;
+    var ctx = canvas.getContext("2d");
+    var cx = canvas.width / 2, cy = canvas.height / 2;
+    var rOut = 225, rIn = 42;
+    var passo = (2 * Math.PI) / ORDEM_RODA.length;
+
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+    ORDEM_RODA.forEach(function (key, i) {
+      var a0 = i * passo, a1 = a0 + passo;
+      var cor = (typeof CORES_MODALIDADE !== "undefined" && CORES_MODALIDADE[key]) || { principal: "#22d3ee", texto: "#03121a" };
+      var preset = PRESETS_MODALIDADES[key];
+
+      ctx.beginPath();
+      ctx.moveTo(cx, cy);
+      ctx.arc(cx, cy, rOut, a0, a1);
+      ctx.closePath();
+      ctx.fillStyle = cor.principal;
+      ctx.globalAlpha = 0.92;
+      ctx.fill();
+      ctx.globalAlpha = 1;
+      ctx.lineWidth = 2;
+      ctx.strokeStyle = "#05070d";
+      ctx.stroke();
+
+      var angMeio = a0 + passo / 2;
+
+      // sigla
+      var lx = cx + Math.cos(angMeio) * (rOut - 28);
+      var ly = cy + Math.sin(angMeio) * (rOut - 28);
+      ctx.save();
+      ctx.translate(lx, ly);
+      ctx.rotate(angMeio + Math.PI / 2);
+      ctx.fillStyle = cor.texto;
+      ctx.font = "bold 13px 'Segoe UI',Arial,sans-serif";
+      ctx.textAlign = "center";
+      ctx.fillText(preset.sigla, 0, 0);
+      ctx.restore();
+
+      // quantidade de concursos salvos
+      var lx2 = cx + Math.cos(angMeio) * (rOut - 46);
+      var ly2 = cy + Math.sin(angMeio) * (rOut - 46);
+      ctx.save();
+      ctx.translate(lx2, ly2);
+      ctx.rotate(angMeio + Math.PI / 2);
+      ctx.fillStyle = cor.texto;
+      ctx.globalAlpha = 0.85;
+      ctx.font = "9px 'Segoe UI',Arial,sans-serif";
+      ctx.textAlign = "center";
+      ctx.fillText(formatarContagem(key), 0, 0);
+      ctx.globalAlpha = 1;
+      ctx.restore();
+    });
+
+    ctx.beginPath();
+    ctx.arc(cx, cy, rOut, 0, 2 * Math.PI);
+    ctx.lineWidth = 4;
+    ctx.strokeStyle = "#22d3ee";
+    ctx.globalAlpha = 0.5;
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+  }
+
+  /* ---------- 4) Modal de preset ---------- */
+  function abrirModalPreset(key) {
+    var preset = PRESETS_MODALIDADES[key];
+    if (!preset) return;
+    var modalAntigo = document.getElementById("mplPresetModalV2");
+    if (modalAntigo) modalAntigo.remove();
+
+    var cor = (typeof CORES_MODALIDADE !== "undefined" && CORES_MODALIDADE[key]) || { principal: "#22d3ee", texto: "#03121a" };
+    var modal = document.createElement("div");
+    modal.id = "mplPresetModalV2";
+    modal.style.cssText = "position:fixed;inset:0;z-index:20001;display:flex;align-items:center;justify-content:center;background:rgba(3,5,10,.72);";
+    modal.innerHTML =
+      '<div style="width:min(92vw,420px);background:#111a2e;border:1px solid #233256;border-top:4px solid ' + cor.principal + ';border-radius:14px;padding:22px;box-shadow:0 20px 60px rgba(0,0,0,.5);">' +
+      '  <h3 style="margin:0 0 4px;color:' + cor.principal + ';">' + preset.nome + '</h3>' +
+      '  <p class="muted" style="margin:0 0 16px;">Concursos salvos: ' + formatarContagem(key) + '. Confira ou ajuste os parâmetros antes de continuar.</p>' +
+      '  <label>Universo (U)</label><input id="mpU2" type="number" value="' + preset.universo + '">' +
+      '  <label>Dezenas sorteadas (S)</label><input id="mpS2" type="number" value="' + preset.dezenasSorteadas + '">' +
+      '  <label>Aposta mínima</label><input id="mpAmin2" type="number" value="' + preset.apostaMinima + '">' +
+      '  <label>Aposta máxima</label><input id="mpAmax2" type="number" value="' + preset.apostaMaxima + '">' +
+      '  <label>K — tamanho inicial do Radar Reduzido <span class="muted">(poderá ser recalculado depois na aba Radar)</span></label>' +
+      '  <input id="mpK2" type="number" value="' + preset.radarK + '">' +
+      '  <div style="display:flex;gap:8px;margin-top:16px;">' +
+      '    <button id="mpBtnCancelar2" class="btn-secondary" style="flex:1;">Voltar à Roleta</button>' +
+      '    <button id="mpBtnAplicar2" class="btn-primary" style="flex:1;background:' + cor.principal + ';color:' + cor.texto + ';">Aplicar e Ir ao Dashboard</button>' +
+      '  </div>' +
+      '</div>';
+    document.body.appendChild(modal);
+
+    document.getElementById("mpBtnCancelar2").addEventListener("click", function () { modal.remove(); });
+    modal.addEventListener("click", function (e) { if (e.target === modal) modal.remove(); });
+
+    document.getElementById("mpBtnAplicar2").addEventListener("click", function () {
+      var aplicado = JSON.parse(JSON.stringify(preset));
+      aplicado.presetKey = key;
+      aplicado.universo = Number(document.getElementById("mpU2").value) || preset.universo;
+      aplicado.dezenasSorteadas = Number(document.getElementById("mpS2").value) || preset.dezenasSorteadas;
+      aplicado.apostaMinima = Number(document.getElementById("mpAmin2").value) || preset.apostaMinima;
+      aplicado.apostaMaxima = Number(document.getElementById("mpAmax2").value) || preset.apostaMaxima;
+      aplicado.radarK = Number(document.getElementById("mpK2").value) || preset.radarK;
+
+      var manterBase = MPL_STATE.modalidade && MPL_STATE.modalidade.presetKey === key;
+
+      MPL_STATE.modalidade = aplicado;
+      MPL_STATE.config.K = aplicado.radarK;
+      MPL_STATE.config.A = aplicado.dezenasSorteadas;
+      MPL_STATE.config.caixaConfirmada = false;
+      MPL_STATE.config.caixaJanela = null;
+      MPL_STATE.config.filtrosDuros.pin.dezenas = [];
+      if (typeof inicializarFiltrosLinhaColuna === "function") inicializarFiltrosLinhaColuna(aplicado);
+      MPL_STATE.ui.volanteDashboardAtual = null;
+      localStorage.setItem("mplUltimaModalidade", key);
+
+      function seguirParaDashboard() {
+        if (typeof renderModalidadeForm === "function") renderModalidadeForm();
+        if (typeof renderFiltrosForm === "function") renderFiltrosForm();
+        if (typeof atualizarBadgeEscopo === "function") atualizarBadgeEscopo();
+        if (typeof renderApiStatus === "function") renderApiStatus();
+        if (typeof renderBaseTable === "function") renderBaseTable();
+
+        modal.remove();
+        fecharRoleta();
+        var btnDash = document.querySelector('.tab-btn[data-tab="dashboard"]');
+        if (btnDash) btnDash.click();
+        if (typeof renderDashboard === "function") renderDashboard();
+        revelarApp();
+      }
+
+      // se a modalidade escolhida for a mesma que já estava ativa e tiver
+      // base salva, recarrega a base automaticamente em vez de zerar
+      if (manterBase && typeof carregarBaseIndexedDB === "function") {
+        carregarBaseIndexedDB(aplicado.sigla).then(function (base) {
+          MPL_STATE.base = (base && base.length) ? base : [];
+          seguirParaDashboard();
+        }).catch(function () { MPL_STATE.base = []; seguirParaDashboard(); });
+      } else if (typeof carregarBaseIndexedDB === "function") {
+        carregarBaseIndexedDB(aplicado.sigla).then(function (base) {
+          MPL_STATE.base = (base && base.length) ? base : [];
+          seguirParaDashboard();
+        }).catch(function () { MPL_STATE.base = []; seguirParaDashboard(); });
+      } else {
+        MPL_STATE.base = [];
+        seguirParaDashboard();
+      }
+    });
+  }
+
+  /* ---------- 5) Abrir / fechar / botão INÍCIO ---------- */
+  function abrirRoleta() {
+    var overlay = document.getElementById("mplRoletaOverlayV2");
+    if (!overlay) overlay = montarOverlay();
+    overlay.style.display = "flex";
+  }
+  function fecharRoleta() {
+    var overlay = document.getElementById("mplRoletaOverlayV2");
+    if (overlay) overlay.style.display = "none";
+  }
+
+  function injetarBotaoInicio() {
+    if (document.getElementById("btnMplInicioV2")) return;
+    var header = document.querySelector(".mpl-header");
+    if (!header) return;
+    var btn = document.createElement("button");
+    btn.id = "btnMplInicioV2";
+    btn.textContent = "⟲ INÍCIO";
+    btn.title = "Escolher outra modalidade";
+    btn.style.cssText =
+      "background:transparent;border:1px solid #22d3ee;color:#22d3ee;border-radius:20px;" +
+      "padding:6px 14px;font-size:12px;font-weight:700;cursor:pointer;margin-right:10px;";
+    btn.addEventListener("mouseenter", function () { btn.style.background = "rgba(34,211,238,.12)"; });
+    btn.addEventListener("mouseleave", function () { btn.style.background = "transparent"; });
+    btn.addEventListener("click", abrirRoleta);
+
+    var badge = document.getElementById("scopeBadge");
+    if (badge) header.insertBefore(btn, badge);
+    else header.appendChild(btn);
+  }
+
+  /* ---------- 6) Boot: SEMPRE mostra a roleta primeiro ---------- */
+  function boot() {
+    neutralizarPatchesAntigos();
+    injetarBotaoInicio();
+    abrirRoleta();
+    // Revela o app "por trás" só depois que o usuário decidir (o clique em
+    // "Aplicar e Ir ao Dashboard" chama revelarApp()). Não revelamos aqui.
+  }
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", function () { setTimeout(boot, 50); });
+  } else {
+    setTimeout(boot, 50);
+  }
+})();
+/* ============================================================
+   #pessoal
+   MPL — PATCH J — CORREÇÃO: botão INÍCIO e roda duplicados.
+   COLE ESTE BLOCO NO FINAL DE js/mpl-ui.js — DEPOIS do Patch I
+   (PATCH-mpl-ui-RoletaInicial-V2.js). Não apaga nada, só corrige.
+
+   Causa raiz: os Patches G/H antigos têm seu próprio temporizador
+   interno (dispara ~650ms após o carregamento) que recria o botão
+   "INÍCIO" antigo (id="btnMplInicio") e a roda estática antiga
+   (id="mplRoletaOverlay") — mesmo depois que o Patch I já tinha
+   limpado tudo uma única vez logo no início. Por isso apareciam
+   dois botões e, ao clicar no errado, a roda estática (sem giro).
+
+   Correção: em vez de limpar uma única vez, ficamos "vigiando" por
+   alguns segundos após o carregamento e removendo IMEDIATAMENTE
+   qualquer elemento antigo (btnMplInicio / mplRoletaOverlay /
+   mplPresetModal) que reapareça, até os temporizadores antigos
+   já terem disparado e não haver mais risco de recriação.
+   ============================================================ */
+(function () {
+  "use strict";
+
+  var IDS_ANTIGOS = ["btnMplInicio", "mplRoletaOverlay", "mplPresetModal", "mplOcultarAppAteRoleta"];
+
+  function limparAntigos() {
+    IDS_ANTIGOS.forEach(function (id) {
+      var el = document.getElementById(id);
+      if (el) el.remove();
+    });
+  }
+
+  var tentativas = 0;
+  var vigia = setInterval(function () {
+    tentativas++;
+    limparAntigos();
+    if (tentativas > 40) clearInterval(vigia); // ~4s de vigilância é suficiente
+  }, 100);
+
+  // limpeza imediata também, para não esperar o primeiro tick do interval
+  limparAntigos();
+})();
+/* ============================================================
+   #pessoal
+   MPL — PATCH L — ABA CONFERIDOR DE APOSTAS (marcado p/ Premium futuro)
+   COLE ESTE BLOCO NO FINAL DE js/mpl-ui.js — não apaga nada.
+
+   Cria uma aba nova ("Conferidor") inteiramente via JS (sem precisar
+   editar index.html). Permite conferir:
+   - Origem dos jogos: os jogos do Ranking atual (painel) OU um
+     arquivo TXT/CSV carregado pelo usuário (uma linha por jogo).
+   - Escopo de conferência: base completa, intervalo de concursos,
+     ou um concurso específico.
+   Mostra, por jogo, o melhor resultado (mais acertos) dentro do
+   escopo escolhido e em qual concurso ocorreu.
+
+   Observação sobre valores de prêmio: este patch NÃO exibe valores
+   monetários de premiação, pois o MPL ainda não integra a tabela
+   oficial de faixas/valores da Caixa (isso está no roadmap — Fase 8,
+   "dados de prêmios via API" — e será conectado aqui quando pronto).
+   Por ora mostra apenas contagem de acertos, que é um dado 100%
+   auditável a partir da própria base histórica já importada.
+   ============================================================ */
+(function () {
+  "use strict";
+
+  function injetarAba() {
+    var nav = document.getElementById("mplTabs");
+    var main = document.getElementById("mplMain");
+    if (!nav || !main || document.getElementById("tab-conferidor")) return;
+
+    var btn = document.createElement("button");
+    btn.className = "tab-btn";
+    btn.dataset.tab = "conferidor";
+    btn.innerHTML = "Conferidor <span style=\"font-size:9px;color:#eab308;\">★ Premium</span>";
+    nav.appendChild(btn);
+
+    var secao = document.createElement("section");
+    secao.id = "tab-conferidor";
+    secao.className = "tab-panel";
+    secao.innerHTML =
+      '<h2>Conferidor de Apostas</h2>' +
+      '<div class="card">' +
+      '  <p class="muted">Confira jogos gerados pelo MPL ou um arquivo próprio contra a base histórica. Mostra o melhor resultado (mais acertos) dentro do escopo escolhido.</p>' +
+      '  <h3>1) Origem dos jogos</h3>' +
+      '  <div class="row-flex">' +
+      '    <div><label><input type="radio" name="confOrigem" value="ranking" checked style="width:auto;"> Jogos do Ranking atual (painel)</label></div>' +
+      '    <div><label><input type="radio" name="confOrigem" value="arquivo" style="width:auto;"> Carregar arquivo (TXT/CSV, 1 jogo por linha)</label></div>' +
+      '  </div>' +
+      '  <input type="file" id="confArquivo" accept=".txt,.csv" style="display:none;">' +
+      '  <div id="confArquivoInfo" class="muted"></div>' +
+      '  <h3 style="margin-top:16px;">2) Escopo de conferência</h3>' +
+      '  <div class="row-flex">' +
+      '    <div><label><input type="radio" name="confEscopo" value="completa" checked style="width:auto;"> Base completa</label></div>' +
+      '    <div><label><input type="radio" name="confEscopo" value="intervalo" style="width:auto;"> Intervalo de concursos</label></div>' +
+      '    <div><label><input type="radio" name="confEscopo" value="especifico" style="width:auto;"> Concurso específico</label></div>' +
+      '  </div>' +
+      '  <div class="row-flex">' +
+      '    <div><label>De</label><input type="number" id="confDe" placeholder="concurso inicial"></div>' +
+      '    <div><label>Até</label><input type="number" id="confAte" placeholder="concurso final"></div>' +
+      '    <div><label>Concurso específico</label><input type="number" id="confEspecifico" placeholder="nº do concurso"></div>' +
+      '  </div>' +
+      '  <button id="btnConferir" class="btn-primary">Conferir Apostas</button>' +
+      '</div>' +
+      '<div class="card" id="confResultadoCard" style="display:none;">' +
+      '  <h3>Resultado da Conferência</h3>' +
+      '  <div id="confResumo" class="grid-cards"></div>' +
+      '  <div id="confTabela" class="table-wrap"></div>' +
+      '  <p class="muted">Contagem de acertos calculada diretamente sobre a base histórica importada. Valores de premiação ainda não integrados (ver roadmap).</p>' +
+      '</div>';
+    main.appendChild(secao);
+
+    // reaproveita o mecanismo de troca de aba já existente
+    btn.addEventListener("click", function () {
+      document.querySelectorAll(".tab-btn").forEach(function (b) { b.classList.remove("active"); });
+      document.querySelectorAll(".tab-panel").forEach(function (p) { p.classList.remove("active"); });
+      btn.classList.add("active");
+      secao.classList.add("active");
+    });
+
+    ligarEventosConferidor();
+  }
+
+  var jogosDoArquivo = null;
+
+  function ligarEventosConferidor() {
+    document.querySelectorAll('input[name="confOrigem"]').forEach(function (r) {
+      r.addEventListener("change", function () {
+        document.getElementById("confArquivo").style.display = (r.value === "arquivo" && r.checked) ? "block" : "none";
+      });
+    });
+
+    document.getElementById("confArquivo").addEventListener("change", async function (e) {
+      var file = e.target.files[0];
+      if (!file) return;
+      var texto = await file.text();
+      var linhas = texto.trim().split(/\r?\n/).filter(function (l) { return l.trim().length; });
+      jogosDoArquivo = linhas.map(function (l) {
+        return l.split(/[\s,;]+/).map(Number).filter(function (n) { return !isNaN(n); });
+      }).filter(function (j) { return j.length; });
+      document.getElementById("confArquivoInfo").textContent = jogosDoArquivo.length + " jogo(s) carregado(s) de " + file.name + ".";
+    });
+
+    document.getElementById("btnConferir").addEventListener("click", conferirApostas);
+  }
+
+  function obterJogosParaConferir() {
+    var origem = document.querySelector('input[name="confOrigem"]:checked').value;
+    if (origem === "arquivo") {
+      if (!jogosDoArquivo || !jogosDoArquivo.length) { alert("Carregue um arquivo de jogos primeiro."); return null; }
+      return jogosDoArquivo;
+    }
+    var lista = (MPL_STATE.cache.rankingExibicao && MPL_STATE.cache.rankingExibicao.length)
+      ? MPL_STATE.cache.rankingExibicao : MPL_STATE.cache.ranking;
+    if (!lista || !lista.length) { alert("Não há jogos no Ranking atual. Gere e ranqueie jogos primeiro, ou carregue um arquivo."); return null; }
+    return lista.map(function (r) { return r.jogo; });
+  }
+
+  function obterEscopoConcursos() {
+    var escopo = document.querySelector('input[name="confEscopo"]:checked').value;
+    var base = MPL_STATE.base;
+    if (escopo === "completa") return base;
+    if (escopo === "intervalo") {
+      var de = Number(document.getElementById("confDe").value);
+      var ate = Number(document.getElementById("confAte").value);
+      return base.filter(function (c) { return c.numero >= de && c.numero <= ate; });
+    }
+    if (escopo === "especifico") {
+      var num = Number(document.getElementById("confEspecifico").value);
+      return base.filter(function (c) { return c.numero === num; });
+    }
+    return base;
+  }
+
+  function conferirApostas() {
+    if (!MPL_STATE.modalidade) return alert("Configure uma modalidade primeiro.");
+    var jogos = obterJogosParaConferir();
+    if (!jogos) return;
+    var concursos = obterEscopoConcursos();
+    if (!concursos.length) return alert("Nenhum concurso encontrado no escopo selecionado.");
+
+    var resultados = jogos.map(function (jogo, i) {
+      var melhor = { acertos: -1, concurso: null };
+      concursos.forEach(function (c) {
+        var dezenasRef = (Array.isArray(c.dezenas2) && MPL_STATE.config.duplaSenaSorteioAtivo === 2) ? c.dezenas2 : c.dezenas;
+        var acertos = jogo.filter(function (d) { return dezenasRef.includes(d); }).length;
+        if (acertos > melhor.acertos) melhor = { acertos: acertos, concurso: c.numero };
+      });
+      return { indice: i + 1, jogo: jogo, melhorAcertos: melhor.acertos, concursoDoMelhor: melhor.concurso };
+    });
+
+    var melhorGeral = resultados.reduce(function (a, b) { return b.melhorAcertos > a.melhorAcertos ? b : a; }, resultados[0]);
+    var mediaAcertos = resultados.reduce(function (s, r) { return s + r.melhorAcertos; }, 0) / resultados.length;
+
+    document.getElementById("confResultadoCard").style.display = "block";
+    document.getElementById("confResumo").innerHTML =
+      card("Jogos conferidos", resultados.length) +
+      card("Concursos no escopo", concursos.length) +
+      card("Melhor acerto encontrado", melhorGeral.melhorAcertos + " (jogo #" + melhorGeral.indice + ", concurso " + melhorGeral.concursoDoMelhor + ")") +
+      card("Média de acertos (melhor por jogo)", mediaAcertos.toFixed(2));
+
+    document.getElementById("confTabela").innerHTML =
+      "<table><thead><tr><th>#</th><th>Jogo</th><th>Melhor acerto</th><th>Concurso</th></tr></thead><tbody>" +
+      resultados.map(function (r) {
+        return "<tr><td>" + r.indice + "</td><td>" + r.jogo.map(function (d) { return String(d).padStart(2, "0"); }).join(" ") +
+          "</td><td><b>" + r.melhorAcertos + "</b></td><td>" + (r.concursoDoMelhor || "-") + "</td></tr>";
+      }).join("") + "</tbody></table>";
+  }
+
+  document.addEventListener("DOMContentLoaded", function () { setTimeout(injetarAba, 200); });
+})();
+/* ============================================================
+   #pessoal
+   MPL — PATCH N — ESCONDE A ABA "MODALIDADE" DA BARRA DE ABAS
+   COLE ESTE BLOCO NO FINAL DE js/mpl-ui.js — não apaga nada.
+
+   A roleta inicial (Patch I) já cobre 100% do que a aba Modalidade
+   fazia (aplicar preset + carregar base salva automaticamente), então
+   ela deixa de ser necessária como ponto de entrada visível. O código
+   da aba continua existindo (não removido), só escondido — se um dia
+   quiser reabrir para ajustes finos avançados, é só remover este patch.
+   ============================================================ */
+(function () {
+  "use strict";
+
+  function escenderAba() {
+    var btn = document.querySelector('.tab-btn[data-tab="modalidade"]');
+    var painel = document.getElementById("tab-modalidade");
+    if (btn) btn.style.display = "none";
+    // se por algum motivo o usuário estiver exatamente nessa aba quando
+    // ela for escondida, redireciona para o Dashboard em vez de deixar
+    // uma aba "fantasma" ativa e invisível.
+    if (btn && btn.classList.contains("active")) {
+      var btnDash = document.querySelector('.tab-btn[data-tab="dashboard"]');
+      if (btnDash) btnDash.click();
+    }
+  }
+
+  document.addEventListener("DOMContentLoaded", function () { setTimeout(escenderAba, 250); });
+})();
+/* ============================================================
+   #pessoal
+   MPL — PATCH O — CONFERIDOR: Dupla Sena confere os 2 sorteios juntos
+   COLE ESTE BLOCO NO FINAL DE js/mpl-ui.js — DEPOIS do Patch L
+   (PATCH-mpl-ui-ConferidorApostas.js). Não apaga nada.
+
+   O botão "Conferir Apostas" do Patch L usava sempre um único
+   resultado por concurso (o "sorteio ativo" do seletor do cabeçalho).
+   Para Dupla Sena isso escondia metade da informação. Este patch
+   substitui só o comportamento do clique (o botão em si é reaproveitado
+   — clonado para remover o listener antigo), calculando e mostrando
+   os acertos no 1º E no 2º sorteio ao mesmo tempo, em colunas
+   separadas, sempre que a modalidade ativa for Dupla Sena.
+   ============================================================ */
+(function () {
+  "use strict";
+
+  function ehDS() {
+    return typeof isDuplaSena === "function" && MPL_STATE.modalidade && isDuplaSena(MPL_STATE.modalidade);
+  }
+
+  function religarBotaoConferir() {
+    var antigo = document.getElementById("btnConferir");
+    if (!antigo || antigo.__dsConferidorFixado) return;
+    var novo = antigo.cloneNode(true);
+    antigo.parentNode.replaceChild(novo, antigo);
+    novo.__dsConferidorFixado = true;
+    novo.addEventListener("click", conferirApostasComDoisSorteios);
+  }
+
+  function obterJogos() {
+    var origemEl = document.querySelector('input[name="confOrigem"]:checked');
+    var origem = origemEl ? origemEl.value : "ranking";
+    if (origem === "arquivo") {
+      if (typeof window.__mplJogosArquivoConferidor === "undefined" || !window.__mplJogosArquivoConferidor) {
+        // fallback: tenta ler do input de arquivo já processado pelo Patch L
+        var info = document.getElementById("confArquivoInfo");
+        alert("Carregue um arquivo de jogos primeiro (" + (info ? info.textContent : "") + ").");
+        return null;
+      }
+      return window.__mplJogosArquivoConferidor;
+    }
+    var lista = (MPL_STATE.cache.rankingExibicao && MPL_STATE.cache.rankingExibicao.length)
+      ? MPL_STATE.cache.rankingExibicao : MPL_STATE.cache.ranking;
+    if (!lista || !lista.length) { alert("Não há jogos no Ranking atual. Gere e ranqueie jogos primeiro, ou carregue um arquivo."); return null; }
+    return lista.map(function (r) { return r.jogo; });
+  }
+
+  function obterEscopo() {
+    var escopoEl = document.querySelector('input[name="confEscopo"]:checked');
+    var escopo = escopoEl ? escopoEl.value : "completa";
+    var base = MPL_STATE.base;
+    if (escopo === "intervalo") {
+      var de = Number(document.getElementById("confDe").value);
+      var ate = Number(document.getElementById("confAte").value);
+      return base.filter(function (c) { return c.numero >= de && c.numero <= ate; });
+    }
+    if (escopo === "especifico") {
+      var num = Number(document.getElementById("confEspecifico").value);
+      return base.filter(function (c) { return c.numero === num; });
+    }
+    return base;
+  }
+
+  function card2(label, value) {
+    return '<div class="stat-card"><div class="label">' + label + '</div><div class="value">' + value + '</div></div>';
+  }
+
+  function conferirApostasComDoisSorteios() {
+    if (!MPL_STATE.modalidade) return alert("Configure uma modalidade primeiro.");
+    var jogos = obterJogos();
+    if (!jogos) return;
+    var concursos = obterEscopo();
+    if (!concursos.length) return alert("Nenhum concurso encontrado no escopo selecionado.");
+
+    var duplaSena = ehDS();
+
+    var resultados = jogos.map(function (jogo, i) {
+      var melhor1 = { acertos: -1, concurso: null };
+      var melhor2 = { acertos: -1, concurso: null };
+
+      concursos.forEach(function (c) {
+        var a1 = jogo.filter(function (d) { return c.dezenas.includes(d); }).length;
+        if (a1 > melhor1.acertos) melhor1 = { acertos: a1, concurso: c.numero };
+
+        if (duplaSena && Array.isArray(c.dezenas2) && c.dezenas2.length) {
+          var a2 = jogo.filter(function (d) { return c.dezenas2.includes(d); }).length;
+          if (a2 > melhor2.acertos) melhor2 = { acertos: a2, concurso: c.numero };
+        }
+      });
+
+      return {
+        indice: i + 1, jogo: jogo,
+        melhor1: melhor1.acertos, concurso1: melhor1.concurso,
+        melhor2: duplaSena ? melhor2.acertos : null, concurso2: duplaSena ? melhor2.concurso : null
+      };
+    });
+
+    var melhorGeral1 = resultados.reduce(function (a, b) { return b.melhor1 > a.melhor1 ? b : a; }, resultados[0]);
+    var media1 = resultados.reduce(function (s, r) { return s + r.melhor1; }, 0) / resultados.length;
+
+    var resumoHtml = card2("Jogos conferidos", resultados.length) +
+      card2("Concursos no escopo", concursos.length) +
+      card2("Melhor acerto — 1º sorteio", melhorGeral1.melhor1 + " (jogo #" + melhorGeral1.indice + ", concurso " + melhorGeral1.concurso1 + ")") +
+      card2("Média de acertos — 1º sorteio", media1.toFixed(2));
+
+    var cabecalho = "<tr><th>#</th><th>Jogo</th><th>Melhor acerto (1º sorteio)</th><th>Concurso</th>";
+    if (duplaSena) cabecalho += "<th>Melhor acerto (2º sorteio)</th><th>Concurso</th>";
+    cabecalho += "</tr>";
+
+    if (duplaSena) {
+      var melhorGeral2 = resultados.reduce(function (a, b) { return (b.melhor2 || 0) > (a.melhor2 || 0) ? b : a; }, resultados[0]);
+      var media2 = resultados.reduce(function (s, r) { return s + (r.melhor2 || 0); }, 0) / resultados.length;
+      resumoHtml += card2("Melhor acerto — 2º sorteio", (melhorGeral2.melhor2 ?? 0) + " (jogo #" + melhorGeral2.indice + ", concurso " + (melhorGeral2.concurso2 || "-") + ")") +
+        card2("Média de acertos — 2º sorteio", media2.toFixed(2));
+    }
+
+    var linhas = resultados.map(function (r) {
+      var l = "<tr><td>" + r.indice + "</td><td>" + r.jogo.map(function (d) { return String(d).padStart(2, "0"); }).join(" ") +
+        "</td><td><b>" + r.melhor1 + "</b></td><td>" + (r.concurso1 || "-") + "</td>";
+      if (duplaSena) l += "<td><b>" + (r.melhor2 ?? "-") + "</b></td><td>" + (r.concurso2 || "-") + "</td>";
+      l += "</tr>";
+      return l;
+    }).join("");
+
+    document.getElementById("confResultadoCard").style.display = "block";
+    document.getElementById("confResumo").innerHTML = resumoHtml;
+    document.getElementById("confTabela").innerHTML = "<table><thead>" + cabecalho + "</thead><tbody>" + linhas + "</tbody></table>";
+  }
+
+  function boot() {
+    religarBotaoConferir();
+    // a aba Conferidor pode ainda não existir no instante em que este
+    // patch roda (é criada de forma assíncrona pelo Patch L) — tenta
+    // de novo por alguns segundos até conseguir religar o botão.
+    var tentativas = 0;
+    var vigia = setInterval(function () {
+      tentativas++;
+      religarBotaoConferir();
+      if (document.getElementById("btnConferir") && document.getElementById("btnConferir").__dsConferidorFixado) clearInterval(vigia);
+      if (tentativas > 30) clearInterval(vigia);
+    }, 200);
+  }
+
+  document.addEventListener("DOMContentLoaded", function () { setTimeout(boot, 300); });
+})();
+/* ============================================================
+   #pessoal
+   MPL — PATCH O-BIS — expõe os jogos do arquivo carregado no
+   Conferidor para uso compartilhado entre patches.
+   COLE ESTE BLOCO NO FINAL DE js/mpl-ui.js — DEPOIS do Patch O.
+   ============================================================ */
+(function () {
+  "use strict";
+  function religar() {
+    var input = document.getElementById("confArquivo");
+    if (!input || input.__dsArquivoFixado) return;
+    input.__dsArquivoFixado = true;
+    input.addEventListener("change", async function (e) {
+      var file = e.target.files[0];
+      if (!file) return;
+      var texto = await file.text();
+      var linhas = texto.trim().split(/\r?\n/).filter(function (l) { return l.trim().length; });
+      window.__mplJogosArquivoConferidor = linhas.map(function (l) {
+        return l.split(/[\s,;]+/).map(Number).filter(function (n) { return !isNaN(n); });
+      }).filter(function (j) { return j.length; });
+      var info = document.getElementById("confArquivoInfo");
+      if (info) info.textContent = window.__mplJogosArquivoConferidor.length + " jogo(s) carregado(s) de " + file.name + ".";
+    });
+  }
+  var tentativas = 0;
+  var vigia = setInterval(function () {
+    tentativas++;
+    religar();
+    if (tentativas > 30) clearInterval(vigia);
+  }, 200);
+})();
+/* ============================================================
+   #pessoal
+   MPL — PATCH Q — Corrige a cor do texto "MPL" dentro da roleta
+   (era o único lugar que ficou com o azul ciano "Win98" antigo,
+   pois o texto foi criado com innerHTML fixo no Patch I, ANTES
+   de existir o gradiente do Patch/CSS de modernização).
+   COLE ESTE BLOCO NO FINAL DE js/mpl-ui.js.
+   ============================================================ */
+(function () {
+  "use strict";
+
+  function aplicarGradienteNaRoleta() {
+    var overlay = document.getElementById("mplRoletaOverlayV2");
+    if (!overlay) return;
+    var titulo = overlay.querySelector("div"); // primeiro div = bloco de título (MPL + subtítulo)
+    var alvo = overlay.querySelector('div[style*="font-size:30px"]');
+    if (alvo) {
+      alvo.style.background = "linear-gradient(120deg, #22d3ee 0%, #818cf8 55%, #a855f7 100%)";
+      alvo.style.webkitBackgroundClip = "text";
+      alvo.style.backgroundClip = "text";
+      alvo.style.color = "transparent";
+      alvo.style.textShadow = "none";
+      alvo.style.filter = "drop-shadow(0 0 12px rgba(129,140,248,.45))";
+    }
+  }
+
+  var tentativas = 0;
+  var vigia = setInterval(function () {
+    tentativas++;
+    aplicarGradienteNaRoleta();
+    if (tentativas > 60) clearInterval(vigia); // ~6s cobre qualquer atraso de criação do overlay
+  }, 100);
+
+  // reaplica também sempre que a roleta for reaberta pelo botão INÍCIO
+  document.addEventListener("click", function (e) {
+    if (e.target && e.target.id === "btnMplInicioV2") {
+      setTimeout(aplicarGradienteNaRoleta, 50);
+    }
+  });
+})();
+/* ============================================================
+   #pessoal
+   MPL — PATCH T — MAPA INICIAL (renomeia "Escopo de Análise")
+   COLE ESTE BLOCO NO FINAL DE js/mpl-ui.js.
+
+   1) Renomeia a aba/título de "Escopo de Análise" para "Mapa Inicial".
+   2) Acrescenta uma TIMELINE horizontal (canvas) com todos os
+      concursos da base — clique e arraste para selecionar um
+      intervalo visualmente (equivalente ao modo "intervalo" já
+      existente); clique único define "concurso específico" via
+      seleção de 1 ponto. Continua 100% compatível com os campos
+      numéricos que já existiam (ambos ficam sincronizados).
+   3) Acrescenta um GLOBO 3D (pseudo-3D via canvas 2D, sem depender
+      de nenhuma biblioteca externa) mostrando todas as dezenas do
+      universo da modalidade girando — é a "matéria-prima" ainda sem
+      hierarquia (isso só existe depois do STF, lá no Radar — ver
+      Patch U). Aqui é só o retrato do universo completo, pulsando
+      na cor da modalidade.
+   ============================================================ */
+(function () {
+  "use strict";
+
+  /* ---------- 1) Renomear aba ---------- */
+  function renomearAba() {
+    var btn = document.querySelector('.tab-btn[data-tab="escopo"]');
+    if (btn && btn.textContent.indexOf("Mapa Inicial") === -1) btn.textContent = "Mapa Inicial";
+    var painel = document.getElementById("tab-escopo");
+    if (painel) {
+      var h2 = painel.querySelector("h2");
+      if (h2) h2.textContent = "Mapa Inicial";
+    }
+  }
+
+  /* ---------- 2) Timeline horizontal ---------- */
+  function montarCardTimeline() {
+    var form = document.getElementById("escopoForm");
+    if (!form || document.getElementById("mapaTimelineCard")) return;
+    var card = document.createElement("div");
+    card.id = "mapaTimelineCard";
+    card.className = "card";
+    card.innerHTML =
+      '<h3>Linha do Tempo dos Concursos</h3>' +
+      '<p class="muted">Clique e arraste para selecionar um intervalo visualmente, ou clique uma vez para escolher um concurso específico. Os campos abaixo continuam sincronizados.</p>' +
+      '<canvas id="mapaTimelineCanvas" width="900" height="90" style="width:100%;height:90px;cursor:crosshair;"></canvas>' +
+      '<div id="mapaTimelineInfo" class="muted" style="margin-top:6px;"></div>';
+    form.parentNode.insertBefore(card, form);
+  }
+
+  var arrastando = false, xInicio = 0, xAtual = 0;
+
+  function concursoNaPosicao(x, canvas) {
+    var base = MPL_STATE.base;
+    if (!base.length) return null;
+    var margem = 20;
+    var largura = canvas.width - margem * 2;
+    var frac = Math.max(0, Math.min(1, (x - margem) / largura));
+    var idx = Math.round(frac * (base.length - 1));
+    return base[idx];
+  }
+
+  function desenharTimeline() {
+    var canvas = document.getElementById("mapaTimelineCanvas");
+    if (!canvas) return;
+    var ctx = canvas.getContext("2d");
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    var base = MPL_STATE.base;
+    if (!base.length) {
+      ctx.fillStyle = "#8fa3c4";
+      ctx.font = "13px sans-serif";
+      ctx.textAlign = "center";
+      ctx.fillText("Nenhum concurso na base ainda.", canvas.width / 2, canvas.height / 2);
+      return;
+    }
+
+    var margem = 20;
+    var largura = canvas.width - margem * 2;
+    var meioY = 45;
+    var cor = (MPL_STATE.modalidade && typeof obterCorModalidade === "function") ? obterCorModalidade(MPL_STATE.modalidade) : { principal: "#22d3ee" };
+
+    // linha base
+    ctx.strokeStyle = "#233256";
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(margem, meioY);
+    ctx.lineTo(canvas.width - margem, meioY);
+    ctx.stroke();
+
+    // ticks (agrupados se houver muitos concursos, para não poluir)
+    var passoTick = Math.max(1, Math.floor(base.length / 250));
+    for (var i = 0; i < base.length; i += passoTick) {
+      var x = margem + (i / (base.length - 1)) * largura;
+      ctx.beginPath();
+      ctx.moveTo(x, meioY - 4);
+      ctx.lineTo(x, meioY + 4);
+      ctx.strokeStyle = "#3a4a6b";
+      ctx.stroke();
+    }
+
+    // destaque conforme o escopo atual
+    var escopo = MPL_STATE.escopo;
+    var faixaIni = null, faixaFim = null;
+    if (escopo.modo === "completa") { faixaIni = 0; faixaFim = base.length - 1; }
+    else if (escopo.modo === "ultimosN") { faixaIni = Math.max(0, base.length - (escopo.qtd || 0)); faixaFim = base.length - 1; }
+    else if (escopo.modo === "intervalo") {
+      faixaIni = base.findIndex(function (c) { return c.numero >= escopo.concursoInicial; });
+      var idxFim = base.length - 1;
+      for (var k = base.length - 1; k >= 0; k--) { if (base[k].numero <= escopo.concursoFinal) { idxFim = k; break; } }
+      faixaFim = idxFim;
+    }
+
+    if (faixaIni !== null && faixaFim !== null && faixaIni <= faixaFim) {
+      var xIni = margem + (faixaIni / (base.length - 1)) * largura;
+      var xFim = margem + (faixaFim / (base.length - 1)) * largura;
+      ctx.fillStyle = cor.principal + "33";
+      ctx.fillRect(xIni, meioY - 14, Math.max(2, xFim - xIni), 28);
+      ctx.strokeStyle = cor.principal;
+      ctx.lineWidth = 2;
+      ctx.strokeRect(xIni, meioY - 14, Math.max(2, xFim - xIni), 28);
+    }
+
+    // seleção sendo arrastada agora (feedback ao vivo)
+    if (arrastando) {
+      var x1 = Math.min(xInicio, xAtual), x2 = Math.max(xInicio, xAtual);
+      ctx.fillStyle = "rgba(234,179,8,.25)";
+      ctx.fillRect(x1, meioY - 20, x2 - x1, 40);
+    }
+
+    // extremos (primeiro/último concurso) rotulados
+    ctx.fillStyle = "#8fa3c4";
+    ctx.font = "10px sans-serif";
+    ctx.textAlign = "left";
+    ctx.fillText(String(base[0].numero), margem, meioY + 22);
+    ctx.textAlign = "right";
+    ctx.fillText(String(base[base.length - 1].numero), canvas.width - margem, meioY + 22);
+  }
+
+  function ligarEventosTimeline() {
+    var canvas = document.getElementById("mapaTimelineCanvas");
+    if (!canvas || canvas.__mapaLigado) return;
+    canvas.__mapaLigado = true;
+
+    function posX(e) {
+      var rect = canvas.getBoundingClientRect();
+      return (e.clientX - rect.left) * (canvas.width / rect.width);
+    }
+
+    canvas.addEventListener("mousedown", function (e) {
+      arrastando = true;
+      xInicio = xAtual = posX(e);
+      desenharTimeline();
+    });
+    canvas.addEventListener("mousemove", function (e) {
+      if (!arrastando) return;
+      xAtual = posX(e);
+      desenharTimeline();
+      var c1 = concursoNaPosicao(Math.min(xInicio, xAtual), canvas);
+      var c2 = concursoNaPosicao(Math.max(xInicio, xAtual), canvas);
+      var info = document.getElementById("mapaTimelineInfo");
+      if (info && c1 && c2) info.textContent = "Selecionando: concurso " + c1.numero + " até " + c2.numero + "...";
+    });
+    window.addEventListener("mouseup", function (e) {
+      if (!arrastando) return;
+      arrastando = false;
+      var dist = Math.abs(xAtual - xInicio);
+      var c1 = concursoNaPosicao(Math.min(xInicio, xAtual), canvas);
+      var c2 = concursoNaPosicao(Math.max(xInicio, xAtual), canvas);
+      if (!c1 || !c2) return;
+
+      if (dist < 4) {
+        // clique único = concurso específico (usamos como intervalo de 1)
+        MPL_STATE.escopo.modo = "intervalo";
+        MPL_STATE.escopo.concursoInicial = c1.numero;
+        MPL_STATE.escopo.concursoFinal = c1.numero;
+      } else {
+        MPL_STATE.escopo.modo = "intervalo";
+        MPL_STATE.escopo.concursoInicial = c1.numero;
+        MPL_STATE.escopo.concursoFinal = c2.numero;
+      }
+
+      // sincroniza os campos/rádios já existentes na aba
+      var selModo = document.getElementById("escopoModo");
+      if (selModo) selModo.value = "intervalo";
+      var inIni = document.getElementById("escopoIni"); if (inIni) inIni.value = MPL_STATE.escopo.concursoInicial;
+      var inFim = document.getElementById("escopoFim"); if (inFim) inFim.value = MPL_STATE.escopo.concursoFinal;
+      var info = document.getElementById("escopoInfo");
+      var efetiva = (typeof aplicarEscopo === "function") ? aplicarEscopo(MPL_STATE.base, MPL_STATE.escopo) : [];
+      if (info) info.textContent = "Escopo atual: intervalo · " + efetiva.length + " concursos selecionados de " + MPL_STATE.base.length + " totais.";
+
+      desenharTimeline();
+    });
+  }
+
+  /* ---------- 3) Globo 3D (pseudo-3D via canvas 2D) ---------- */
+  function montarCardGlobo() {
+    var form = document.getElementById("escopoForm");
+    if (!form || document.getElementById("mapaGloboCard")) return;
+    var card = document.createElement("div");
+    card.id = "mapaGloboCard";
+    card.className = "card";
+    card.innerHTML =
+      '<h3>Universo de Dezenas — Visão Geral</h3>' +
+      '<p class="muted">Todas as dezenas da modalidade, ainda sem hierarquia — é a matéria-prima antes da Caixa e dos Scores. Quando você chegar ao Radar Reduzido, elas passam a se organizar por proximidade da mira, conforme o STF calculado.</p>' +
+      '<canvas id="mapaGloboCanvas" width="360" height="360" style="width:100%;max-width:360px;display:block;margin:0 auto;"></canvas>';
+    form.parentNode.insertBefore(card, form);
+  }
+
+  var anguloGlobo = 0;
+  function pontosEsfera(n) {
+    var pontos = [];
+    var offset = 2 / n;
+    var anguloOuro = Math.PI * (3 - Math.sqrt(5));
+    for (var i = 0; i < n; i++) {
+      var y = ((i * offset) - 1) + (offset / 2);
+      var r = Math.sqrt(Math.max(0, 1 - y * y));
+      var phi = i * anguloOuro;
+      pontos.push({ x: Math.cos(phi) * r, y: y, z: Math.sin(phi) * r, dezena: i + 1 });
+    }
+    return pontos;
+  }
+
+  var cachePontosGlobo = null, cacheNGlobo = 0;
+
+  function desenharGlobo() {
+    var canvas = document.getElementById("mapaGloboCanvas");
+    if (!canvas || !MPL_STATE.modalidade) return;
+    if (typeof isSuperSete === "function" && isSuperSete(MPL_STATE.modalidade)) {
+      var ctxMsg = canvas.getContext("2d");
+      ctxMsg.clearRect(0, 0, canvas.width, canvas.height);
+      ctxMsg.fillStyle = "#8fa3c4"; ctxMsg.font = "12px sans-serif"; ctxMsg.textAlign = "center";
+      ctxMsg.fillText("Visão de globo não se aplica ao Super Sete (estrutura posicional).", canvas.width / 2, canvas.height / 2);
+      return;
+    }
+    var n = MPL_STATE.modalidade.universo;
+    if (cacheNGlobo !== n) { cachePontosGlobo = pontosEsfera(n); cacheNGlobo = n; }
+
+    var ctx = canvas.getContext("2d");
+    var cx = canvas.width / 2, cy = canvas.height / 2;
+    var R = 140;
+    var cor = (typeof obterCorModalidade === "function") ? obterCorModalidade(MPL_STATE.modalidade) : { principal: "#22d3ee" };
+
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+    var cosA = Math.cos(anguloGlobo), sinA = Math.sin(anguloGlobo);
+    var projetados = cachePontosGlobo.map(function (p) {
+      var xr = p.x * cosA - p.z * sinA;
+      var zr = p.x * sinA + p.z * cosA;
+      var escala = 1 / (1.8 - zr * 0.8); // perspectiva simples
+      return { sx: cx + xr * R * escala * 0.9, sy: cy + p.y * R * escala * 0.9, z: zr, dezena: p.dezena, escala: escala };
+    });
+    projetados.sort(function (a, b) { return a.z - b.z; }); // desenha fundo primeiro
+
+    projetados.forEach(function (p) {
+      var brilho = 0.35 + 0.65 * ((p.z + 1) / 2); // mais brilhante quando "na frente"
+      var raio = Math.max(2, 5 * p.escala);
+      ctx.beginPath();
+      ctx.arc(p.sx, p.sy, raio, 0, 2 * Math.PI);
+      ctx.fillStyle = cor.principal;
+      ctx.globalAlpha = brilho;
+      ctx.fill();
+      ctx.globalAlpha = 1;
+      if (p.escala > 0.85) {
+        ctx.fillStyle = "#fff";
+        ctx.font = (7 * p.escala) + "px sans-serif";
+        ctx.textAlign = "center";
+        ctx.fillText(String(p.dezena).padStart(2, "0"), p.sx, p.sy + 2.5);
+      }
+    });
+  }
+
+  function cicloGlobo() {
+    anguloGlobo += 0.008;
+    desenharGlobo();
+    requestAnimationFrame(cicloGlobo);
+  }
+
+  /* ---------- Boot ---------- */
+  var __origRenderEscopoForm = renderEscopoForm;
+  renderEscopoForm = function () {
+    var r = __origRenderEscopoForm();
+    renomearAba();
+    montarCardTimeline();
+    montarCardGlobo();
+    desenharTimeline();
+    ligarEventosTimeline();
+    return r;
+  };
+
+  document.addEventListener("DOMContentLoaded", function () {
+    setTimeout(function () {
+      renomearAba();
+      requestAnimationFrame(cicloGlobo);
+    }, 300);
+  });
+
+  // redesenha a timeline sempre que a base mudar de forma relevante (nova modalidade, import, API)
+  /* t11-C3 Fase 2: migrado para hooks */
+  if (typeof mplOn === "function") mplOn("dashboard", desenharTimeline, 80);
+})();
+/* ============================================================
+   #pessoal
+   MPL — FASE 9 (parte 3/3) — BRANDING no TXT exportado
+   COLE NO FINAL DE js/mpl-ui.js. Corrige o último ponto que
+   ainda escrevia "Mapa Parametrizável" em vez de "Método".
+   ============================================================ */
+(function () {
+  "use strict";
+  var __origExportarTXT = exportarJogosTXT;
+  exportarJogosTXT = function (qtd) {
+    var __origBaixar = baixarArquivo;
+    baixarArquivo = function (conteudo, nome, tipo) {
+      conteudo = String(conteudo).replace(/Mapa Parametriz[áa]vel das Loterias/g,
+        "Método Parametrizável de Loterias");
+      return __origBaixar(conteudo, nome, tipo);
+    };
+    try { return __origExportarTXT(qtd); }
+    finally { baixarArquivo = __origBaixar; }
+  };
+})();
+/* ============================================================
+   #pessoal
+   MPL — FASE 9.1 — Salvamento garantido após sincronizar via API
+   COLE NO FINAL DE js/mpl-ui.js.
+   ============================================================ */
+(function () {
+  "use strict";
+  var tent = 0;
+  var vigia = setInterval(function () {
+    tent++;
+    var btn = document.getElementById("btnAtualizarAPI");
+    if (btn && !btn.__salvaGarantido) {
+      btn.__salvaGarantido = true;
+      btn.addEventListener("click", function () {
+        setTimeout(async function () {
+          if (!MPL_STATE.modalidade || !MPL_STATE.base.length) return;
+          try {
+            await salvarBaseIndexedDB(MPL_STATE.base, MPL_STATE.modalidade.sigla);
+            localStorage.setItem("mplUltimaModalidade", MPL_STATE.modalidade.presetKey);
+            var el = document.getElementById("apiProgress");
+            if (el) el.innerHTML += '<div class="alert alert-ok">Base salva no IndexedDB: ' +
+              MPL_STATE.base.length + ' concursos.</div>';
+            console.log("MPL 9.1: base salva com " + MPL_STATE.base.length + " concursos.");
+          } catch (e) { console.error("MPL 9.1: falha ao salvar —", e); }
+        }, 4000); // dá tempo da sincronização terminar
+      });
+    }
+    if (tent > 40) clearInterval(vigia);
+  }, 250);
+})();
+/* ============================================================
+   #pessoal
+   MPL — t11-C3 F1.1 — corrige crash do Modo Híbrido sem modalidade
+   COLE NO FINAL DE js/mpl-ui.js.
+
+   Bug: montarPainelHibrido roda 900ms após o load e chama
+   universos(), que lê MPL_STATE.modalidade.universo. Como a
+   roleta aparece antes de qualquer modalidade ser escolhida,
+   modalidade é null → TypeError não tratado durante a janela
+   de restauração de sessão.
+
+   Correção: o próprio montarPainelHibrido já aborta se #dzcWrap
+   existir. Criamos um placeholder invisível enquanto não houver
+   modalidade e o removemos quando ela for aplicada — o painel
+   real monta normalmente ao entrar na aba Gerador.
+   ============================================================ */
+(function () {
+  "use strict";
+
+  function temModalidade() { return !!(typeof MPL_STATE !== "undefined" && MPL_STATE.modalidade); }
+
+  function bloquear() {
+    if (temModalidade() || document.getElementById("dzcWrap")) return;
+    var ph = document.createElement("div");
+    ph.id = "dzcWrap";
+    ph.setAttribute("data-placeholder", "1");
+    ph.style.display = "none";
+    (document.getElementById("geradorForm") || document.body).appendChild(ph);
+  }
+
+  function liberar() {
+    if (!temModalidade()) return;
+    var ph = document.getElementById("dzcWrap");
+    if (ph && ph.getAttribute("data-placeholder") === "1") {
+      ph.remove();
+      console.log("MPL F1.1: modalidade ativa — painel Híbrido liberado.");
+    }
+  }
+
+  bloquear();
+
+  /* libera assim que houver modalidade (dashboard só renderiza depois disso) */
+  if (typeof mplOn === "function") mplOn("dashboard", liberar, 5);
+
+  /* rede de segurança nos primeiros 12s (cobre o mount de 900ms) */
+  var t = 0;
+  var vigia = setInterval(function () {
+    t++;
+    if (temModalidade()) { liberar(); clearInterval(vigia); }
+    else bloquear();
+    if (t > 30) clearInterval(vigia);
+  }, 400);
+
+  console.log("MPL F1.1: guarda do Modo Híbrido ativa (evita crash sem modalidade).");
+})();

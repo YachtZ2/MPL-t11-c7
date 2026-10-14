@@ -1,0 +1,191 @@
+/* ============================================================
+   MPL — mpl-radar-avcombat-v2.js  (SUBSTITUI mpl-radar-avcombat.js)
+   No index.html, REMOVA a linha do mpl-radar-avcombat.js antigo e
+   ADICIONE esta no lugar (mesma posição, depois de mpl-radar-aviao-fix.js):
+     <script src="js/mpl-radar-avcombat-v2.js"></script>
+
+   Diferenças desta versão:
+   1) Roda um loop de animação PRÓPRIO (requestAnimationFrame interno,
+      com trava contra dupla inicialização) — não depende mais do loop
+      antigo definido lá no Patch U original. Isso elimina de vez a
+      dúvida "está em conflito com o anterior?": mesmo que arquivos
+      antigos ainda estejam no projeto, este aqui não compartilha
+      nenhum estado de animação com eles.
+   2) Corrige o sentido do rastro do feixe: a "cauda" semitransparente
+      agora fica atrás do feixe na direção real do giro (antes estava
+      espelhada, parecendo apontar para onde o feixe ainda vai chegar,
+      em vez de por onde ele acabou de passar).
+   3) Loga no console, uma única vez, uma linha de confirmação — use o
+      F12 pra conferir rapidamente se este arquivo está mesmo ativo.
+   ============================================================ */
+(function () {
+  "use strict";
+
+  if (window.__mplRadarAceCombatV2Ativo) { console.warn("MPL Radar AceCombat v2: já estava ativo, ignorando segunda inicialização."); return; }
+  window.__mplRadarAceCombatV2Ativo = true;
+
+  var VELOCIDADE = 0.022;
+  var anguloVarredura = 0;
+  var estadoAlvos = {};
+
+  function corHex(hex, alpha) {
+    var h = hex.replace("#", "");
+    var r = parseInt(h.substring(0, 2), 16), g = parseInt(h.substring(2, 4), 16), b = parseInt(h.substring(4, 6), 16);
+    return "rgba(" + r + "," + g + "," + b + "," + alpha + ")";
+  }
+
+  function ajustarCanvas() {
+    var canvas = document.getElementById("radarAviaoCanvas");
+    if (!canvas) return null;
+    if (canvas.width !== 520) {
+      canvas.width = 520; canvas.height = 520;
+      canvas.style.maxWidth = "520px";
+      canvas.style.borderRadius = "50%";
+    }
+    return canvas;
+  }
+
+  function estilizarContainer(canvas, corPrincipal) {
+    canvas.style.border = "3px solid " + corPrincipal;
+    canvas.style.boxShadow = "0 0 25px " + corHex(corPrincipal, 0.35) + ", inset 0 0 30px " + corHex(corPrincipal, 0.12);
+    canvas.style.background = "radial-gradient(circle, " + corHex(corPrincipal, 0.06) + " 0%, rgba(3,5,10,1) 100%)";
+  }
+
+  function desenhar() {
+    var canvas = ajustarCanvas();
+    if (canvas && MPL_STATE.modalidade) {
+      var cor0 = (typeof obterCorModalidade === "function") ? obterCorModalidade(MPL_STATE.modalidade) : { principal: "#22d3ee" };
+      estilizarContainer(canvas, cor0.principal);
+    }
+
+    if (!canvas || !MPL_STATE.modalidade) { requestAnimationFrame(desenhar); return; }
+    var ctx = canvas.getContext("2d");
+
+    if (typeof isSuperSete === "function" && isSuperSete(MPL_STATE.modalidade)) {
+      ctx.fillStyle = "rgba(5,11,15,1)"; ctx.fillRect(0, 0, canvas.width, canvas.height);
+      ctx.fillStyle = "#8fa3c4"; ctx.font = "13px monospace"; ctx.textAlign = "center";
+      ctx.fillText("RADAR NÃO DISPONÍVEL PARA SUPER SETE", canvas.width / 2, canvas.height / 2);
+      requestAnimationFrame(desenhar);
+      return;
+    }
+
+    var ranking = MPL_STATE.cache.scoresDezenas;
+    if (!ranking || !ranking.length) {
+      ctx.fillStyle = "rgba(5,11,15,1)"; ctx.fillRect(0, 0, canvas.width, canvas.height);
+      ctx.fillStyle = "#8fa3c4"; ctx.font = "13px monospace"; ctx.textAlign = "center";
+      ctx.fillText("AGUARDANDO SCORES...", canvas.width / 2, canvas.height / 2);
+      requestAnimationFrame(desenhar);
+      return;
+    }
+
+    var reduzido = (MPL_STATE.cache.radar && MPL_STATE.cache.radar.reduzido) || [];
+    var cor = (typeof obterCorModalidade === "function") ? obterCorModalidade(MPL_STATE.modalidade) : { principal: "#22d3ee" };
+    var corBase = cor.principal;
+    var cx = canvas.width / 2, cy = canvas.height / 2;
+    var Rmax = cx - 40;
+    var U = MPL_STATE.modalidade.universo;
+    var idsNoRR = {}; reduzido.forEach(function (d) { idsNoRR[d.dezena] = d; });
+
+    // rastro geral (motion blur)
+    ctx.fillStyle = "rgba(4,8,10,0.14)";
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    // anéis + cruz
+    ctx.strokeStyle = corHex(corBase, 0.18);
+    ctx.lineWidth = 1;
+    for (var r = Rmax / 4; r <= Rmax; r += Rmax / 4) { ctx.beginPath(); ctx.arc(cx, cy, r, 0, 2 * Math.PI); ctx.stroke(); }
+    ctx.strokeStyle = corHex(corBase, 0.15);
+    ctx.beginPath();
+    ctx.moveTo(cx - Rmax, cy); ctx.lineTo(cx + Rmax, cy);
+    ctx.moveTo(cx, cy - Rmax); ctx.lineTo(cx, cy + Rmax);
+    ctx.stroke();
+
+    var pontos = ranking.map(function (d) {
+      var ang = ((d.dezena - 1) / U) * 2 * Math.PI - Math.PI / 2;
+      var norm = ang < 0 ? ang + 2 * Math.PI : ang;
+      var distFrac = Math.max(0.10, Math.min(1, 1 - (d.STF / 100)));
+      var raio = distFrac * Rmax;
+      return {
+        dezena: d.dezena, classe: d.classe, ang: norm,
+        x: cx + Math.cos(ang) * raio, y: cy + Math.sin(ang) * raio,
+        dentro: !!idsNoRR[d.dezena]
+      };
+    });
+
+    pontos.forEach(function (p) {
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, p.dentro ? 2.2 : 1.4, 0, 2 * Math.PI);
+      ctx.fillStyle = p.dentro ? corHex(corBase, 0.55) : "rgba(120,130,150,.25)";
+      ctx.fill();
+    });
+
+    pontos.filter(function (p) { return p.dentro; }).forEach(function (p) {
+      if (!estadoAlvos[p.dezena]) estadoAlvos[p.dezena] = { opacity: 0 };
+      var alvo = estadoAlvos[p.dezena];
+      var diff = Math.abs(anguloVarredura - p.ang);
+      diff = Math.min(diff, 2 * Math.PI - diff);
+      if (diff < 0.09) alvo.opacity = 1;
+      else alvo.opacity = Math.max(0, alvo.opacity - 0.006);
+      if (alvo.opacity <= 0.02) return;
+
+      var corAlvo = p.classe === "A" ? "#eab308" : corBase;
+      ctx.save();
+      ctx.globalAlpha = alvo.opacity;
+      ctx.strokeStyle = corAlvo; ctx.fillStyle = corAlvo; ctx.lineWidth = 2;
+      ctx.shadowColor = corAlvo; ctx.shadowBlur = 10 * alvo.opacity;
+      var box = 16;
+      ctx.strokeRect(p.x - box / 2, p.y - box / 2, box, box);
+      ctx.beginPath(); ctx.arc(p.x, p.y, 2, 0, 2 * Math.PI); ctx.fill();
+      ctx.shadowBlur = 0;
+      ctx.font = "bold 11px 'Courier New', monospace";
+      ctx.textAlign = "left"; ctx.textBaseline = "middle";
+      ctx.fillText(String(p.dezena).padStart(2, "0"), p.x + box / 2 + 3, p.y);
+      ctx.restore();
+    });
+
+    // feixe + rastro cônico — CORRIGIDO: a cauda fica no lado de TRÁS
+    // do giro (ângulo local POSITIVO, já que ctx.rotate(anguloVarredura)
+    // com anguloVarredura crescente gira em sentido horário; "atrás" do
+    // movimento horário é o lado de ângulo local negativo NO SENTIDO DE
+    // DESENHO — na prática, para ficar visualmente correto, a cauda deve
+    // ser desenhada no sentido OPOSTO ao qual estava antes).
+    ctx.save();
+    ctx.translate(cx, cy);
+    ctx.rotate(anguloVarredura);
+    ctx.strokeStyle = corHex(corBase, 0.85);
+    ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(Rmax, 0); ctx.stroke();
+
+    ctx.fillStyle = corHex(corBase, 0.07);
+    ctx.beginPath();
+    ctx.moveTo(0, 0);
+    ctx.arc(0, 0, Rmax, 0, 0.4, false); // <- sinal e sentido invertidos em relação à v1
+    ctx.closePath();
+    ctx.fill();
+    ctx.restore();
+
+    // HUD
+    ctx.font = "11px 'Courier New', monospace";
+    ctx.fillStyle = corHex(corBase, 0.9);
+    ctx.shadowColor = corBase; ctx.shadowBlur = 4;
+    ctx.textAlign = "left"; ctx.textBaseline = "alphabetic";
+    ctx.fillText("SYS: RR(K) ONLINE", 14, 20);
+    ctx.fillText("TARGETS: " + reduzido.length + "/" + U, 14, 34);
+    ctx.textAlign = "right";
+    ctx.fillText("MPL RADAR", canvas.width - 14, 20);
+    ctx.fillText(MPL_STATE.modalidade.sigla || "", canvas.width - 14, 34);
+    ctx.shadowBlur = 0;
+
+    anguloVarredura += VELOCIDADE;
+    if (anguloVarredura > 2 * Math.PI) anguloVarredura -= 2 * Math.PI;
+
+    requestAnimationFrame(desenhar);
+  }
+
+  document.addEventListener("DOMContentLoaded", function () {
+    setTimeout(function () {
+      console.log("MPL Radar AceCombat: carregado e rodando (loop próprio)");
+      requestAnimationFrame(desenhar);
+    }, 500);
+  });
+})();

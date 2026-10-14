@@ -1,0 +1,451 @@
+/* ============================================================
+   MPL — mpl-scoring.js
+   SIC, SF, SA, SC, SRT (Teia), SEI, SU, STF, CAM/FAM/RAP, RQR/RC/IER
+   Fórmulas canônicas — Volume 0 e Volume 1
+   ============================================================ */
+
+/* ---------------- SIC — Score Inicial de Camadas ---------------- */
+function calcularSIC(dezena, base, camadas) {
+  let sicBase = 0;
+  const freqPorCamada = {};
+  let menorCamadaPresente = null;
+
+  camadas.forEach(c => {
+    const janela = base.slice(Math.max(0, base.length - c.janela));
+    const presente = janela.some(x => x.dezenas.includes(dezena));
+    const freq = janela.filter(x => x.dezenas.includes(dezena)).length;
+    freqPorCamada[c.id] = freq;
+    if (presente) {
+      sicBase += c.peso;
+      if (menorCamadaPresente === null) menorCamadaPresente = c.id;
+    }
+  });
+
+  const pesosBFC = { C1: 2.00, C2: 1.50, C3: 1.20, C4: 0.80, C5: 0.50 };
+  let bfc = 0;
+  camadas.forEach(c => { bfc += (pesosBFC[c.id] || 0) * (freqPorCamada[c.id] || 0); });
+  const bfcLimitado = Math.min(bfc, 20);
+
+  const escalaPAR = { C1: 0, C2: -3, C3: -7, C4: -12, C5: -18, NENHUMA: -25 };
+  const par = escalaPAR[menorCamadaPresente] ?? escalaPAR.NENHUMA;
+
+  return { sic: limitar(sicBase + bfcLimitado + par, 0, 100), sicBase, bfc: bfcLimitado, par, freqPorCamada };
+}
+
+/* ---------------- SF — Score de Frequência ---------------- */
+function scoreFreqRelativa(freqObservada, janela, FE) {
+  const freqEsperada = FE * janela;
+  if (freqEsperada === 0) return 50;
+  return limitar(50 + ((freqObservada - freqEsperada) / freqEsperada) * 50, 0, 100);
+}
+
+function calcularSF(dezena, base, modalidade, janelas) {
+  const FE = calcularFE(modalidade.dezenasSorteadas, modalidade.universo);
+  const curtaN = contarFrequencia(base, dezena, janelas.curta);
+  const mediaN = contarFrequencia(base, dezena, janelas.media);
+  const longaN = contarFrequencia(base, dezena, janelas.longa);
+  const historicaN = base.filter(c => c.dezenas.includes(dezena)).length;
+
+  const sCurta = scoreFreqRelativa(curtaN, Math.min(janelas.curta, base.length), FE);
+  const sMedia = scoreFreqRelativa(mediaN, Math.min(janelas.media, base.length), FE);
+  const sLonga = scoreFreqRelativa(longaN, Math.min(janelas.longa, base.length), FE);
+  const sHistorica = scoreFreqRelativa(historicaN, base.length, FE);
+
+  // BTR — Bônus de Tendência de Frequência: compara curta vs longa
+  const btr = limitar((sCurta - sLonga) * 0.15, -8, 8);
+
+  const sfBase = 0.35 * sCurta + 0.25 * sMedia + 0.20 * sLonga + 0.20 * sHistorica;
+  return { sf: limitar(sfBase + btr, 0, 100), sCurta, sMedia, sLonga, sHistorica, btr };
+}
+
+/* ---------------- SA — Score de Ausência ---------------- */
+function calcularSA(dezena, base, modalidade, sfValor = null) {
+  const AE = calcularAE(modalidade.dezenasSorteadas, modalidade.universo);
+  const atual = ausenciaAtual(base, dezena);
+  const posicoes = posicoesDezena(base, dezena);
+  const intervalos = intervalosDezena(posicoes);
+  const ausenciaMediaHist = intervalos.length ? media(intervalos) : AE;
+
+  // SPA — proporção da ausência atual sobre a esperada, com curva de maturação (saturante)
+  const razao = AE > 0 ? atual / AE : 0;
+  const spa = limitar(100 * (1 - Math.exp(-razao)), 0, 100);
+
+  // SAE — compatibilidade entre ausência atual e distribuição histórica de ausências (percentil invertido em torno do centro)
+  const percentilAtual = intervalos.length ? (intervalos.filter(v => v <= atual).length / intervalos.length) * 100 : 50;
+  const sae = limitar(100 - Math.abs(percentilAtual - 60) * 1.5, 0, 100);
+
+  // SMAH — compatibilidade com a média histórica de ausência dessa dezena
+  const smah = ausenciaMediaHist > 0 ? limitar(100 - (Math.abs(atual - ausenciaMediaHist) / ausenciaMediaHist) * 60, 0, 100) : 50;
+
+  let saBase = 0.45 * spa + 0.35 * sae + 0.20 * smah;
+  if (sfValor !== null) {
+    const scf = 0.70 + 0.30 * (sfValor / 100); // SCF — Sincronia Complementar com Frequência
+    saBase = saBase * scf;
+  }
+  return { sa: limitar(saBase, 0, 100), spa, sae, smah, atual, ausenciaMediaHist };
+}
+
+/* ---------------- SC — Score de Ciclo ---------------- */
+function calcularSC(dezena, base, saValor = null) {
+  const posicoes = posicoesDezena(base, dezena);
+  const intervalos = intervalosDezena(posicoes);
+  if (intervalos.length < 2) return { sc: 50, spcic: 50, rct: 50, erc: 50, tcr: 50, crc: 50 };
+
+  const cicloMedio = media(intervalos);
+  const cicloDesvio = desvioPadrao(intervalos);
+  const cv = cicloMedio > 0 ? cicloDesvio / cicloMedio : 1;
+  const atual = ausenciaAtual(base, dezena);
+
+  // SPCIC — posição relativa dentro do ciclo (pico quando atual ~ cicloMedio)
+  const posRelativa = cicloMedio > 0 ? atual / cicloMedio : 1;
+  const spcic = limitar(100 * Math.exp(-((posRelativa - 1) ** 2) * 2), 0, 100);
+
+  // ERC — estabilidade do ciclo (menor CV = mais estável = maior score)
+  const erc = limitar(100 * (1 - Math.min(cv, 1)), 0, 100);
+
+  // RCT — ritmo de ciclo recente (compara últimos intervalos com a média geral)
+  const ultimosIntervalos = intervalos.slice(-3);
+  const mediaRecente = ultimosIntervalos.length ? media(ultimosIntervalos) : cicloMedio;
+  const rct = cicloMedio > 0 ? limitar(100 - (Math.abs(mediaRecente - cicloMedio) / cicloMedio) * 60, 0, 100) : 50;
+
+  // TCR — tendência de ciclo (comparação metade inicial vs metade final)
+  const metade = Math.floor(intervalos.length / 2);
+  const tcr = metade > 0
+    ? limitar(100 - (Math.abs(media(intervalos.slice(0, metade)) - media(intervalos.slice(metade))) / cicloMedio) * 50, 0, 100)
+    : 50;
+
+  // CRC — confiabilidade do ciclo (função do tamanho da amostra de intervalos)
+  const crc = limitar(40 + Math.min(intervalos.length, 20) * 3, 0, 100);
+
+  let scBase = 0.35 * spcic + 0.20 * rct + 0.15 * erc + 0.15 * tcr + 0.15 * crc;
+  if (saValor !== null) {
+    const cca = 0.70 + 0.30 * (saValor / 100);
+    scBase = scBase * cca;
+  }
+  return { sc: limitar(scBase, 0, 100), spcic, rct, erc, tcr, crc, cicloMedio, cv };
+}
+
+/* ---------------- SRT — Score de Relevância na Teia ---------------- */
+function construirTeia(base) {
+  const contagemIndividual = {};
+  const contagemDuplas = {};
+  const contagemTriplas = {};
+  let totalConcursos = base.length;
+
+  base.forEach(c => {
+    const dz = c.dezenas;
+    dz.forEach(d => contagemIndividual[d] = (contagemIndividual[d] || 0) + 1);
+    for (let i = 0; i < dz.length; i++) {
+      for (let j = i + 1; j < dz.length; j++) {
+        const key = `${dz[i]}-${dz[j]}`;
+        contagemDuplas[key] = (contagemDuplas[key] || 0) + 1;
+      }
+    }
+    for (let i = 0; i < dz.length; i++) {
+      for (let j = i + 1; j < dz.length; j++) {
+        for (let k = j + 1; k < dz.length; k++) {
+          const key = `${dz[i]}-${dz[j]}-${dz[k]}`;
+          contagemTriplas[key] = (contagemTriplas[key] || 0) + 1;
+        }
+      }
+    }
+  });
+
+  const liftDuplas = {};
+  Object.keys(contagemDuplas).forEach(key => {
+    const [a, b] = key.split("-").map(Number);
+    const pA = contagemIndividual[a] / totalConcursos;
+    const pB = contagemIndividual[b] / totalConcursos;
+    const pAB = contagemDuplas[key] / totalConcursos;
+    liftDuplas[key] = (pA * pB) > 0 ? pAB / (pA * pB) : 0;
+  });
+
+  return { contagemIndividual, contagemDuplas, contagemTriplas, liftDuplas, totalConcursos };
+}
+
+function calcularSRT(dezena, base, teia) {
+  const chavesConectadas = Object.keys(teia.contagemDuplas).filter(k => k.split("-").map(Number).includes(dezena));
+  if (!chavesConectadas.length) return { srt: 30, frd2: 0, frd3: 0, ct: 0, cft: 0, er: 0 };
+
+  const forcasDuplas = chavesConectadas.map(k => teia.liftDuplas[k] || 0);
+  const frd2 = limitar(50 * media(forcasDuplas), 0, 100);
+
+  const chavesTriplas = Object.keys(teia.contagemTriplas).filter(k => k.split("-").map(Number).includes(dezena));
+  const frd3 = chavesTriplas.length ? limitar(100 * (media(chavesTriplas.map(k => teia.contagemTriplas[k])) / teia.totalConcursos) * 20, 0, 100) : 0;
+
+  // CT — grau de centralidade (nº de conexões fortes, lift>1)
+  const conexoesFortes = forcasDuplas.filter(v => v > 1).length;
+  const ct = limitar((conexoesFortes / Math.max(1, chavesConectadas.length)) * 100, 0, 100);
+
+  // CFT — conexão com dezenas fortes (frequência global das parceiras)
+  const parceiras = chavesConectadas.map(k => k.split("-").map(Number).find(d => d !== dezena));
+  const freqParceiras = parceiras.map(p => teia.contagemIndividual[p] || 0);
+  const cft = limitar(100 * (media(freqParceiras) / teia.totalConcursos) * 4, 0, 100);
+
+  // ER — estabilidade relacional (variabilidade das forças de conexão)
+  const er = limitar(100 - desvioPadrao(forcasDuplas) * 20, 0, 100);
+
+  const srt = limitar(0.35 * frd2 + 0.15 * frd3 + 0.20 * ct + 0.20 * cft + 0.10 * er, 0, 100);
+  return { srt, frd2, frd3, ct, cft, er };
+}
+
+/* ---------------- SEI — Score Estrutural Individual ---------------- */
+function calcularSEI(dezena, base, modalidade) {
+  const { universo } = modalidade;
+  const faixaTamanho = Math.ceil(universo / 3);
+  const faixaDezena = Math.floor((dezena - 1) / faixaTamanho);
+  const totalPorFaixa = { 0: 0, 1: 0, 2: 0 };
+  let totalDezenasSorteadas = 0;
+  base.forEach(c => c.dezenas.forEach(d => {
+    const f = Math.floor((d - 1) / faixaTamanho);
+    totalPorFaixa[f] = (totalPorFaixa[f] || 0) + 1;
+    totalDezenasSorteadas++;
+  }));
+  const esperadoPorFaixa = totalDezenasSorteadas / 3;
+  const sfxi = esperadoPorFaixa > 0 ? limitar(100 - Math.abs((totalPorFaixa[faixaDezena] || 0) - esperadoPorFaixa) / esperadoPorFaixa * 40, 0, 100) : 50;
+
+  const par = dezena % 2 === 0;
+  const totalPares = base.reduce((acc, c) => acc + c.dezenas.filter(d => d % 2 === 0).length, 0);
+  const propPares = totalDezenasSorteadas > 0 ? totalPares / totalDezenasSorteadas : 0.5;
+  const spari = limitar(100 - Math.abs((par ? propPares : (1 - propPares)) - 0.5) * 100, 0, 100);
+
+  const ehExtremo = dezena <= Math.ceil(universo * 0.1) || dezena >= Math.floor(universo * 0.9);
+  const sexi = ehExtremo ? 45 : 65;
+
+  return { sei: limitar(0.45 * sfxi + 0.35 * spari + 0.20 * sexi, 0, 100), sfxi, spari, sexi };
+}
+
+/* ---------------- SU — Score do Usuário (nível dezena) ---------------- */
+function calcularSU(dezena, suConfig) {
+  if (suConfig.proibidas.includes(dezena)) return 0;
+  let ajuste = 0;
+  if (suConfig.fixas.includes(dezena)) ajuste += 50;
+  if (suConfig.preferenciais.includes(dezena)) ajuste += 15;
+  if (suConfig.evitar.includes(dezena)) ajuste -= 15;
+  ajuste += (suConfig.pesoManual[dezena] || 0);
+  (suConfig.grupos || []).forEach(g => { if (g.dezenas.includes(dezena)) ajuste += (g.peso || 5); });
+  return limitar(50 + ajuste, 0, 100);
+}
+
+/* ---------------- RAP — Reescalonamento Automático de Pesos ---------------- */
+function reescalonarPesos(pesos, ativos) {
+  const soma = Object.keys(pesos).filter(k => ativos[k]).reduce((acc, k) => acc + pesos[k], 0);
+  const novo = {};
+  Object.keys(pesos).forEach(k => { novo[k] = (ativos[k] && soma > 0) ? pesos[k] / soma : 0; });
+  return novo;
+}
+
+/* ---------------- STF — Score Total Final da Dezena ---------------- */
+function calcularSTF(scores, pesos) {
+  return limitar(
+    pesos.SIC * scores.SIC + pesos.SF * scores.SF + pesos.SA * scores.SA +
+    pesos.SC * scores.SC + pesos.SRT * scores.SRT + pesos.SEI * scores.SEI + pesos.SU * scores.SU,
+    0, 100
+  );
+}
+
+function classeSTF(valor) {
+  if (valor >= 85) return "A";
+  if (valor >= 70) return "B";
+  if (valor >= 55) return "C";
+  if (valor >= 40) return "D";
+  if (valor >= 25) return "E";
+  return "E";
+}
+
+/* ---------------- Pipeline completo: gera ranking de todas as dezenas ---------------- */
+function gerarRankingDezenas(base, modalidade, config) {
+  const teia = construirTeia(base);
+  const pesosAtivos = reescalonarPesos(config.pesosPerfil, config.modulosAtivos);
+  const ranking = [];
+
+  for (let d = 1; d <= modalidade.universo; d++) {
+    const sicR = calcularSIC(d, base, config.camadas);
+    const sfR = calcularSF(d, base, modalidade, config.janelasFrequencia);
+    const saR = calcularSA(d, base, modalidade, sfR.sf);
+    const scR = calcularSC(d, base, saR.sa);
+    const srtR = calcularSRT(d, base, teia);
+    const seiR = calcularSEI(d, base, modalidade);
+    const suVal = calcularSU(d, config.su);
+
+    const scores = { SIC: sicR.sic, SF: sfR.sf, SA: saR.sa, SC: scR.sc, SRT: srtR.srt, SEI: seiR.sei, SU: suVal };
+    const stf = calcularSTF(scores, pesosAtivos);
+
+    ranking.push({
+      dezena: d, STF: stf, classe: classeSTF(stf),
+      SIC: sicR.sic, SF: sfR.sf, SA: saR.sa, SC: scR.sc, SRT: srtR.srt, SEI: seiR.sei, SU: suVal,
+      detalhes: { sicR, sfR, saR, scR, srtR, seiR }
+    });
+  }
+  ranking.sort((a, b) => b.STF - a.STF);
+  return { ranking, teia, pesosAtivos };
+}
+
+/* ---------------- RQR — Redução Qualificada / RR(K) ---------------- */
+function gerarRR(rankingDezenas, K, fixas = [], proibidas = []) {
+  const filtradas = rankingDezenas.filter(d => !proibidas.includes(d.dezena));
+  const selecionadas = [];
+  fixas.forEach(f => {
+    const item = filtradas.find(d => d.dezena === f);
+    if (item && !selecionadas.includes(item)) selecionadas.push(item);
+  });
+  filtradas.forEach(item => {
+    if (selecionadas.length < K && !selecionadas.includes(item)) selecionadas.push(item);
+  });
+  return selecionadas.slice(0, K).sort((a, b) => a.dezena - b.dezena);
+}
+
+function combinacao(n, k) {
+  if (k < 0 || k > n) return 0;
+  let res = 1;
+  for (let i = 1; i <= k; i++) res = (res * (n - i + 1)) / i;
+  return Math.round(res);
+}
+
+/* RC = 1 - C(K,A)/C(U,A) */
+function calcularRC(K, A, U) {
+  const cU = combinacao(U, A);
+  return cU > 0 ? 1 - (combinacao(K, A) / cU) : 0;
+}
+
+function calcularIER(coberturaRelativa, rc) { return coberturaRelativa * rc; }
+/* ============================================================
+   #pessoal
+   MPL — PATCH A (Super Sete) — SCORES POSICIONAIS POR COLUNA
+   Append-only. Não altera o comportamento das demais modalidades.
+   Ativa apenas quando isSuperSete(modalidade) === true.
+   ============================================================ */
+(function () {
+  "use strict";
+
+  /* ---- utilitários posicionais (série de dígitos de UMA coluna) ---- */
+  function serieColunaSS(base, coluna) {
+    return base.map(c => Number(c.dezenas[coluna])).filter(v => !isNaN(v));
+  }
+  function freqDigitoSS(serie, d, janela) {
+    const ini = Math.max(0, serie.length - janela);
+    return serie.slice(ini).filter(x => x === d).length;
+  }
+  function posicoesDigitoSS(serie, d) {
+    const p = []; serie.forEach((x, i) => { if (x === d) p.push(i); }); return p;
+  }
+  function ausenciaAtualDigitoSS(serie, d) {
+    for (let i = serie.length - 1; i >= 0; i--) if (serie[i] === d) return (serie.length - 1) - i;
+    return serie.length;
+  }
+
+  /* ---- SIC posicional (mesmas camadas/pesos canônicos) ---- */
+  function sicPosicionalSS(serie, d, camadas) {
+    let sicBase = 0; const freqCam = {}; let menorCam = null;
+    camadas.forEach(c => {
+      const jan = serie.slice(Math.max(0, serie.length - c.janela));
+      const freq = jan.filter(x => x === d).length;
+      freqCam[c.id] = freq;
+      if (freq > 0) { sicBase += c.peso; if (menorCam === null) menorCam = c.id; }
+    });
+    const pesosBFC = { C1: 2.00, C2: 1.50, C3: 1.20, C4: 0.80, C5: 0.50 };
+    let bfc = 0; camadas.forEach(c => { bfc += (pesosBFC[c.id] || 0) * (freqCam[c.id] || 0); });
+    bfc = Math.min(bfc, 20);
+    const par = { C1: 0, C2: -3, C3: -7, C4: -12, C5: -18, NENHUMA: -25 };
+    const p = par[menorCam] ?? par.NENHUMA;
+    return limitar(sicBase + bfc + p, 0, 100);
+  }
+
+  /* ---- SF posicional: FE = 1/10 (uma dezena de 10 por coluna) ---- */
+  function sfPosicionalSS(serie, d) {
+    const FE = 0.1;
+    const rel = (obs, jan) => { const esp = FE * jan; return esp === 0 ? 50 : limitar(50 + ((obs - esp) / esp) * 50, 0, 100); };
+    const cN = freqDigitoSS(serie, d, 10), mN = freqDigitoSS(serie, d, 30), lN = freqDigitoSS(serie, d, 100);
+    const hN = serie.filter(x => x === d).length;
+    const sC = rel(cN, Math.min(10, serie.length));
+    const sM = rel(mN, Math.min(30, serie.length));
+    const sL = rel(lN, Math.min(100, serie.length));
+    const sH = rel(hN, serie.length);
+    const btr = limitar((sC - sL) * 0.15, -8, 8);
+    return limitar(0.35 * sC + 0.25 * sM + 0.20 * sL + 0.20 * sH + btr, 0, 100);
+  }
+
+  /* ---- SA posicional: AE = (10/1)-1 = 9, com curva de maturação ---- */
+  function saPosicionalSS(serie, d, sfValor) {
+    const AE = 9;
+    const atual = ausenciaAtualDigitoSS(serie, d);
+    const pos = posicoesDigitoSS(serie, d);
+    const intervalos = []; for (let i = 1; i < pos.length; i++) intervalos.push(pos[i] - pos[i - 1]);
+    const amh = intervalos.length ? media(intervalos) : AE;
+    const razao = AE > 0 ? atual / AE : 0;
+    const spa = limitar(100 * (1 - Math.exp(-razao)), 0, 100);
+    const perc = intervalos.length ? (intervalos.filter(v => v <= atual).length / intervalos.length) * 100 : 50;
+    const sae = limitar(100 - Math.abs(perc - 60) * 1.5, 0, 100);
+    const smah = amh > 0 ? limitar(100 - (Math.abs(atual - amh) / amh) * 60, 0, 100) : 50;
+    let saBase = 0.45 * spa + 0.35 * sae + 0.20 * smah;
+    if (sfValor !== null) { const scf = 0.70 + 0.30 * (sfValor / 100); saBase *= scf; }
+    return limitar(saBase, 0, 100);
+  }
+
+  /* ---- SC posicional (ritmo de reaparição do dígito na coluna) ---- */
+  function scPosicionalSS(serie, d, saValor) {
+    const pos = posicoesDigitoSS(serie, d);
+    const intervalos = []; for (let i = 1; i < pos.length; i++) intervalos.push(pos[i] - pos[i - 1]);
+    if (intervalos.length < 2) return 50;
+    const cicloMedio = media(intervalos), cicloDesvio = desvioPadrao(intervalos);
+    const cv = cicloMedio > 0 ? cicloDesvio / cicloMedio : 1;
+    const atual = ausenciaAtualDigitoSS(serie, d);
+    const posRel = cicloMedio > 0 ? atual / cicloMedio : 1;
+    const spcic = limitar(100 * Math.exp(-((posRel - 1) ** 2) * 2), 0, 100);
+    const erc = limitar(100 * (1 - Math.min(cv, 1)), 0, 100);
+    const ult = intervalos.slice(-3); const mr = ult.length ? media(ult) : cicloMedio;
+    const rct = cicloMedio > 0 ? limitar(100 - (Math.abs(mr - cicloMedio) / cicloMedio) * 60, 0, 100) : 50;
+    const metade = Math.floor(intervalos.length / 2);
+    const tcr = metade > 0 ? limitar(100 - (Math.abs(media(intervalos.slice(0, metade)) - media(intervalos.slice(metade))) / cicloMedio) * 50, 0, 100) : 50;
+    const crc = limitar(40 + Math.min(intervalos.length, 20) * 3, 0, 100);
+    let scBase = 0.35 * spcic + 0.20 * rct + 0.15 * erc + 0.15 * tcr + 0.15 * crc;
+    if (saValor !== null) { const cca = 0.70 + 0.30 * (saValor / 100); scBase *= cca; }
+    return limitar(scBase, 0, 100);
+  }
+
+  /* ---- Ranking posicional: 7 colunas × dígitos 0–9 ---- */
+  window.gerarRankingSuperSete = function (base, modalidade, config) {
+    const NCOL = 7;
+    const camadas = config.camadas;
+    const pesos = reescalonarPesos(
+      { SIC: config.pesosPerfil.SIC, SF: config.pesosPerfil.SF, SA: config.pesosPerfil.SA, SC: config.pesosPerfil.SC },
+      { SIC: config.modulosAtivos.SIC, SF: config.modulosAtivos.SF, SA: config.modulosAtivos.SA, SC: config.modulosAtivos.SC }
+    );
+    const colunas = [];
+    for (let c = 0; c < NCOL; c++) {
+      const serie = serieColunaSS(base, c);
+      const rankCol = [];
+      for (let d = 0; d <= 9; d++) {
+        const sic = sicPosicionalSS(serie, d, camadas);
+        const sf = sfPosicionalSS(serie, d);
+        const sa = saPosicionalSS(serie, d, config.modulosAtivos.SF ? sf : null);
+        const sc = scPosicionalSS(serie, d, config.modulosAtivos.SA ? sa : null);
+        const stf = limitar(pesos.SIC * sic + pesos.SF * sf + pesos.SA * sa + pesos.SC * sc, 0, 100);
+        rankCol.push({ digito: d, STF: stf, classe: classeSTF(stf), SIC: sic, SF: sf, SA: sa, SC: sc, ausencia: ausenciaAtualDigitoSS(serie, d) });
+      }
+      rankCol.sort((a, b) => b.STF - a.STF);
+      colunas.push({ coluna: c, ranking: rankCol });
+    }
+    // ranking agregado (0–9) apenas para compatibilidade de telas genéricas
+    const agg = [];
+    for (let d = 0; d <= 9; d++) {
+      const stfs = colunas.map(col => col.ranking.find(r => r.digito === d).STF);
+      const mm = media(stfs);
+      agg.push({ dezena: d, STF: mm, classe: classeSTF(mm), SIC: 0, SF: 0, SA: 0, SC: 0, SRT: 0, SEI: 0, SU: 0 });
+    }
+    agg.sort((a, b) => b.STF - a.STF);
+    const teia = { contagemIndividual: {}, contagemDuplas: {}, contagemTriplas: {}, liftDuplas: {}, totalConcursos: base.length };
+    if (MPL_STATE.cache) MPL_STATE.cache.scoresSuperSete = colunas;
+    return { ranking: agg, teia, pesosAtivos: pesos, superSete: true, colunas };
+  };
+
+  /* ---- Monkey-patch seguro: desvia Super Sete; mantém o resto idêntico ---- */
+  const __origGerarRanking = gerarRankingDezenas;
+  gerarRankingDezenas = function (base, modalidade, config) {
+    if (typeof isSuperSete === "function" && isSuperSete(modalidade)) {
+      return window.gerarRankingSuperSete(base, modalidade, config);
+    }
+    if (MPL_STATE.cache) MPL_STATE.cache.scoresSuperSete = null;
+    return __origGerarRanking(base, modalidade, config);
+  };
+})();

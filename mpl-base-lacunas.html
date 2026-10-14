@@ -1,0 +1,126 @@
+/* ============================================================
+   #pessoal
+   MPL — mpl-base-lacunas.js — Diagnóstico e reparo de lacunas
+   ARQUIVO NOVO. No index.html, carregue APÓS mpl-ui.js.
+
+   Causa do problema: o AIB é "forward only" — parte do MAIOR
+   número local e busca só o que vem depois. Se um concurso do
+   meio falhar (timeout, proxy, aba fechada), ele nunca mais é
+   procurado, e a contagem fica menor que o último número sem
+   que nada avise.
+
+   Este módulo varre a base, lista os números ausentes e busca
+   cada um via API, salvando ao final.
+   ============================================================ */
+(function () {
+  "use strict";
+  var faltando = [], rodando = false;
+
+  function analisar() {
+    var b = MPL_STATE.base.map(function (c) { return c.numero; }).sort(function (x, y) { return x - y; });
+    if (!b.length) return { vazia: true };
+    var f = [];
+    for (var i = 1; i < b.length; i++) {
+      if (b[i] === b[i - 1]) continue;
+      for (var n = b[i - 1] + 1; n < b[i]; n++) f.push(n);
+    }
+    return { primeiro: b[0], ultimo: b[b.length - 1], tenho: b.length,
+      esperado: b[b.length - 1] - b[0] + 1, faltando: f };
+  }
+
+  function montar() {
+    var alvo = document.getElementById("apiConflitos");
+    if (!alvo || document.getElementById("lacunasCard")) return;
+    var card = document.createElement("div");
+    card.className = "card";
+    card.id = "lacunasCard";
+    card.innerHTML = '<h3>🔍 Integridade da Base</h3><div id="lacunasConteudo"></div>';
+    alvo.closest(".card").parentNode.appendChild(card);
+    render();
+  }
+
+  function render() {
+    var el = document.getElementById("lacunasConteudo");
+    if (!el) return;
+    if (!MPL_STATE.modalidade || !MPL_STATE.base.length) {
+      el.innerHTML = '<p class="muted">Nenhuma base carregada.</p>'; return;
+    }
+    var r = analisar();
+    faltando = r.faltando || [];
+
+    var resumo = '<div class="grid-cards">' +
+      card2("Primeiro concurso", r.primeiro) +
+      card2("Último concurso", r.ultimo) +
+      card2("Concursos na base", r.tenho) +
+      card2("Esperado no intervalo", r.esperado) +
+      '</div>';
+
+    if (!faltando.length) {
+      el.innerHTML = resumo + '<div class="alert alert-ok">Nenhuma lacuna: a base tem todos os concursos de ' +
+        r.primeiro + ' a ' + r.ultimo + ' de forma contínua.</div>';
+      return;
+    }
+
+    el.innerHTML = resumo +
+      '<div class="alert alert-warn"><b>' + faltando.length + ' concurso(s) faltando</b> dentro do intervalo: ' +
+      faltando.slice(0, 40).map(function (n) { return '<span class="pill">' + n + '</span>'; }).join("") +
+      (faltando.length > 40 ? ' <span class="muted">…e mais ' + (faltando.length - 40) + '</span>' : '') +
+      '</div>' +
+      '<p class="muted" style="font-size:11.5px;">Isso acontece quando uma busca falha no meio do processo. A atualização normal não recupera esses casos, porque ela só olha para frente.</p>' +
+      '<button id="btnRepararLacunas" class="btn-primary"' + (rodando ? " disabled" : "") + '>' +
+      (rodando ? "Buscando…" : "Buscar concursos faltantes via API") + '</button>' +
+      '<div id="lacunasProgresso" class="muted" style="margin-top:6px;"></div>';
+
+    var b = document.getElementById("btnRepararLacunas");
+    if (b && !b.__l) { b.__l = true; b.addEventListener("click", reparar); }
+  }
+
+  function card2(l, v) {
+    return '<div class="stat-card"><div class="label">' + l + '</div><div class="value">' + v + '</div></div>';
+  }
+
+  async function reparar() {
+    if (rodando || !faltando.length) return;
+    rodando = true; render();
+    var prog = document.getElementById("lacunasProgresso");
+    var key = MPL_STATE.modalidade.presetKey, novos = [], falhas = [];
+
+    for (var i = 0; i < faltando.length; i++) {
+      var n = faltando[i];
+      if (prog) prog.textContent = "Buscando concurso " + n + " (" + (i + 1) + " de " + faltando.length + ")…";
+      try {
+        var c = await getConcursoPorNumeroAPI(key, n);
+        var v = validarRespostaCaixa(c, MPL_STATE.modalidade);
+        if (!v.valido) { falhas.push(n + " (" + v.motivo + ")"); continue; }
+        var reg = { numero: c.numero, data: c.data, dezenas: c.dezenas, campoExtra: c.campoExtra };
+        if (c.dezenas2) reg.dezenas2 = c.dezenas2;
+        if (c.premiacoes) reg.premiacoes = c.premiacoes;
+        if (c.acumulado !== undefined) reg.acumulado = c.acumulado;
+        if (c.valorAcumuladoProximo) reg.valorAcumuladoProximo = c.valorAcumuladoProximo;
+        novos.push(reg);
+      } catch (e) { falhas.push(n + " (" + e.message + ")"); }
+    }
+
+    if (novos.length) {
+      var r = atualizarBaseIncremental(MPL_STATE.base, novos);
+      MPL_STATE.base = r.resultado;
+      await salvarBaseIndexedDB(MPL_STATE.base, MPL_STATE.modalidade.sigla);
+      if (typeof renderBaseTable === "function") renderBaseTable();
+      if (typeof atualizarBadgeEscopo === "function") atualizarBadgeEscopo();
+      if (typeof agendarRAE === "function") agendarRAE("lacunas", 300);
+    }
+
+    rodando = false; render();
+    var p = document.getElementById("lacunasProgresso");
+    if (p) p.innerHTML = '<div class="alert alert-ok">' + novos.length + ' concurso(s) recuperados e salvos.' +
+      (falhas.length ? ' Falhas: ' + falhas.join(", ") : '') + '</div>';
+  }
+
+  document.querySelectorAll(".tab-btn").forEach(function (b) {
+    if (b.dataset.tab === "api") b.addEventListener("click", function () { setTimeout(function () { montar(); render(); }, 80); });
+  });
+  document.addEventListener("DOMContentLoaded", function () { setTimeout(montar, 900); });
+
+  window.mplAnalisarLacunas = analisar;
+  console.log("MPL Lacunas: diagnóstico de integridade da base ativo.");
+})();

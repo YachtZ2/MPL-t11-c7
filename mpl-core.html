@@ -1,0 +1,445 @@
+/* ============================================================
+   MPL — mpl-core.js
+   Estado global, PBM (presets), Storage (PBS/AIB), Parser, VBE
+   Fonte: Volume 0 (Documento Canônico) + Especificação Técnica
+   v1.3 — dados sintéticos (modo demo) agora geram campos extras
+   coerentes por modalidade: Mês da Sorte (Dia de Sorte), Trevos
+   (+Milionária) e Time do Coração (Timemania), para alimentar o
+   cockpit de insights do Dashboard.
+   ============================================================ */
+
+const MPL_STATE = {
+  modalidade: null,
+  base: [],                 // [{numero, data, dezenas:[...], campoExtra}]
+  escopo: { modo: "completa", concursoInicial: null, concursoFinal: null, nomeDoCenario: "Padrão" },
+  config: {
+    camadas: [
+      { id: "C1", janela: 5,  peso: 30 },
+      { id: "C2", janela: 8,  peso: 25 },
+      { id: "C3", janela: 10, peso: 20 },
+      { id: "C4", janela: 13, peso: 15 },
+      { id: "C5", janela: 17, peso: 10 }
+    ],
+    janelasFrequencia: { curta: 10, media: 30, longa: 100 },
+    pesosPerfil: { SIC: 0.28, SF: 0.17, SA: 0.13, SC: 0.10, SRT: 0.22, SEI: 0.05, SU: 0.05 },
+    modulosAtivos: { SIC: true, SF: true, SA: true, SC: true, SRT: true, SEI: true, SU: true },
+    K: 18,
+    A: null, // definido pela modalidade
+    caixaJanela: null,      // janela (N) usada para construir o Radar Bruto (RB) a partir da Caixa
+    caixaConfirmada: false, // trava simbólica: usuário confirmou a configuração da Caixa antes de seguir
+    stjPesos: { stf: 0.40, sej: 0.35, scoj: 0.20, suj: 0.05 }, // pesos do STJ — personalizáveis (RAP aplicável)
+    su: { fixas: [], proibidas: [], preferenciais: [], evitar: [], pesoManual: {}, grupos: [] },
+    filtrosDuros: {
+      paridade: { min: 1, max: null, ativo: true },
+      soma: { min: null, max: null, ativo: true },
+      faixas: { qtd: 3, minPorFaixa: 0, ativo: true },
+      consecutivas: { max: 4, ativo: true },
+      repetidas: { min: 0, max: null, ativo: true },
+      classesSTF: { minA: 0, ativo: false },
+      fixas: { ativo: true },
+      proibidas: { ativo: true },
+      pin: { ativo: false, dezenas: [] },  // PIN — dezenas obrigatórias em TODOS os jogos
+      porLinha: [],                        // array indexado por linha do volante: [{ativo,min,max}, ...]
+      porColuna: []                        // array indexado por coluna do volante: [{ativo,min,max}, ...]
+    }
+  },
+  cache: {
+    caixa: null, jmctArray: null, tjf: null,
+    scoresDezenas: null, teia: null,
+    radar: { bruto: [], ajustado: [], reduzido: [] },
+    jogos: [], jogosAprovados: [], ranking: [], rankingExibicao: [],
+    btm: null, btj: null, otimizadorK: null
+  },
+  ui: { activeTab: "dashboard", volanteDashboardAtual: null }
+};
+
+/* PRESETS — inclui "colunas" para desenhar o volante oficial no mesmo formato
+   apresentado pela Caixa (usado pelo módulo mpl-volante.js).
+   Dia de Sorte: 10 colunas -> 4 linhas (1-10, 11-20, 21-30, 31 sozinho).
+   Super Sete: estrutura posicional própria (7 colunas independentes, 0-9 cada). */
+const PRESETS_MODALIDADES = {
+  megaSena:  { nome: "Mega-Sena", sigla: "MS", universo: 60, dezenasSorteadas: 6, apostaMinima: 6, apostaMaxima: 20, radarK: 25, colunas: 10 },
+  lotofacil: { nome: "Lotofácil", sigla: "LF", universo: 25, dezenasSorteadas: 15, apostaMinima: 15, apostaMaxima: 20, radarK: 20, colunas: 5 },
+  quina:     { nome: "Quina", sigla: "QN", universo: 80, dezenasSorteadas: 5, apostaMinima: 5, apostaMaxima: 15, radarK: 30, colunas: 10 },
+  lotomania: { nome: "Lotomania", sigla: "LM", universo: 100, dezenasSorteadas: 20, apostaMinima: 50, apostaMaxima: 50, radarK: 60, colunas: 10 },
+  timemania: { nome: "Timemania", sigla: "TM", universo: 80, dezenasSorteadas: 7, apostaMinima: 10, apostaMaxima: 10, radarK: 30, colunas: 10, possuiCampoExtra: true, nomeCampoExtra: "Time do Coração" },
+  duplaSena: { nome: "Dupla Sena", sigla: "DS", universo: 50, dezenasSorteadas: 6, apostaMinima: 6, apostaMaxima: 15, radarK: 22, colunas: 10, possuiSorteioMultiplo: true, quantidadeSorteiosPorConcurso: 2 },
+  diaDeSorte:{ nome: "Dia de Sorte", sigla: "DDS", universo: 31, dezenasSorteadas: 7, apostaMinima: 7, apostaMaxima: 15, radarK: 18, colunas: 10, possuiCampoExtra: true, nomeCampoExtra: "Mês da Sorte" },
+  superSete: { nome: "Super Sete", sigla: "S7", universo: 10, dezenasSorteadas: 7, apostaMinima: 7, apostaMaxima: 7, radarK: 10, colunas: 7, layoutEspecial: "superSete", regrasEspeciais: "7 colunas independentes, cada uma de 0 a 9 (dígitos podem repetir entre colunas)" },
+  maisMilionaria: { nome: "+Milionária", sigla: "MM", universo: 50, dezenasSorteadas: 6, apostaMinima: 6, apostaMaxima: 12, radarK: 22, colunas: 10, possuiCampoExtra: true, nomeCampoExtra: "Trevos da Sorte", regrasEspeciais: "2 trevos de 1 a 6" },
+  lotofacilIndependencia: { nome: "Lotofácil da Independência", sigla: "LFI", universo: 25, dezenasSorteadas: 15, apostaMinima: 15, apostaMaxima: 20, radarK: 20, colunas: 5, concursoEspecial: true },
+  megaDaVirada: { nome: "Mega da Virada", sigla: "MV", universo: 60, dezenasSorteadas: 6, apostaMinima: 6, apostaMaxima: 20, radarK: 25, colunas: 10, concursoEspecial: true },
+  quinaSaoJoao: { nome: "Quina de São João", sigla: "QSJ", universo: 80, dezenasSorteadas: 5, apostaMinima: 5, apostaMaxima: 15, radarK: 30, colunas: 10, concursoEspecial: true },
+  personalizada: { nome: "Personalizada", sigla: "CUSTOM", universo: 25, dezenasSorteadas: 6, apostaMinima: 6, apostaMaxima: 15, radarK: 15, colunas: 10 }
+};
+
+const MESES_DA_SORTE = ["Janeiro","Fevereiro","Março","Abril","Maio","Junho","Julho","Agosto","Setembro","Outubro","Novembro","Dezembro"];
+const TIMES_DO_CORACAO_DEMO = ["Flamengo","Corinthians","Palmeiras","São Paulo","Grêmio","Internacional","Vasco","Botafogo","Cruzeiro","Atlético-MG"];
+
+function limitar(v, min, max) { return Math.max(min, Math.min(max, v)); }
+
+function calcularFE(S, U) { return S / U; }
+function calcularIE(U, S) { return U / S; }
+function calcularAE(U, S) { return (U / S) - 1; }
+
+function media(arr) { return arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : 0; }
+function mediana(arr) {
+  if (!arr.length) return 0;
+  const s = [...arr].sort((a, b) => a - b);
+  const mid = Math.floor(s.length / 2);
+  return s.length % 2 ? s[mid] : (s[mid - 1] + s[mid]) / 2;
+}
+function moda(arr) {
+  if (!arr.length) return 0;
+  const freq = {};
+  arr.forEach(v => freq[v] = (freq[v] || 0) + 1);
+  let best = arr[0], bestC = 0;
+  Object.keys(freq).forEach(k => { if (freq[k] > bestC) { bestC = freq[k]; best = Number(k); } });
+  return best;
+}
+function desvioPadrao(arr) {
+  if (arr.length < 2) return 0;
+  const m = media(arr);
+  return Math.sqrt(media(arr.map(v => (v - m) ** 2)));
+}
+function percentil(arr, p) {
+  if (!arr.length) return 0;
+  const s = [...arr].sort((a, b) => a - b);
+  const idx = (p / 100) * (s.length - 1);
+  const lo = Math.floor(idx), hi = Math.ceil(idx);
+  if (lo === hi) return s[lo];
+  return s[lo] + (s[hi] - s[lo]) * (idx - lo);
+}
+
+/* Normaliza nome da modalidade para uso em nomes de arquivo: "Dia de Sorte" -> "DIA_DE_SORTE" */
+function normalizarNomeModalidade(nome) {
+  return (nome || "MODALIDADE")
+    .normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+    .toUpperCase()
+    .replace(/[^A-Z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+}
+
+/* Modalidades posicionais (ex.: Super Sete) têm regras próprias de validação/parse/exibição */
+function isSuperSete(modalidade) {
+  return !!(modalidade && modalidade.layoutEspecial === "superSete");
+}
+
+/* Inicializa (ou redimensiona) os filtros detalhados por linha/coluna conforme
+   o layout oficial do volante da modalidade ativa. Preserva configurações já
+   existentes quando o tamanho não muda. */
+function inicializarFiltrosLinhaColuna(modalidade) {
+  if (!modalidade || isSuperSete(modalidade)) {
+    MPL_STATE.config.filtrosDuros.porLinha = [];
+    MPL_STATE.config.filtrosDuros.porColuna = [];
+    return;
+  }
+  const layout = obterLayoutVolante(modalidade);
+  const f = MPL_STATE.config.filtrosDuros;
+  const maxPadrao = modalidade.dezenasSorteadas;
+  f.porLinha = Array.from({ length: layout.linhas }, (_, i) => (f.porLinha && f.porLinha[i]) || { ativo: false, min: 0, max: maxPadrao });
+  f.porColuna = Array.from({ length: layout.colunas }, (_, i) => (f.porColuna && f.porColuna[i]) || { ativo: false, min: 0, max: maxPadrao });
+}
+
+/* ---------------- STORAGE: PBS / AIB (IndexedDB) ---------------- */
+const MPL_DB_NAME = "MPL_DB";
+const MPL_DB_VERSION = 1;
+let mplDb = null;
+
+function abrirIndexedDB() {
+  return new Promise((resolve, reject) => {
+    if (mplDb) return resolve(mplDb);
+    const req = indexedDB.open(MPL_DB_NAME, MPL_DB_VERSION);
+    req.onupgradeneeded = (e) => {
+      const db = e.target.result;
+      if (!db.objectStoreNames.contains("bases")) db.createObjectStore("bases", { keyPath: "id" });
+      if (!db.objectStoreNames.contains("cenarios")) db.createObjectStore("cenarios", { keyPath: "id" });
+    };
+    req.onsuccess = (e) => { mplDb = e.target.result; resolve(mplDb); };
+    req.onerror = (e) => reject(e);
+  });
+}
+
+async function salvarBaseIndexedDB(base, modalidadeId) {
+  const db = await abrirIndexedDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction("bases", "readwrite");
+    tx.objectStore("bases").put({
+      id: modalidadeId || "default",
+      base, modalidadeId,
+      atualizadoEm: new Date().toISOString()
+    });
+    tx.oncomplete = () => resolve(true);
+    tx.onerror = (e) => reject(e);
+  });
+}
+
+async function carregarBaseIndexedDB(modalidadeId) {
+  const db = await abrirIndexedDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction("bases", "readonly");
+    const req = tx.objectStore("bases").get(modalidadeId || "default");
+    req.onsuccess = () => resolve(req.result ? req.result.base : null);
+    req.onerror = (e) => reject(e);
+  });
+}
+
+async function apagarBaseIndexedDB(modalidadeId) {
+  const db = await abrirIndexedDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction("bases", "readwrite");
+    tx.objectStore("bases").delete(modalidadeId || "default");
+    tx.oncomplete = () => resolve(true);
+    tx.onerror = (e) => reject(e);
+  });
+}
+
+/* AIB — Atualização Incremental da Base: mescla sem apagar */
+function atualizarBaseIncremental(baseAtual, novosConcursos) {
+  const existentes = new Set(baseAtual.map(c => c.numero));
+  const adicionados = novosConcursos.filter(c => !existentes.has(c.numero));
+  const resultado = [...baseAtual, ...adicionados].sort((a, b) => a.numero - b.numero);
+  return { resultado, qtdAdicionados: adicionados.length };
+}
+
+/* ---------------- PARSER: CSV / JSON / colagem ----------------
+   ordenar=false preserva a ordem original das dezenas — obrigatório
+   para modalidades posicionais como Super Sete, onde a posição de
+   cada dígito corresponde a uma coluna específica do volante. */
+function parseCSVTexto(texto, ordenar = true) {
+  const linhas = texto.trim().split(/\r?\n/).filter(l => l.trim().length);
+  const registros = [];
+  linhas.forEach(linha => {
+    const sep = linha.includes(";") ? ";" : (linha.includes(",") ? "," : /\s+/);
+    const partes = linha.split(sep).map(p => p.trim()).filter(p => p.length);
+    if (partes.length < 2) return;
+    const numero = parseInt(partes[0], 10);
+    let idx = 1;
+    let data = null;
+    if (/^\d{4}-\d{2}-\d{2}$/.test(partes[1]) || /^\d{2}\/\d{2}\/\d{4}$/.test(partes[1])) {
+      data = partes[1]; idx = 2;
+    }
+    let dezenas = partes.slice(idx).map(Number).filter(n => !isNaN(n));
+    if (ordenar) dezenas = dezenas.sort((a, b) => a - b);
+    if (!isNaN(numero) && dezenas.length) {
+      registros.push({ numero, data, dezenas });
+    }
+  });
+  return registros;
+}
+
+function parseJSONTexto(texto, ordenar = true) {
+  const dados = JSON.parse(texto);
+  if (!Array.isArray(dados)) throw new Error("JSON deve ser um array de concursos.");
+  return dados.map(d => {
+    let dezenas = (d.dezenas || []).map(Number);
+    if (ordenar) dezenas = dezenas.sort((a, b) => a - b);
+    return {
+      numero: Number(d.numero ?? d.concurso),
+      data: d.data || null,
+      dezenas,
+      campoExtra: d.campoExtra ?? null
+    };
+  });
+}
+
+/* ---------------- VBE: Validação da Base Estatística ---------------- */
+function validarBase(base, modalidade) {
+  const erros = [];
+  const avisos = [];
+  if (!modalidade) { erros.push("Nenhuma modalidade configurada."); return { valido: false, erros, avisos }; }
+  const { universo, dezenasSorteadas } = modalidade;
+  const especial = isSuperSete(modalidade);
+  const numerosVistos = new Set();
+  const resultadosVistos = new Set();
+
+  base.forEach((c) => {
+    if (!Array.isArray(c.dezenas) || c.dezenas.length !== dezenasSorteadas) {
+      erros.push(`Concurso ${c.numero}: quantidade de dezenas incorreta (esperado ${dezenasSorteadas}, encontrado ${c.dezenas ? c.dezenas.length : 0}).`);
+    }
+    if (especial) {
+      /* Super Sete: cada posição/coluna vai de 0 a 9 e dígitos PODEM se repetir entre colunas */
+      c.dezenas.forEach(d => {
+        if (d < 0 || d > 9) erros.push(`Concurso ${c.numero}: dígito ${d} fora da faixa válida (0-9) para o Super Sete.`);
+      });
+    } else {
+      const setD = new Set(c.dezenas);
+      if (setD.size !== c.dezenas.length) erros.push(`Concurso ${c.numero}: dezenas duplicadas no mesmo sorteio.`);
+      c.dezenas.forEach(d => {
+        if (d < 1 || d > universo) erros.push(`Concurso ${c.numero}: dezena ${d} fora do universo (1-${universo}).`);
+      });
+    }
+    if (numerosVistos.has(c.numero)) erros.push(`Concurso ${c.numero}: número de concurso duplicado.`);
+    numerosVistos.add(c.numero);
+    const assinatura = especial ? c.dezenas.join(",") : [...c.dezenas].sort((a, b) => a - b).join(",");
+    if (resultadosVistos.has(assinatura)) avisos.push(`Concurso ${c.numero}: resultado idêntico a outro concurso já existente.`);
+    resultadosVistos.add(assinatura);
+  });
+
+  const ordenado = [...base].sort((a, b) => a.numero - b.numero);
+  for (let i = 1; i < ordenado.length; i++) {
+    if (ordenado[i].numero === ordenado[i - 1].numero) continue;
+    if (ordenado[i].numero !== ordenado[i - 1].numero + 1) {
+      avisos.push(`Possível lacuna entre concursos ${ordenado[i - 1].numero} e ${ordenado[i].numero}.`);
+    }
+  }
+
+  if (base.length < 20) avisos.push("Base com menos de 20 concursos: resultados estatísticos pouco confiáveis.");
+
+  return { valido: erros.length === 0, erros, avisos, totalConcursos: base.length };
+}
+
+/* ---------------- Dados sintéticos (Modo Demonstração) ---------------- */
+function gerarCampoExtraSintetico(modalidade) {
+  if (modalidade.presetKey === "diaDeSorte") {
+    return MESES_DA_SORTE[Math.floor(Math.random() * MESES_DA_SORTE.length)];
+  }
+  if (modalidade.presetKey === "maisMilionaria") {
+    const t1 = 1 + Math.floor(Math.random() * 6);
+    let t2 = 1 + Math.floor(Math.random() * 6);
+    while (t2 === t1) t2 = 1 + Math.floor(Math.random() * 6);
+    return `${t1} e ${t2}`;
+  }
+  if (modalidade.presetKey === "timemania") {
+    return TIMES_DO_CORACAO_DEMO[Math.floor(Math.random() * TIMES_DO_CORACAO_DEMO.length)];
+  }
+  return null;
+}
+
+function gerarBaseSintetica(modalidade, quantidade = 300) {
+  const { dezenasSorteadas } = modalidade;
+  const base = [];
+  const especial = isSuperSete(modalidade);
+  for (let i = 1; i <= quantidade; i++) {
+    let dezenas;
+    if (especial) {
+      /* cada uma das 7 posições é sorteada independentemente entre 0 e 9 (com repetição) */
+      dezenas = Array.from({ length: dezenasSorteadas }, () => Math.floor(Math.random() * 10));
+    } else {
+      const pool = Array.from({ length: modalidade.universo }, (_, k) => k + 1);
+      dezenas = [];
+      for (let j = 0; j < dezenasSorteadas; j++) {
+        const idx = Math.floor(Math.random() * pool.length);
+        dezenas.push(pool.splice(idx, 1)[0]);
+      }
+      dezenas.sort((a, b) => a - b);
+    }
+    base.push({ numero: i, data: null, dezenas, campoExtra: gerarCampoExtraSintetico(modalidade), sintetico: true });
+  }
+  return base;
+}
+
+/* ---------------- Escopo de Análise ---------------- */
+function aplicarEscopo(base, escopo) {
+  if (!escopo || escopo.modo === "completa") return base;
+  if (escopo.modo === "ultimosN") return base.slice(-escopo.qtd);
+  if (escopo.modo === "intervalo") return base.filter(c => c.numero >= escopo.concursoInicial && c.numero <= escopo.concursoFinal);
+  if (escopo.modo === "anterioresA") return base.filter(c => c.numero < escopo.concursoAlvo);
+  return base;
+}
+/* ============================================================
+   #pessoal
+   MPL — PATCH C (Dupla Sena) — SEGUNDO SORTEIO (DADOS + VALIDAÇÃO)
+   COLE ESTE BLOCO NO FINAL DE js/mpl-core.js — não apaga nada.
+   Modelo: Opção B — um concurso, dois resultados vinculados.
+   concurso.dezenas  = 1º sorteio (já existia)
+   concurso.dezenas2 = 2º sorteio (novo, só Dupla Sena)
+   Nunca são somados/combinados: cada pipeline estatístico roda
+   separado, escolhido pelo seletor "Sorteio ativo" (ver patch de UI).
+   ============================================================ */
+(function () {
+  "use strict";
+
+  function isDuplaSena(modalidade) {
+    return !!(modalidade && modalidade.presetKey === "duplaSena");
+  }
+  window.isDuplaSena = isDuplaSena;
+
+  /* Força a NÃO-ordenação enquanto a modalidade ativa for Dupla Sena,
+     senão os 12 números (6+6) seriam misturados antes de conseguirmos
+     separar qual dezena pertence a qual sorteio. */
+  var __origParseCSVTexto = parseCSVTexto;
+  parseCSVTexto = function (texto, ordenar) {
+    if (ordenar === undefined) ordenar = true;
+    var forcarBruto = typeof MPL_STATE !== "undefined" && MPL_STATE.modalidade && isDuplaSena(MPL_STATE.modalidade);
+    return __origParseCSVTexto(texto, forcarBruto ? false : ordenar);
+  };
+
+  var __origParseJSONTexto = parseJSONTexto;
+  parseJSONTexto = function (texto, ordenar) {
+    if (ordenar === undefined) ordenar = true;
+    var forcarBruto = typeof MPL_STATE !== "undefined" && MPL_STATE.modalidade && isDuplaSena(MPL_STATE.modalidade);
+    return __origParseJSONTexto(texto, forcarBruto ? false : ordenar);
+  };
+
+  /* Divide o array bruto (ordem de arquivo preservada) em duas metades:
+     primeiros S números = 1º sorteio, próximos S = 2º sorteio.
+     Se só vierem S números, mantém como "1º sorteio apenas" (2º pendente).
+     Formato esperado ao colar/importar: "concurso;data;12 números" —
+     ex.: 2740;2023-01-05;33 16 25 10 24 09 08 31 13 03 05 34 */
+  var __origAtualizarBaseIncremental = atualizarBaseIncremental;
+  atualizarBaseIncremental = function (baseAtual, novosConcursos) {
+    if (typeof MPL_STATE !== "undefined" && MPL_STATE.modalidade && isDuplaSena(MPL_STATE.modalidade)) {
+      var S = MPL_STATE.modalidade.dezenasSorteadas;
+      novosConcursos = novosConcursos.map(function (c) {
+        if (Array.isArray(c.dezenas) && c.dezenas.length >= S * 2) {
+          var brutas = c.dezenas.slice();
+          var d1 = brutas.slice(0, S).map(Number).sort(function (a, b) { return a - b; });
+          var d2 = brutas.slice(S, S * 2).map(Number).sort(function (a, b) { return a - b; });
+          var novo = {};
+          for (var k in c) novo[k] = c[k];
+          novo.dezenas = d1;
+          novo.dezenas2 = d2;
+          return novo;
+        }
+        return c; // só o 1º sorteio informado — 2º fica pendente
+      });
+    }
+    return __origAtualizarBaseIncremental(baseAtual, novosConcursos);
+  };
+
+  /* VBE — validação extra do 2º sorteio (não bloqueia a base se estiver
+     pendente; apenas avisa). Erros reais (faixa/duplicidade) continuam
+     invalidando a base, como no 1º sorteio. */
+  var __origValidarBase = validarBase;
+  validarBase = function (base, modalidade) {
+    var r = __origValidarBase(base, modalidade);
+    if (isDuplaSena(modalidade)) {
+      var universo = modalidade.universo, S = modalidade.dezenasSorteadas;
+      base.forEach(function (c) {
+        if (Array.isArray(c.dezenas2) && c.dezenas2.length) {
+          if (c.dezenas2.length !== S) r.erros.push("Concurso " + c.numero + ": 2º sorteio com quantidade incorreta de dezenas (esperado " + S + ").");
+          var set2 = new Set(c.dezenas2);
+          if (set2.size !== c.dezenas2.length) r.erros.push("Concurso " + c.numero + ": dezenas duplicadas no 2º sorteio.");
+          c.dezenas2.forEach(function (d) {
+            if (d < 1 || d > universo) r.erros.push("Concurso " + c.numero + ": dezena " + d + " do 2º sorteio fora do universo (1-" + universo + ").");
+          });
+        } else {
+          r.avisos.push("Concurso " + c.numero + ": 2º sorteio ainda não informado (pipeline do 2º sorteio ficará incompleto até ser importado).");
+        }
+      });
+      r.valido = r.erros.length === 0;
+    }
+    return r;
+  };
+
+  /* Modo demonstração: gera também o 2º sorteio (independente do 1º,
+     dezenas podem coincidir entre os dois — isso é normal e esperado
+     na Dupla Sena real). */
+  var __origGerarBaseSintetica = gerarBaseSintetica;
+  gerarBaseSintetica = function (modalidade, quantidade) {
+    var base = __origGerarBaseSintetica(modalidade, quantidade);
+    if (isDuplaSena(modalidade)) {
+      base.forEach(function (c) {
+        var pool = Array.from({ length: modalidade.universo }, function (_, k) { return k + 1; });
+        var d2 = [];
+        for (var j = 0; j < modalidade.dezenasSorteadas; j++) {
+          var idx = Math.floor(Math.random() * pool.length);
+          d2.push(pool.splice(idx, 1)[0]);
+        }
+        c.dezenas2 = d2.sort(function (a, b) { return a - b; });
+      });
+    }
+    return base;
+  };
+})();

@@ -1,0 +1,146 @@
+/* ============================================================
+   MPL — mpl-radar-aviao-fix.js  (arquivo NOVO e independente)
+   ADICIONE no index.html, depois de js/mpl-ui.js (e depois do
+   Patch U original, se ele ainda estiver colado lá):
+     <script src="js/mpl-radar-aviao-fix.js"></script>
+
+   Resolve os dois problemas do print: números caindo FORA das
+   bolinhas (eram desenhados 11px acima, de propósito equivocado),
+   e sobreposição de rótulos quando várias dezenas ficam próximas
+   no círculo. Substitui inteiramente a função de desenho do radar
+   (é a mesma técnica das outras correções: reatribuir a função).
+   ============================================================ */
+(function () {
+  "use strict";
+
+  function limitarLocal(v, min, max) { return Math.max(min, Math.min(max, v)); }
+
+  window.desenharRadarAviao = function () {
+    var canvas = document.getElementById("radarAviaoCanvas");
+    if (!canvas) return;
+    var ranking = MPL_STATE.cache.scoresDezenas;
+    var reduzido = (MPL_STATE.cache.radar && MPL_STATE.cache.radar.reduzido) || [];
+    if (!ranking || !ranking.length || !MPL_STATE.modalidade) return;
+
+    var ctx = canvas.getContext("2d");
+    if (typeof isSuperSete === "function" && isSuperSete(MPL_STATE.modalidade)) {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.fillStyle = "#8fa3c4"; ctx.font = "12px sans-serif"; ctx.textAlign = "center";
+      ctx.fillText("Visão de radar circular não se aplica ao Super Sete.", canvas.width / 2, canvas.height / 2);
+      return;
+    }
+
+    var cx = canvas.width / 2, cy = canvas.height / 2;
+    var Rmax = 170; // um pouco menor que antes, sobra espaço para os rótulos não vazarem da tela
+    var cor = (typeof obterCorModalidade === "function") ? obterCorModalidade(MPL_STATE.modalidade) : { principal: "#22d3ee" };
+    var idsNoRR = new Set(reduzido.map(function (d) { return d.dezena; }));
+    var U = MPL_STATE.modalidade.universo;
+
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+    // anéis de referência
+    [0.25, 0.5, 0.75, 1].forEach(function (f) {
+      ctx.beginPath();
+      ctx.arc(cx, cy, Rmax * f, 0, 2 * Math.PI);
+      ctx.strokeStyle = "rgba(34,211,238,.18)";
+      ctx.lineWidth = 1;
+      ctx.stroke();
+    });
+    ctx.beginPath();
+    ctx.moveTo(cx - Rmax, cy); ctx.lineTo(cx + Rmax, cy);
+    ctx.moveTo(cx, cy - Rmax); ctx.lineTo(cx, cy + Rmax);
+    ctx.strokeStyle = "rgba(34,211,238,.12)";
+    ctx.stroke();
+
+    // feixe giratório decorativo (mantém se o navegador suportar)
+    if (ctx.createConicGradient) {
+      var t = Date.now() / 1000;
+      var anguloFeixe = (t * 0.6) % (2 * Math.PI);
+      var grad = ctx.createConicGradient(anguloFeixe, cx, cy);
+      grad.addColorStop(0, "rgba(34,211,238,.22)");
+      grad.addColorStop(0.06, "rgba(34,211,238,0)");
+      grad.addColorStop(1, "rgba(34,211,238,0)");
+      ctx.beginPath();
+      ctx.arc(cx, cy, Rmax, 0, 2 * Math.PI);
+      ctx.fillStyle = grad;
+      ctx.fill();
+    }
+
+    // calcula posição de cada dezena
+    var pontos = ranking.map(function (d) {
+      var ang = ((d.dezena - 1) / U) * 2 * Math.PI - Math.PI / 2;
+      var distFrac = limitarLocal(1 - (d.STF / 100), 0.10, 1);
+      var raio = distFrac * Rmax;
+      return {
+        dezena: d.dezena, ang: ang, raio: raio,
+        x: cx + Math.cos(ang) * raio, y: cy + Math.sin(ang) * raio,
+        dentro: idsNoRR.has(d.dezena)
+      };
+    });
+
+    // resolução de sobreposição: só entre pontos "dentro" (que têm rótulo visível);
+    // empurra radialmente quem estiver muito perto de outro já posicionado
+    var colocados = [];
+    var raioMinimoEntrePontos = 22;
+    pontos.filter(function (p) { return p.dentro; }).forEach(function (p) {
+      var tentativas = 0;
+      while (tentativas < 6) {
+        var colide = colocados.some(function (q) {
+          var dx = p.x - q.x, dy = p.y - q.y;
+          return Math.sqrt(dx * dx + dy * dy) < raioMinimoEntrePontos;
+        });
+        if (!colide) break;
+        p.raio += 10;
+        p.raio = Math.min(p.raio, Rmax - 6);
+        p.x = cx + Math.cos(p.ang) * p.raio;
+        p.y = cy + Math.sin(p.ang) * p.raio;
+        tentativas++;
+      }
+      colocados.push(p);
+    });
+
+    // desenha primeiro as de fora (mais discretas, ao fundo)
+    pontos.filter(function (p) { return !p.dentro; }).forEach(function (p) {
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, 4, 0, 2 * Math.PI);
+      ctx.fillStyle = "rgba(143,163,196,.35)";
+      ctx.fill();
+    });
+
+    // depois as de dentro (destaque), com número CENTRADO na própria bolinha
+    pontos.filter(function (p) { return p.dentro; }).forEach(function (p) {
+      var raioBolinha = 11;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, raioBolinha, 0, 2 * Math.PI);
+      ctx.fillStyle = cor.principal;
+      ctx.shadowColor = cor.principal;
+      ctx.shadowBlur = 10;
+      ctx.fill();
+      ctx.shadowBlur = 0;
+
+      ctx.font = "bold 10px 'Segoe UI',Arial,sans-serif";
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      var texto = String(p.dezena).padStart(2, "0");
+      // contorno escuro + preenchimento claro: legível em qualquer cor de fundo
+      ctx.lineWidth = 2.5;
+      ctx.strokeStyle = "rgba(3,5,10,.85)";
+      ctx.strokeText(texto, p.x, p.y + 0.5);
+      ctx.fillStyle = "#ffffff";
+      ctx.fillText(texto, p.x, p.y + 0.5);
+    });
+    ctx.textBaseline = "alphabetic"; // restaura padrão para não afetar outros desenhos
+
+    // mira central
+    ctx.beginPath();
+    ctx.arc(cx, cy, 5, 0, 2 * Math.PI);
+    ctx.strokeStyle = "#eab308";
+    ctx.lineWidth = 2;
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(cx - 10, cy); ctx.lineTo(cx + 10, cy);
+    ctx.moveTo(cx, cy - 10); ctx.lineTo(cx, cy + 10);
+    ctx.strokeStyle = "#eab308";
+    ctx.stroke();
+  };
+})();

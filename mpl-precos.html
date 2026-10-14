@@ -1,0 +1,134 @@
+/* ============================================================
+   #pessoal
+   MPL — mpl-precos.js — TABELA DE PREÇOS (custo automático)
+   Regra oficial: custo = C(A, S) × preço da aposta simples.
+   Ex.: Mega-Sena com 7 dezenas → C(7,6)=7 × preço simples.
+   Os valores abaixo são EDITÁVEIS na tela (salvos em localStorage),
+   porque a Caixa reajusta periodicamente — o MPL não atualiza preço
+   sozinho. Confira no site oficial e ajuste quando mudar.
+   ============================================================ */
+(function () {
+  "use strict";
+
+  /* Preço da aposta SIMPLES por modalidade (valor de referência —
+     ajuste na aba Conferidor/Backtest se estiver desatualizado). */
+  var PRECOS_PADRAO = {
+    megaSena: 6.00, megaDaVirada: 6.00,
+    lotofacil: 3.50, lotofacilIndependencia: 3.50,
+    quina: 3.00, quinaSaoJoao: 3.00,
+    lotomania: 3.50,
+    duplaSena: 3.00,
+    diaDeSorte: 2.50,
+    timemania: 3.50,
+    superSete: 3.00,
+    maisMilionaria: 6.00,
+    personalizada: 0
+  };
+
+  function precoSimples(presetKey) {
+    var salvo = localStorage.getItem("mplPreco_" + presetKey);
+    if (salvo !== null && salvo !== "") return Number(salvo);
+    return PRECOS_PADRAO[presetKey] != null ? PRECOS_PADRAO[presetKey] : 0;
+  }
+  function salvarPreco(presetKey, valor) {
+    localStorage.setItem("mplPreco_" + presetKey, String(valor));
+  }
+
+  /* Custo de UM jogo com A dezenas, conforme a modalidade. */
+  function custoDoJogo(qtdDezenas, modalidade) {
+    if (!modalidade) return 0;
+    var pk = modalidade.presetKey;
+    var base = precoSimples(pk);
+    var S = modalidade.dezenasSorteadas;
+
+    /* Super Sete: aposta é por coluna, não combinatória de conjunto. */
+    if (typeof isSuperSete === "function" && isSuperSete(modalidade)) return base;
+
+    /* Lotomania: sempre 50 dezenas, preço fixo. */
+    if (pk === "lotomania") return base;
+
+    /* Timemania: sempre 10 dezenas, preço fixo. */
+    if (pk === "timemania") return base;
+
+    /* Demais: multiplicador combinatório C(A, S). */
+    var mult = (typeof combinacao === "function") ? combinacao(qtdDezenas, S) : 1;
+    return base * Math.max(1, mult);
+  }
+
+  window.mplPrecoSimples = precoSimples;
+  window.mplSalvarPreco = salvarPreco;
+  window.mplCustoDoJogo = custoDoJogo;
+  window.MPL_PRECOS_PADRAO = PRECOS_PADRAO;
+
+  console.log("MPL Preços: módulo carregado (custo = C(A,S) × preço simples).");
+})();
+/* ============================================================
+   #pessoal
+   MPL — FASE 9.7 — CUSTO: +Milionária (trevos) e Super Sete (colunas)
+   COLE NO FINAL DE js/mpl-precos.js.
+
+   +Milionária: custo = C(A,6) × C(T,2) × preço simples
+                (A = 6..12 dezenas, T = 2..6 trevos)
+   Super Sete : custo = produto dos dígitos marcados por coluna
+                (1 a 3 por coluna) × preço simples
+
+   Os demais cálculos permanecem exatamente como estavam.
+   ============================================================ */
+(function () {
+  "use strict";
+
+  var __origCusto = window.mplCustoDoJogo;
+
+  /* opcoes: { trevos: 2..6, digitosPorColuna: [d1..d7] ou número } */
+  window.mplCustoDoJogo = function (qtdDezenas, modalidade, opcoes) {
+    opcoes = opcoes || {};
+    if (!modalidade) return 0;
+    var pk = modalidade.presetKey;
+    var base = (typeof mplPrecoSimples === "function") ? mplPrecoSimples(pk) : 0;
+
+    /* ---------- +Milionária ---------- */
+    if (pk === "maisMilionaria") {
+      var T = Number(opcoes.trevos) || 2;
+      T = Math.max(2, Math.min(6, T));
+      var mDz = combinacao(qtdDezenas, 6);
+      var mTr = combinacao(T, 2);
+      return base * Math.max(1, mDz) * Math.max(1, mTr);
+    }
+
+    /* ---------- Super Sete ---------- */
+    if (typeof isSuperSete === "function" && isSuperSete(modalidade)) {
+      var dpc = opcoes.digitosPorColuna;
+      var mult = 1;
+      if (Array.isArray(dpc) && dpc.length) {
+        dpc.forEach(function (d) { mult *= Math.max(1, Math.min(3, Number(d) || 1)); });
+      } else if (Number(dpc) > 1) {
+        mult = Math.pow(Math.min(3, Number(dpc)), 7);
+      }
+      return base * mult;
+    }
+
+    return __origCusto(qtdDezenas, modalidade);
+  };
+
+  /* Quantidade de apostas simples equivalentes (para exibir na tela) */
+  window.mplApostasEquivalentes = function (qtdDezenas, modalidade, opcoes) {
+    opcoes = opcoes || {};
+    if (!modalidade) return 1;
+    var pk = modalidade.presetKey;
+    if (pk === "maisMilionaria") {
+      var T = Math.max(2, Math.min(6, Number(opcoes.trevos) || 2));
+      return combinacao(qtdDezenas, 6) * combinacao(T, 2);
+    }
+    if (typeof isSuperSete === "function" && isSuperSete(modalidade)) {
+      var dpc = opcoes.digitosPorColuna, m = 1;
+      if (Array.isArray(dpc) && dpc.length) {
+        dpc.forEach(function (d) { m *= Math.max(1, Math.min(3, Number(d) || 1)); });
+      } else if (Number(dpc) > 1) { m = Math.pow(Math.min(3, Number(dpc)), 7); }
+      return m;
+    }
+    if (pk === "lotomania" || pk === "timemania") return 1;
+    return combinacao(qtdDezenas, modalidade.dezenasSorteadas);
+  };
+
+  console.log("MPL 9.7: custo de +Milionária (trevos) e Super Sete (colunas) ativo.");
+})();

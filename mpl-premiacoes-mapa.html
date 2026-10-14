@@ -1,0 +1,435 @@
+/* ============================================================
+   #pessoal
+   MPL — FASE 9 (parte 2/3) — MAPA EXPLÍCITO DE FAIXAS + CORREÇÕES
+   ARQUIVO NOVO. No index.html, adicione DEPOIS de
+   mpl-backtest-custo-retorno.js e DEPOIS de mpl-conferidor-premiacao.js:
+     js/mpl-premiacoes-mapa.js>
+
+   Corrige:
+   BUG 2 — parse de faixa por texto errava em Lotofácil/Timemania/
+           Lotomania. Agora existe um MAPA EXPLÍCITO por modalidade,
+           escrito e auditável por nós (não dependemos de adivinhar
+           o formato de descrição da API).
+   BUG 3 — contagem "concursos com/sem dado" contava jogo×concurso.
+   BUG 4 — Dupla Sena usava a tabela de prêmios do 1º sorteio também
+           para o 2º. Agora as faixas são separadas por sorteio.
+   ============================================================ */
+(function () {
+  "use strict";
+
+  /* ---------- MAPA EXPLÍCITO DE FAIXAS (auditável) ----------
+     Para cada modalidade: lista de {acertos, termos[]}.
+     "termos" são trechos (minúsculos, sem acento) que podem
+     aparecer na descrição da faixa retornada pela API.
+     A ordem importa: o primeiro que casar vence.               */
+  var MPL_MAPA_FAIXAS = {
+    megaSena:       [{ a: 6, t: ["sena"] }, { a: 5, t: ["quina"] }, { a: 4, t: ["quadra"] }],
+    megaDaVirada:   [{ a: 6, t: ["sena"] }, { a: 5, t: ["quina"] }, { a: 4, t: ["quadra"] }],
+    quina:          [{ a: 5, t: ["quina"] }, { a: 4, t: ["quadra"] }, { a: 3, t: ["terno"] }, { a: 2, t: ["duque"] }],
+    quinaSaoJoao:   [{ a: 5, t: ["quina"] }, { a: 4, t: ["quadra"] }, { a: 3, t: ["terno"] }, { a: 2, t: ["duque"] }],
+    duplaSena:      [{ a: 6, t: ["sena"] }, { a: 5, t: ["quina"] }, { a: 4, t: ["quadra"] }, { a: 3, t: ["terno"] }],
+    lotofacil:      [{ a: 15, t: ["15"] }, { a: 14, t: ["14"] }, { a: 13, t: ["13"] }, { a: 12, t: ["12"] }, { a: 11, t: ["11"] }],
+    lotofacilIndependencia: [{ a: 15, t: ["15"] }, { a: 14, t: ["14"] }, { a: 13, t: ["13"] }, { a: 12, t: ["12"] }, { a: 11, t: ["11"] }],
+    lotomania:      [{ a: 20, t: ["20"] }, { a: 19, t: ["19"] }, { a: 18, t: ["18"] }, { a: 17, t: ["17"] }, { a: 16, t: ["16"] }, { a: 15, t: ["15"] }, { a: 0, t: ["0 acert", "nenhum"] }],
+    diaDeSorte:     [{ a: 7, t: ["7"] }, { a: 6, t: ["6"] }, { a: 5, t: ["5"] }, { a: 4, t: ["4"] }],
+    timemania:      [{ a: 7, t: ["7"] }, { a: 6, t: ["6"] }, { a: 5, t: ["5"] }, { a: 4, t: ["4"] }, { a: 3, t: ["3"] }],
+    superSete:      [{ a: 7, t: ["7"] }, { a: 6, t: ["6"] }, { a: 5, t: ["5"] }, { a: 4, t: ["4"] }, { a: 3, t: ["3"] }],
+    maisMilionaria: [{ a: 6, t: ["6 acert", "6 numero"] }, { a: 5, t: ["5 acert", "5 numero"] }, { a: 4, t: ["4 acert", "4 numero"] }, { a: 3, t: ["3 acert", "3 numero"] }, { a: 2, t: ["2 acert", "2 numero"] }]
+  };
+
+  /* Faixas que NÃO correspondem a acertos de dezena e devem ser
+     ignoradas no cálculo (evita somar prêmio indevido). */
+  var FAIXAS_IGNORADAS = ["time do coracao", "time de coracao", "mes da sorte", "trevo"];
+
+  function normalizar(txt) {
+    return String(txt || "").toLowerCase()
+      .normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+  }
+
+  /* Detecta a qual sorteio a faixa pertence (Dupla Sena). */
+  function sorteioDaFaixa(descricao) {
+    var d = normalizar(descricao);
+    if (/(^|\s)2\s*[ºo°]|segundo\s+sorteio/.test(d)) return 2;
+    if (/(^|\s)1\s*[ºo°]|primeiro\s+sorteio/.test(d)) return 1;
+    return 1; // sem indicação explícita → assume 1º
+  }
+
+  /* Converte a descrição da faixa em nº de acertos, usando o MAPA
+     EXPLÍCITO da modalidade ativa. Retorna null se não for faixa
+     de acertos (ex.: Time do Coração) ou se não reconhecer. */
+  function acertosDaFaixa(descricao, presetKey) {
+    var d = normalizar(descricao);
+    for (var i = 0; i < FAIXAS_IGNORADAS.length; i++) {
+      if (d.indexOf(FAIXAS_IGNORADAS[i]) !== -1) return null;
+    }
+    var mapa = MPL_MAPA_FAIXAS[presetKey];
+    if (mapa) {
+      for (var j = 0; j < mapa.length; j++) {
+        var f = mapa[j];
+        for (var k = 0; k < f.t.length; k++) {
+          if (d.indexOf(f.t[k]) !== -1) return f.a;
+        }
+      }
+    }
+    var m = d.match(/(\d+)\s*(acert|numero|dezena|ponto)/);
+    if (m) return Number(m[1]);
+    return null;
+  }
+  window.mplAcertosDaFaixa = acertosDaFaixa;
+
+  /* Tabela {acertos -> valorPremio} de um concurso, por sorteio. */
+  function tabelaPremios(concurso, presetKey, sorteio) {
+    if (!concurso || !concurso.premiacoes || !concurso.premiacoes.length) return null;
+    var ehDS = presetKey === "duplaSena";
+    var tabela = {};
+    var achou = false;
+    concurso.premiacoes.forEach(function (p) {
+      if (ehDS && sorteioDaFaixa(p.descricao) !== (sorteio || 1)) return;
+      var a = acertosDaFaixa(p.descricao, presetKey);
+      if (a === null) return;
+      tabela[a] = Number(p.valorPremio) || 0;
+      achou = true;
+    });
+    return achou ? tabela : null;
+  }
+  window.mplTabelaPremios = tabelaPremios;
+
+  function fmt(v) {
+    return "R$ " + Number(v || 0).toLocaleString("pt-BR", { minimumFractionDigits: 2 });
+  }
+  function card9(label, valor, cor) {
+    return '<div class="stat-card"' + (cor ? ' style="border-top:3px solid ' + cor + ';"' : '') + '>' +
+      '<div class="label">' + label + '</div><div class="value">' + valor + '</div></div>';
+  }
+
+  /* ============ BTJ — CUSTO × RETORNO (corrigido) ============ */
+  function religarBTJ() {
+    var btn = document.getElementById("btnBTJ");
+    if (!btn || btn.__fase9) return;
+    btn.__fase9 = true;
+    btn.addEventListener("click", function () {
+      setTimeout(recalcularCustoRetorno, 140); // roda DEPOIS do patch antigo
+    });
+  }
+
+  function recalcularCustoRetorno() {
+    var btj = MPL_STATE.cache.btj;
+    if (!btj || !btj.resultados || !btj.resultados.length) return;
+    var inputPreco = document.getElementById("precoApostaSimples");
+    var preco = inputPreco ? Number(inputPreco.value) : 0;
+    var topN = Number((document.getElementById("btTopN") || {}).value) || 10;
+    var presetKey = MPL_STATE.modalidade ? MPL_STATE.modalidade.presetKey : null;
+    var ehDS = presetKey === "duplaSena";
+
+    var mapaBase = {};
+    MPL_STATE.base.forEach(function (c) { mapaBase[c.numero] = c; });
+
+    var custoTotal = 0, retornoTotal = 0;
+    var concursosComDado = 0, concursosSemDado = 0, premiosPagos = 0;
+
+    btj.resultados.forEach(function (item) {
+      var qtdJogos = item.qtdJogosAvaliados || topN;
+      custoTotal += (preco || 0) * qtdJogos;
+
+      var concurso = mapaBase[item.concurso];
+      var t1 = tabelaPremios(concurso, presetKey, 1);
+      if (!t1) { concursosSemDado++; return; }
+      concursosComDado++;
+
+      /* CORREÇÃO BUG 1: soma o prêmio de CADA jogo, não só do melhor */
+      var lista = item.acertos || [item.melhorAcerto];
+      lista.forEach(function (a) {
+        if (t1[a] !== undefined && t1[a] > 0) { retornoTotal += t1[a]; premiosPagos++; }
+      });
+
+      /* CORREÇÃO BUG 4: Dupla Sena usa a tabela do 2º sorteio */
+      if (ehDS && item.acertos2) {
+        var t2 = tabelaPremios(concurso, presetKey, 2);
+        if (t2) {
+          item.acertos2.forEach(function (a) {
+            if (t2[a] !== undefined && t2[a] > 0) { retornoTotal += t2[a]; premiosPagos++; }
+          });
+        }
+      }
+    });
+
+    var saldo = retornoTotal - custoTotal;
+    var roi = custoTotal > 0 ? (saldo / custoTotal) * 100 : null;
+
+    var alvo = document.getElementById("backtestResult");
+    if (!alvo) return;
+    var antigo = document.getElementById("fase9CustoRetorno");
+    if (antigo) antigo.remove();
+
+    var bloco = document.createElement("div");
+    bloco.id = "fase9CustoRetorno";
+    bloco.innerHTML =
+      '<h3 style="margin-top:18px;">💰 Custo × Retorno (Fase 9 — corrigido)</h3>' +
+      '<div class="grid-cards">' +
+      card9("Custo total (" + topN + " jogos × " + btj.resultados.length + " rodadas)", preco ? fmt(custoTotal) : "—") +
+      card9("Retorno total (premiação real)", fmt(retornoTotal), "#10b981") +
+      card9("Saldo", fmt(saldo), saldo >= 0 ? "#10b981" : "#ef4444") +
+      card9("ROI", roi === null ? "—" : roi.toFixed(1) + "%", roi !== null && roi >= 0 ? "#10b981" : "#ef4444") +
+      card9("Prêmios contabilizados", premiosPagos) +
+      card9("Concursos com dado de premiação", concursosComDado + " de " + btj.resultados.length) +
+      '</div>' +
+      (concursosSemDado > 0 ? '<div class="alert alert-warn">' + concursosSemDado + ' concurso(s) sem dados de premiação (importados manualmente) foram excluídos do RETORNO, mas seguem contando no custo — o saldo é, portanto, conservador.</div>' : "") +
+      (!preco ? '<div class="alert alert-warn">Informe o preço da aposta simples acima para calcular o custo.</div>' : "") +
+      '<p class="muted">Agora o retorno soma o prêmio de <b>todos</b> os jogos do Top-N que foram premiados em cada rodada' +
+      (ehDS ? ', considerando separadamente as faixas do 1º e do 2º sorteio' : '') +
+      '. Cálculo retrospectivo e hipotético — não é previsão nem garantia de resultado futuro.</p>';
+    alvo.appendChild(bloco);
+  }
+
+  /* ============ CONFERIDOR — RETORNO (corrigido) ============ */
+  function religarConferidor() {
+    var btn = document.getElementById("btnConferir");
+    if (!btn || btn.__fase9conf) return;
+    var novo = btn.cloneNode(true);
+    btn.parentNode.replaceChild(novo, btn);
+    novo.__fase9conf = true;
+    /* mantém a conferência de acertos do patch anterior... */
+    if (typeof conferirApostasComDoisSorteios === "function") {
+      novo.addEventListener("click", conferirApostasComDoisSorteios);
+    }
+    /* ...e acrescenta o retorno corrigido por cima */
+    novo.addEventListener("click", function () { setTimeout(retornoConferidor, 120); });
+  }
+
+  function obterJogosConf() {
+    var origemEl = document.querySelector('input[name="confOrigem"]:checked');
+    var origem = origemEl ? origemEl.value : "ranking";
+    if (origem === "arquivo") return window.__mplJogosArquivoConferidor || [];
+    var lista = (MPL_STATE.cache.rankingExibicao && MPL_STATE.cache.rankingExibicao.length)
+      ? MPL_STATE.cache.rankingExibicao : MPL_STATE.cache.ranking;
+    return (lista || []).map(function (r) { return r.jogo; });
+  }
+  function obterEscopoConf() {
+    var el = document.querySelector('input[name="confEscopo"]:checked');
+    var escopo = el ? el.value : "completa";
+    var base = MPL_STATE.base;
+    if (escopo === "intervalo") {
+      var de = Number(document.getElementById("confDe").value);
+      var ate = Number(document.getElementById("confAte").value);
+      return base.filter(function (c) { return c.numero >= de && c.numero <= ate; });
+    }
+    if (escopo === "especifico") {
+      var num = Number(document.getElementById("confEspecifico").value);
+      return base.filter(function (c) { return c.numero === num; });
+    }
+    return base;
+  }
+
+  function retornoConferidor() {
+    var tabela = document.getElementById("confTabela");
+    if (!tabela) return;
+    var jogos = obterJogosConf();
+    var concursos = obterEscopoConf();
+    if (!jogos.length || !concursos.length) return;
+
+    var presetKey = MPL_STATE.modalidade ? MPL_STATE.modalidade.presetKey : null;
+    var ehDS = presetKey === "duplaSena";
+
+    /* CORREÇÃO BUG 3: conta CONCURSOS, não jogo×concurso */
+    var comDado = 0, semDado = 0;
+    var tabelas = concursos.map(function (c) {
+      var t1 = tabelaPremios(c, presetKey, 1);
+      var t2 = ehDS ? tabelaPremios(c, presetKey, 2) : null;
+      if (t1) comDado++; else semDado++;
+      return { c: c, t1: t1, t2: t2 };
+    });
+
+    var totalGeral = 0;
+    var linhas = jogos.map(function (jogo) {
+      var r1 = 0, r2 = 0;
+      tabelas.forEach(function (x) {
+        if (x.t1) {
+          var a1 = jogo.filter(function (d) { return x.c.dezenas.indexOf(d) !== -1; }).length;
+          if (x.t1[a1] !== undefined) r1 += x.t1[a1];
+        }
+        if (ehDS && x.t2 && Array.isArray(x.c.dezenas2) && x.c.dezenas2.length) {
+          var a2 = jogo.filter(function (d) { return x.c.dezenas2.indexOf(d) !== -1; }).length;
+          if (x.t2[a2] !== undefined) r2 += x.t2[a2];
+        }
+      });
+      totalGeral += r1 + r2;
+      return { r1: r1, r2: r2 };
+    });
+
+    /* remove colunas de retorno de uma execução anterior */
+    tabela.querySelectorAll(".colRetorno9").forEach(function (el) { el.remove(); });
+    var cab = tabela.querySelector("thead tr");
+    if (cab) {
+      var th1 = document.createElement("th");
+      th1.className = "colRetorno9";
+      th1.textContent = ehDS ? "Retorno (1º sorteio)" : "Retorno no escopo";
+      cab.appendChild(th1);
+      if (ehDS) {
+        var th2 = document.createElement("th");
+        th2.className = "colRetorno9";
+        th2.textContent = "Retorno (2º sorteio)";
+        cab.appendChild(th2);
+      }
+    }
+    tabela.querySelectorAll("tbody tr").forEach(function (tr, i) {
+      if (!linhas[i]) return;
+      var td1 = document.createElement("td");
+      td1.className = "colRetorno9";
+      td1.innerHTML = "<b>" + fmt(linhas[i].r1) + "</b>";
+      tr.appendChild(td1);
+      if (ehDS) {
+        var td2 = document.createElement("td");
+        td2.className = "colRetorno9";
+        td2.innerHTML = "<b>" + fmt(linhas[i].r2) + "</b>";
+        tr.appendChild(td2);
+      }
+    });
+
+    var resumo = document.getElementById("confResumo");
+    if (resumo) {
+      var antigo = document.getElementById("fase9ResumoConf");
+      if (antigo) antigo.remove();
+      var bloco = document.createElement("div");
+      bloco.id = "fase9ResumoConf";
+      bloco.className = "stat-card";
+      bloco.style.borderTop = "3px solid #10b981";
+      bloco.innerHTML = '<div class="label">Retorno hipotético total (todos os jogos × escopo)</div>' +
+        '<div class="value">' + fmt(totalGeral) + '</div>' +
+        '<div class="muted" style="font-size:11px;">' + comDado + ' concurso(s) com dado de premiação · ' + semDado + ' sem dado</div>';
+      resumo.appendChild(bloco);
+    }
+  }
+
+  /* ---------- Boot ---------- */
+  var tentativas = 0;
+  var vigia = setInterval(function () {
+    tentativas++;
+    religarBTJ();
+    religarConferidor();
+    if (tentativas > 50) clearInterval(vigia);
+  }, 250);
+
+  console.log("MPL Fase 9: mapa explícito de faixas ativo (" + Object.keys(MPL_MAPA_FAIXAS).length + " modalidades mapeadas).");
+})();
+/* ============================================================
+   #pessoal
+   MPL — FASE 9.4 — DECOMPOSIÇÃO COMBINATÓRIA DE APOSTAS MÚLTIPLAS
+   COLE NO FINAL DE js/mpl-premiacoes-mapa.js.
+
+   Uma aposta com A dezenas equivale a C(A,S) apostas simples.
+   Se H dessas dezenas forem sorteadas, a quantidade de apostas
+   simples com exatamente k acertos é:  C(H,k) × C(A-H, S-k).
+   Ex.: Dia de Sorte, 8 dezenas, 4 acertos →
+        4 apostas com 4 acertos + 4 apostas com 3 acertos.
+   ============================================================ */
+(function () {
+  "use strict";
+
+  /* Retorna {total, detalhe[]} do prêmio de UM jogo. */
+  window.mplDecomporPremio = function (A, H, S, tabela) {
+    var out = { total: 0, detalhe: [] };
+    if (!tabela || !A || !S) return out;
+    for (var k = S; k >= 0; k--) {
+      var valor = tabela[k];
+      if (valor === undefined || valor <= 0) continue;
+      var qtd = combinacao(H, k) * combinacao(A - H, S - k);
+      if (qtd > 0) {
+        out.total += qtd * valor;
+        out.detalhe.push({ acertos: k, qtd: qtd, valorUnit: valor, subtotal: qtd * valor });
+      }
+    }
+    return out;
+  };
+
+  /* Compatibilidade: quando o jogo tem exatamente S dezenas
+     (aposta simples), a decomposição devolve o mesmo resultado
+     da consulta direta — nenhuma modalidade é prejudicada. */
+
+  console.log("MPL 9.4: decomposição combinatória de apostas múltiplas ativa.");
+})();
+/* ============================================================
+   #pessoal
+   MPL — FASE 9.6 — Elimina a reconsulta da Fase 8 (busca dupla)
+   COLE NO FINAL DE js/mpl-premiacoes-mapa.js.
+
+   Causa da busca dupla: mpl-api-premiacoes.js carrega DEPOIS do
+   mpl-api.js e embrulha atualizarBasePorAPI de novo, reconsultando
+   CADA concurso novo para pegar "premiacoes". Como esse arquivo
+   carrega por último, o embrulho dele fica por cima do 9.1/9.2 e
+   a reconsulta volta a acontecer — 2 idas à rede por concurso.
+
+   Esta camada final reimplementa a atualização com busca ÚNICA
+   (o normalize já traz dezenas2 + premiacoes juntos) e mantém o
+   mutex contra chamadas simultâneas.
+   ============================================================ */
+(function () {
+  "use strict";
+  var __rodando = false;
+
+  atualizarBasePorAPI = async function (modalidadeKey, baseAtual, modalidade, onProgress) {
+    if (__rodando) {
+      console.warn("MPL 9.6: ⛔ chamada duplicada bloqueada (sincronização em andamento).");
+      console.trace("MPL 9.6: origem da chamada bloqueada ↑");
+      return { novos: [], conflitos: [], falhas: [], ultimoAPI: 0, ultimoLocal: 0,
+        mensagem: "Sincronização já em andamento — chamada duplicada ignorada." };
+    }
+    __rodando = true;
+    console.log("MPL 9.6: ▶ sincronização iniciada (busca ÚNICA por concurso).");
+
+    try {
+      var ultimo = await getUltimoConcursoAPI(modalidadeKey);
+      var v = validarRespostaCaixa(ultimo, modalidade);
+      if (!v.valido) throw new Error(v.motivo);
+
+      var ultimoLocal = baseAtual.length
+        ? Math.max.apply(null, baseAtual.map(function (c) { return c.numero; })) : 0;
+      var novos = [], conflitos = [], falhas = [];
+
+      if (ultimo.numero <= ultimoLocal) {
+        console.log("MPL 9.6: base já atualizada (local=" + ultimoLocal + ", API=" + ultimo.numero + ").");
+        return { novos: novos, conflitos: conflitos, falhas: falhas,
+          ultimoAPI: ultimo.numero, ultimoLocal: ultimoLocal,
+          mensagem: "A base local já está atualizada com a API." };
+      }
+
+      for (var n = ultimoLocal + 1; n <= ultimo.numero; n++) {
+        try {
+          var c = (n === ultimo.numero) ? ultimo : await getConcursoPorNumeroAPI(modalidadeKey, n);
+          var vc = validarRespostaCaixa(c, modalidade);
+          if (!vc.valido) { falhas.push({ numero: n, motivo: vc.motivo }); continue; }
+
+          var existente = baseAtual.find(function (x) { return x.numero === n; });
+          if (existente) {
+            if (JSON.stringify(existente.dezenas) !== JSON.stringify(c.dezenas)) {
+              conflitos.push({ numero: n, local: existente.dezenas, api: c.dezenas });
+            }
+          } else {
+            /* tudo numa passada só — sem reconsultar */
+            var reg = { numero: c.numero, data: c.data, dezenas: c.dezenas, campoExtra: c.campoExtra };
+            if (c.dezenas2) reg.dezenas2 = c.dezenas2;
+            if (c.premiacoes) reg.premiacoes = c.premiacoes;
+            if (c.acumulado !== undefined) reg.acumulado = c.acumulado;
+            if (c.valorAcumuladoProximo) reg.valorAcumuladoProximo = c.valorAcumuladoProximo;
+            if (c.valorArrecadado) reg.valorArrecadado = c.valorArrecadado;
+            novos.push(reg);
+          }
+          if (onProgress) onProgress(n, ultimo.numero);
+        } catch (e) {
+          falhas.push({ numero: n, motivo: e.message });
+          console.warn("MPL 9.6: concurso " + n + " falhou — " + e.message);
+        }
+      }
+
+      var comPrem = novos.filter(function (x) { return x.premiacoes && x.premiacoes.length; }).length;
+      console.log("MPL 9.6: ■ concluído — " + novos.length + " novo(s) (" + comPrem +
+        " com premiação), " + conflitos.length + " conflito(s), " + falhas.length + " falha(s).");
+
+      return { novos: novos, conflitos: conflitos, falhas: falhas,
+        ultimoAPI: ultimo.numero, ultimoLocal: ultimoLocal };
+    } finally {
+      __rodando = false;
+    }
+  };
+
+  console.log("MPL 9.6: camada final de sincronização ativa (reconsulta da Fase 8 neutralizada).");
+})();

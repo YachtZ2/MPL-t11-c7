@@ -1,0 +1,98 @@
+/* ============================================================
+   MPL — mpl-dashboard-premiados.js  (Fase 8, parte 2/3)
+   ADICIONE no index.html, depois de js/mpl-ui.js:
+     <script src="js/mpl-dashboard-premiados.js"></script>
+
+   Mini-painel no Dashboard: mostra se o concurso exibido no Volante
+   Dinâmico teve ganhadores (por faixa de premiação) ou acumulou,
+   além do valor estimado do próximo concurso, quando disponíveis.
+   Se o concurso foi importado manualmente (sem dados de premiação),
+   mostra aviso claro em vez de inventar números.
+   ============================================================ */
+(function () {
+  "use strict";
+
+  function formatarMoeda(v) {
+    if (v === null || v === undefined) return "—";
+    try { return Number(v).toLocaleString("pt-BR", { style: "currency", currency: "BRL" }); }
+    catch (e) { return "R$ " + v; }
+  }
+
+  function montarCard() {
+    var volanteCard = document.getElementById("volanteDashboard");
+    if (!volanteCard || document.getElementById("premiadosCard")) return;
+    var cardPai = volanteCard.closest(".card");
+    if (!cardPai) return;
+
+    var card = document.createElement("div");
+    card.className = "card";
+    card.id = "premiadosCard";
+    card.innerHTML = '<h3>🏅 Premiação do Concurso Exibido</h3><div id="premiadosConteudo"></div>';
+    cardPai.parentNode.insertBefore(card, cardPai.nextSibling);
+  }
+
+  function renderizar(concurso) {
+    var el = document.getElementById("premiadosConteudo");
+    if (!el) return;
+    if (!concurso) { el.innerHTML = '<p class="muted">Nenhum concurso selecionado.</p>'; return; }
+
+    if (!concurso.premiacoes || !concurso.premiacoes.length) {
+      el.innerHTML = '<p class="muted">Este concurso não tem dados de premiação (comum em importação manual — só concursos trazidos pela API costumam ter essa informação).</p>';
+      return;
+    }
+
+    var cards = concurso.premiacoes.map(function (p) {
+      var teveGanhador = p.ganhadores > 0;
+      return '<div class="stat-card" style="border-top:3px solid ' + (teveGanhador ? "#10b981" : "#64748b") + ';">' +
+        '<div class="label">' + p.descricao + '</div>' +
+        '<div class="value" style="font-size:16px;">' + (teveGanhador ? p.ganhadores + " ganhador(es)" : "Sem ganhadores") + '</div>' +
+        '<div class="muted" style="font-size:11px;">' + formatarMoeda(p.valorPremio) + (teveGanhador ? " por ganhador" : "") + '</div>' +
+        '</div>';
+    }).join("");
+
+    var statusGeral = '<div class="alert ' + (concurso.acumulado ? "alert-warn" : "alert-ok") + '" style="margin-bottom:10px;">' +
+      (concurso.acumulado ? "🔺 ACUMULOU" : "✅ Teve ganhador(es) na faixa principal") +
+      (concurso.valorAcumuladoProximo ? " · Estimativa do próximo concurso: <b>" + formatarMoeda(concurso.valorAcumuladoProximo) + "</b>" : "") +
+      '</div>';
+
+    el.innerHTML = statusGeral + '<div class="grid-cards">' + cards + '</div>';
+  }
+
+  /* t11-C3 Fase 2: migrado para hooks */
+  function atualizarPremiados() {
+    montarCard();
+    var c = MPL_STATE.ui.volanteDashboardAtual ||
+      (MPL_STATE.base.length ? MPL_STATE.base[MPL_STATE.base.length - 1] : null);
+    renderizar(c);
+  }
+  if (typeof mplOn === "function") mplOn("dashboard", atualizarPremiados, 60);
+  document.addEventListener("DOMContentLoaded", function () { setTimeout(montarCard, 400); });
+})();
+/* ============================================================
+   #pessoal
+   MPL — t11-C3 Fase 3: card de premiação via hook
+   ============================================================ */
+(function () {
+  "use strict";
+  function atualizarPremiacaoDoConcurso(containerId, modalidade, c) {
+    if (containerId !== "volanteDashboard") return;
+    var el = document.getElementById("premiadosConteudo");
+    if (!el) return;
+    if (!c || !c.premiacoes || !c.premiacoes.length) {
+      el.innerHTML = '<p class="muted">Este concurso não tem dados de premiação (comum em importação manual).</p>';
+      return;
+    }
+    var cards = c.premiacoes.map(function (p) {
+      var g = p.ganhadores > 0;
+      return '<div class="stat-card" style="border-top:3px solid ' + (g ? "#10b981" : "#64748b") + ';">' +
+        '<div class="label">' + p.descricao + '</div>' +
+        '<div class="value" style="font-size:16px;">' + (g ? p.ganhadores + " ganhador(es)" : "Sem ganhadores") + '</div>' +
+        '<div class="muted" style="font-size:11px;">R$ ' +
+        Number(p.valorPremio || 0).toLocaleString("pt-BR", { minimumFractionDigits: 2 }) + '</div></div>';
+    }).join("");
+    el.innerHTML = '<div class="alert ' + (c.acumulado ? "alert-warn" : "alert-ok") + '" style="margin-bottom:10px;">' +
+      (c.acumulado ? "🔺 ACUMULOU" : "✅ Teve ganhador(es) na faixa principal") + '</div>' +
+      '<div class="grid-cards">' + cards + '</div>';
+  }
+  if (typeof mplOn === "function") mplOn("volante", atualizarPremiacaoDoConcurso, 55);
+})();

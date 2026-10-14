@@ -1,0 +1,88 @@
+/* ============================================================
+   MPL — mpl-gerador-matrix-fix.js  (arquivo NOVO)
+   ADICIONE no index.html, DEPOIS de mpl-gerador-matrix.js:
+     <script src="js/mpl-gerador-matrix-fix.js"></script>
+
+   Corrige o fundo "Matrix" que não aparecia. Causas prováveis:
+   o canvas nascia com largura/altura 0 (porque o formulário ainda
+   não tinha tamanho definido no instante da criação), e o card
+   pai (.card, com padding e possível overflow) cortava o efeito.
+   Esta versão recria o canvas garantindo tamanho mínimo e usa o
+   CARD inteiro como referência de tamanho, não o formulário interno.
+   ============================================================ */
+(function () {
+  "use strict";
+
+  function montarFundo() {
+    var form = document.getElementById("geradorForm");
+    if (!form) return;
+    var card = form.closest(".card") || form;
+
+    var antigo = document.getElementById("matrixBgCanvas");
+    if (antigo) antigo.remove(); // remove a tentativa anterior, possivelmente com tamanho 0
+
+    card.style.position = "relative";
+    card.style.overflow = "hidden";
+
+    var canvas = document.createElement("canvas");
+    canvas.id = "matrixBgCanvas";
+    canvas.style.cssText = "position:absolute;top:0;left:0;width:100%;height:100%;z-index:0;opacity:.14;pointer-events:none;";
+    card.insertBefore(canvas, card.firstChild);
+
+    Array.prototype.forEach.call(card.children, function (child) {
+      if (child !== canvas) { child.style.position = "relative"; child.style.zIndex = "1"; }
+    });
+
+    function redimensionar() {
+      var largura = card.clientWidth || 600;
+      var altura = Math.max(card.clientHeight, 300); // nunca deixa a altura zerar
+      canvas.width = largura;
+      canvas.height = altura;
+    }
+    redimensionar();
+    window.addEventListener("resize", redimensionar);
+
+    var ctx = canvas.getContext("2d");
+    var chars = "0123456789ABCDEF01ΔΣΩ";
+    var tamanhoFonte = 13;
+    var gotas = [];
+
+    function iniciarGotas() {
+      var colunas = Math.max(1, Math.floor(canvas.width / tamanhoFonte));
+      gotas = new Array(colunas).fill(0).map(function () { return Math.random() * canvas.height / tamanhoFonte; });
+    }
+    iniciarGotas();
+    window.addEventListener("resize", iniciarGotas);
+
+    function frame() {
+      if (!document.getElementById("matrixBgCanvas")) return;
+      var cor = (MPL_STATE.modalidade && typeof obterCorModalidade === "function") ? obterCorModalidade(MPL_STATE.modalidade).principal : "#22d3ee";
+      ctx.fillStyle = "rgba(3,8,10,0.12)";
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      ctx.fillStyle = cor;
+      ctx.font = tamanhoFonte + "px monospace";
+      for (var i = 0; i < gotas.length; i++) {
+        ctx.fillText(chars[Math.floor(Math.random() * chars.length)], i * tamanhoFonte, gotas[i] * tamanhoFonte);
+        if (gotas[i] * tamanhoFonte > canvas.height && Math.random() > 0.975) gotas[i] = 0;
+        gotas[i]++;
+      }
+      requestAnimationFrame(frame);
+    }
+    requestAnimationFrame(frame);
+    console.log("MPL Gerador Matrix: fundo recriado, tamanho " + canvas.width + "x" + canvas.height);
+  }
+
+  document.querySelectorAll(".tab-btn").forEach(function (b) {
+    if (b.dataset.tab === "gerador") b.addEventListener("click", function () { setTimeout(montarFundo, 60); });
+  });
+
+  var tentativas = 0;
+  var vigia = setInterval(function () {
+    tentativas++;
+    if (document.getElementById("tab-gerador") && document.getElementById("tab-gerador").classList.contains("active")) {
+      montarFundo();
+      clearInterval(vigia);
+    }
+    if (tentativas > 40) clearInterval(vigia);
+  }, 200);
+})();

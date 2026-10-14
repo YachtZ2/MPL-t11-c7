@@ -1,0 +1,159 @@
+/* ============================================================
+   MPL — mpl-cockpit-pesos.js  (arquivo NOVO)
+   ADICIONE no index.html, DEPOIS de mpl-radar-container.js e
+   mpl-radar-avcombat-v3.js:
+     <script src="js/mpl-cockpit-pesos.js"></script>
+
+   Constrói o "Cockpit de Pesos": painel de controles tipo alavanca/
+   volume, ao lado ESQUERDO do radar, na aba Radar Reduzido. Ao
+   arrastar qualquer peso (SIC, SF, SA, SC, SRT, SEI, SU), o STF de
+   todas as dezenas é recalculado automaticamente (com um pequeno
+   atraso de 400ms depois que você solta o controle, pra não travar
+   o navegador a cada pixel arrastado), e o Radar Reduzido + a
+   visualização do radar de avião são atualizados na hora — como um
+   radar de verdade reagindo aos ajustes.
+
+   Cada peso tem um ícone "ⓘ" que, ao clicar, mostra uma explicação
+   curta do que aquele score mede e o que acontece se você exagerar
+   pra mais ou pra menos (reaproveita o texto do "indicador crítico"
+   que já existia na aba Módulos & Pesos).
+
+   Não remove a aba "Módulos & Pesos" antiga — os dois lugares ficam
+   sincronizados (mudar num, reflete no outro). Se um dia quiser
+   esconder a aba antiga como fizemos com "Modalidade", é só pedir.
+   ============================================================ */
+(function () {
+  "use strict";
+
+  var EXPLICACOES = {
+    SIC: { nome: "SIC — Score Inicial de Camadas", texto: "Mede a presença da dezena em janelas recentes (5, 8, 10, 13, 17 concursos). Aumentar demais faz o radar reagir só ao curtíssimo prazo, ignorando frequência e ciclo de longo prazo — o radar fica \"nervoso\", mudando muito a cada concurso novo. Zerar faz o radar perder sensibilidade a rajadas recentes de uma dezena." },
+    SF: { nome: "SF — Score de Frequência", texto: "Mede se a dezena aparece mais ou menos que o esperado estatisticamente. Aumentar demais valoriza dezenas \"quentes\" de forma desproporcional. Zerar faz o radar ignorar completamente a frequência histórica." },
+    SA: { nome: "SA — Score de Ausência", texto: "Mede o atraso da dezena sem premiar ausências infinitas. Aumentar demais faz o radar perseguir dezenas atrasadas mesmo sem evidência de que estão \"prestes\" a sair. Zerar remove qualquer efeito de atraso no cálculo." },
+    SC: { nome: "SC — Score de Ciclo", texto: "Mede o ritmo histórico de reaparição da dezena. Aumentar demais faz o radar depender de um padrão cíclico que pode não se repetir. Zerar ignora completamente o ritmo/ciclo." },
+    SRT: { nome: "SRT — Score de Relevância na Teia", texto: "Mede a força relacional da dezena com outras (duplas/triplas que saem juntas). Aumentar demais faz o radar priorizar dezenas \"bem conectadas\" mesmo que fracas individualmente. Zerar faz o radar ignorar toda relação entre dezenas." },
+    SEI: { nome: "SEI — Score Estrutural Individual", texto: "Mede contribuição estrutural leve (paridade, faixa, extremos). Tem peso baixo por padrão — aumentar muito pode enviesar o radar por características superficiais da dezena, não por evidência estatística real." },
+    SU: { nome: "SU — Score do Usuário", texto: "Reflete suas preferências manuais (fixas, proibidas, preferenciais). Aumentar demais faz o radar refletir mais sua opinião do que o cálculo estatístico — válido se for intencional, mas muda a natureza do método." }
+  };
+
+  function montarCockpit() {
+    var radarForm = document.getElementById("radarForm");
+    if (!radarForm || document.getElementById("cockpitPesosWrap")) return;
+
+    var wrap = document.createElement("div");
+    wrap.id = "cockpitPesosWrap";
+    wrap.style.cssText = "display:flex;gap:18px;flex-wrap:wrap;align-items:flex-start;margin-bottom:18px;";
+
+    var painel = document.createElement("div");
+    painel.className = "card";
+    painel.id = "cockpitPesosPainel";
+    painel.style.cssText = "flex:0 0 280px;min-width:260px;";
+    painel.innerHTML = '<h3>🎛️ Cockpit de Pesos</h3><p class="muted" style="font-size:11.5px;">Arraste para ajustar — o radar recalcula sozinho.</p><div id="cockpitPesosControles"></div>';
+
+    var radarResult = document.getElementById("radarResult");
+    var radarCardEspaco = document.createElement("div");
+    radarCardEspaco.style.cssText = "flex:1;min-width:320px;";
+    radarCardEspaco.id = "cockpitRadarEspaco";
+
+    wrap.appendChild(painel);
+    wrap.appendChild(radarCardEspaco);
+    radarForm.parentNode.insertBefore(wrap, radarForm);
+
+    renderControles();
+
+    // move o card do radar visual (recriado pelo mpl-radar-container.js)
+    // para dentro do espaço reservado ao lado do cockpit
+    var tentativas = 0;
+    var vigia = setInterval(function () {
+      tentativas++;
+      var radarCard = document.getElementById("radarAviaoCard");
+      if (radarCard && radarCard.parentNode !== radarCardEspaco) {
+        radarCardEspaco.appendChild(radarCard);
+        clearInterval(vigia);
+      }
+      if (tentativas > 40) clearInterval(vigia);
+    }, 150);
+  }
+
+  var debounceTimer = null;
+  function agendarRecalculo() {
+    clearTimeout(debounceTimer);
+    debounceTimer = setTimeout(function () {
+      if (!MPL_STATE.modalidade) return;
+      var base = (typeof baseEfetiva === "function") ? baseEfetiva() : MPL_STATE.base;
+      if (!base || base.length < 20) return;
+
+      var pack = gerarRankingDezenas(base, MPL_STATE.modalidade, MPL_STATE.config);
+      MPL_STATE.cache.scoresDezenas = pack.ranking;
+      MPL_STATE.cache.teia = pack.teia;
+
+      // recalcula o radar reduzido também, usando a mesma lógica do botão "Gerar Radar"
+      var janela = MPL_STATE.config.caixaJanela || (MPL_STATE.cache.caixa ? Math.round(MPL_STATE.cache.caixa.mediana) : 20);
+      var rb = (typeof gerarRadarBruto === "function") ? gerarRadarBruto(base, janela) : [];
+      var ra = pack.ranking.filter(function (r) { return rb.includes(r.dezena) && !MPL_STATE.config.su.proibidas.includes(r.dezena); });
+      var K = Math.min(MPL_STATE.config.K, ra.length || MPL_STATE.config.K);
+      var rr = (typeof gerarRR === "function") ? gerarRR(ra, K, MPL_STATE.config.su.fixas, MPL_STATE.config.su.proibidas) : [];
+      MPL_STATE.cache.radar = { bruto: rb, ajustado: ra.map(function (r) { return r.dezena; }), reduzido: rr };
+
+      if (typeof renderRankingDezenas === "function") renderRankingDezenas(pack.ranking);
+      if (typeof renderDashboard === "function") renderDashboard();
+
+      var status = document.getElementById("cockpitStatus");
+      if (status) {
+        status.textContent = "Recalculado às " + new Date().toLocaleTimeString("pt-BR") + " · RR(K): " + rr.length + " dezenas.";
+      }
+    }, 400);
+  }
+
+  function renderControles() {
+    var el = document.getElementById("cockpitPesosControles");
+    if (!el) return;
+    var p = MPL_STATE.config.pesosPerfil;
+    var ativos = MPL_STATE.config.modulosAtivos;
+
+    el.innerHTML = Object.keys(p).map(function (k) {
+      return '<div style="margin-bottom:14px;">' +
+        '<div style="display:flex;justify-content:space-between;align-items:center;">' +
+        '<label style="margin:0;display:flex;align-items:center;gap:5px;">' +
+        '<input type="checkbox" id="cockAtivo_' + k + '" ' + (ativos[k] ? "checked" : "") + ' style="width:auto;">' +
+        '<b style="color:#e6edf7;">' + k + '</b>' +
+        '<span class="cockInfoBtn" data-score="' + k + '" style="cursor:pointer;color:#eab308;font-size:12px;" title="O que é isso?">ⓘ</span>' +
+        '</label>' +
+        '<span id="cockValor_' + k + '" style="font-size:11px;color:#8fa3c4;">' + (p[k] * 100).toFixed(0) + '%</span>' +
+        '</div>' +
+        '<input type="range" id="cockSlider_' + k + '" min="0" max="100" step="1" value="' + (p[k] * 100).toFixed(0) + '" style="width:100%;accent-color:#22d3ee;">' +
+        '</div>';
+    }).join("") +
+      '<div id="cockpitStatus" class="muted" style="font-size:11px;margin-top:8px;">Aguardando ajuste...</div>' +
+      '<div id="cockpitExplicacao" class="info-box" style="display:none;margin-top:8px;"></div>';
+
+    Object.keys(p).forEach(function (k) {
+      var slider = document.getElementById("cockSlider_" + k);
+      var chk = document.getElementById("cockAtivo_" + k);
+      var valor = document.getElementById("cockValor_" + k);
+
+      slider.addEventListener("input", function () {
+        MPL_STATE.config.pesosPerfil[k] = Number(slider.value) / 100;
+        valor.textContent = slider.value + "%";
+        agendarRecalculo();
+      });
+      chk.addEventListener("change", function () {
+        MPL_STATE.config.modulosAtivos[k] = chk.checked;
+        agendarRecalculo();
+      });
+    });
+
+    el.querySelectorAll(".cockInfoBtn").forEach(function (btn) {
+      btn.addEventListener("click", function () {
+        var info = EXPLICACOES[btn.dataset.score];
+        var caixa = document.getElementById("cockpitExplicacao");
+        if (!info || !caixa) return;
+        caixa.style.display = "block";
+        caixa.innerHTML = "<b>" + info.nome + "</b><br>" + info.texto;
+      });
+    });
+  }
+
+  /* t11-C3 Fase 4 */
+  if (typeof mplOn === "function") mplOn("radar:form", montarCockpit, 40);
+  document.addEventListener("DOMContentLoaded", function () { setTimeout(montarCockpit, 500); });
+})();

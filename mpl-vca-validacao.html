@@ -1,0 +1,263 @@
+/* ============================================================
+   #pessoal
+   MPL — mpl-vca-validacao.js — VCA Fase C: Validação Walk-Forward
+   ARQUIVO NOVO. No index.html, carregue APÓS mpl-presets.js.
+
+   ★ Premium
+
+   Pega a configuração ATUAL (ou um preset aplicado), CONGELA, e roda
+   em N concursos-alvo sequenciais que ela nunca viu. Cada rodada usa
+   apenas o histórico anterior ao próprio alvo (base.slice(0, idx)) —
+   mesma regra canônica do BTM.
+
+   Entrega o número que realmente importa: a degradação entre
+   in-sample (onde foi calibrado) e out-of-sample (alvos novos).
+
+   Processa em lotes com setTimeout(0) para não travar a aba.
+   ============================================================ */
+(function () {
+  "use strict";
+
+  var VAL = { rodando: false, cancelar: false, resultado: null, qtd: 10, passo: 1 };
+  window.MPL_VCA_VAL = VAL;
+
+  function ehSS() {
+    return typeof isSuperSete === "function" && MPL_STATE.modalidade && isSuperSete(MPL_STATE.modalidade);
+  }
+
+  /* Calcula cobertura para UM alvo, com config congelada */
+  function coberturaNoAlvo(base, idxAlvo, cfg, janelaFixa, K) {
+    var historico = base.slice(0, idxAlvo);        /* CORTE TEMPORAL */
+    if (historico.length < 20) return null;
+    var alvo = base[idxAlvo];
+
+    var janela = janelaFixa || 20;
+    /* replica a decisão do Target Lock: se lá os scores foram restritos
+       ao mapa, aqui também são — senão a validação mediria outra coisa */
+    var restr = !!(window.MPL_VCA && window.MPL_VCA.restringirScores);
+    var baseScores = restr ? historico.slice(Math.max(0, historico.length - janela)) : historico;
+    if (restr && baseScores.length < 20) return null;
+    var pack = gerarRankingDezenas(baseScores, MPL_STATE.modalidade, cfg);
+    var rb = gerarRadarBruto(historico, janela);
+    var ra = pack.ranking.filter(function (r) {
+      return rb.indexOf(r.dezena) !== -1 && cfg.su.proibidas.indexOf(r.dezena) === -1;
+    });
+    var kEfetivo = Math.min(K, ra.length || K);
+    var rr = gerarRR(ra, kEfetivo, cfg.su.fixas, cfg.su.proibidas);
+    var dez = rr.map(function (d) { return d.dezena; });
+    var cob = alvo.dezenas.filter(function (d) { return dez.indexOf(d) !== -1; }).length;
+
+    return {
+      concurso: alvo.numero, cobertura: cob, total: alvo.dezenas.length,
+      pct: alvo.dezenas.length ? (cob / alvo.dezenas.length) * 100 : 0,
+      K: kEfetivo, ra: ra.length
+    };
+  }
+
+  /* Roda a validação em lotes */
+  function executar() {
+    if (VAL.rodando || ehSS()) return;
+    var base = (typeof baseEfetiva === "function") ? baseEfetiva() : MPL_STATE.base;
+    if (!base || base.length < 60) return alert("Base insuficiente para validação (mínimo ~60 concursos).");
+
+    var v = window.MPL_VCA || {};
+    var calib = (v.resultado && !v.resultado.erro) ? v.resultado : null;
+    if (!calib) return alert("Calibre primeiro no Target Lock (ative e recalcule) para termos a referência in-sample.");
+
+    /* CONGELA a configuração atual — nenhuma alteração durante a validação */
+    var cfg = JSON.parse(JSON.stringify(MPL_STATE.config));
+    var K = v.kOverride || cfg.K;
+    var janela = calib.janela;
+
+    /* Alvos: os N seguintes ao alvo de calibração (nunca vistos) */
+    var idxCalib = base.findIndex(function (c) { return c.numero === calib.alvo; });
+    if (idxCalib < 0) return alert("Alvo de calibração não encontrado na base atual.");
+
+    var alvos = [];
+    for (var i = idxCalib + VAL.passo; i < base.length && alvos.length < VAL.qtd; i += VAL.passo) {
+      if (i >= 20) alvos.push(i);
+    }
+    if (alvos.length < 3) {
+      return alert("Poucos alvos disponíveis após o concurso " + calib.alvo +
+        ".\n\nEscolha um alvo de calibração mais antigo (ex.: 20–30 concursos atrás) para sobrar histórico de validação.");
+    }
+
+    VAL.rodando = true; VAL.cancelar = false;
+    var resultados = [], idx = 0;
+
+    function lote() {
+      if (VAL.cancelar) { VAL.rodando = false; render(); return; }
+      var fim = Math.min(idx + 2, alvos.length);
+      for (; idx < fim; idx++) {
+        var r = coberturaNoAlvo(base, alvos[idx], cfg, janela, K);
+        if (r) resultados.push(r);
+      }
+      atualizarProgresso(idx, alvos.length);
+      if (idx < alvos.length) setTimeout(lote, 0);
+      else finalizar(resultados, calib, K, janela);
+    }
+    setTimeout(lote, 10);
+    render();
+  }
+
+  function finalizar(res, calib, K, janela) {
+    VAL.rodando = false;
+    if (!res.length) { VAL.resultado = { erro: "Nenhum alvo processado." }; render(); return; }
+
+    var pcts = res.map(function (r) { return r.pct; });
+    var cobs = res.map(function (r) { return r.cobertura; });
+    var mediaPct = pcts.reduce(function (a, b) { return a + b; }, 0) / pcts.length;
+    var mediaCob = cobs.reduce(function (a, b) { return a + b; }, 0) / cobs.length;
+    var total = res[0].total;
+    var totalCoberto = res.filter(function (r) { return r.cobertura === r.total; }).length;
+
+    VAL.resultado = {
+      calibracao: { alvo: calib.alvo, pct: calib.pct, cobertura: calib.cobertura, total: calib.total },
+      alvos: res, qtd: res.length, K: K, janela: janela,
+      mediaPct: mediaPct, mediaCob: mediaCob, total: total,
+      taxaTotal: (totalCoberto / res.length) * 100,
+      melhor: Math.max.apply(null, cobs), pior: Math.min.apply(null, cobs),
+      degradacao: calib.pct - mediaPct
+    };
+    render();
+  }
+
+  function atualizarProgresso(feitos, total) {
+    var el = document.getElementById("valProgresso");
+    if (el) el.textContent = "Processando alvo " + feitos + " de " + total + "…";
+  }
+
+  /* ---------- UI ---------- */
+  function montarSecao() {
+    var card = document.getElementById("vcaCard");
+    if (!card || !MPL_STATE.modalidade) return;
+    if (document.getElementById("valSecao")) { render(); return; }
+    var sec = document.createElement("div");
+    sec.id = "valSecao";
+    sec.style.cssText = "margin-top:16px;padding-top:14px;border-top:1px solid var(--border);";
+    sec.innerHTML = '<div id="valConteudo"></div>';
+    card.appendChild(sec);
+    render();
+  }
+
+  function render() {
+    var el = document.getElementById("valConteudo");
+    if (!el) return;
+
+    if (ehSS()) {
+      el.innerHTML = '<h3 style="margin:0 0 6px;">🔬 Validação <span style="font-size:9px;color:#eab308;">★ Premium</span></h3>' +
+        '<div class="info-box" style="font-size:11px;">Não se aplica ao Super Sete.</div>';
+      return;
+    }
+
+    var cab = '<h3 style="margin:0 0 6px;">🔬 Validação Walk-Forward <span style="font-size:9px;color:#eab308;">★ Premium</span></h3>' +
+      '<p class="muted" style="font-size:11px;margin:0 0 8px;">Congela a configuração atual e testa em alvos que ela <b>nunca viu</b>. É este número que tem valor — não o da calibração.</p>';
+
+    var ctrl =
+      '<label style="font-size:10.5px;margin-top:4px;">Quantos alvos testar</label>' +
+      '<input type="number" id="valQtd" min="3" max="60" value="' + VAL.qtd + '" style="font-size:11.5px;">' +
+      '<div class="muted" style="font-size:10px;margin:-2px 0 6px;">Nº de concursos futuros (após o alvo de calibração) em que a configuração congelada será testada.</div>' +
+      '<label style="font-size:10.5px;">Intervalo entre alvos</label>' +
+      '<input type="number" id="valPasso" min="1" max="20" value="' + VAL.passo + '" style="font-size:11.5px;">' +
+      '<div class="muted" style="font-size:10px;margin:-2px 0 6px;"><b>1</b> = concursos consecutivos (rápido, porém históricos quase iguais). <b>5</b> ou <b>10</b> = alvos espalhados no tempo, testando contextos diferentes — mais custoso e mais informativo.</div>' +
+      (VAL.qtd && VAL.passo ? '<div class="info-box" style="font-size:10.5px;padding:7px 10px;margin:0 0 6px;">' +
+        'Serão testados <b>' + VAL.qtd + '</b> alvos, de ' + VAL.passo + ' em ' + VAL.passo +
+        ' concurso(s). Cada alvo usa <b>apenas o histórico anterior a ele</b>, com a janela deslizando junto.</div>' : "") +
+      '<button id="btnValidar" class="btn-primary" style="width:100%;margin:2px 0 4px;font-size:11.5px;" ' +
+      (VAL.rodando ? "disabled" : "") + '>' + (VAL.rodando ? "Validando…" : "Executar validação") + '</button>' +
+      (VAL.rodando ? '<button id="btnValCancel" class="btn-danger" style="width:100%;font-size:11px;margin:0 0 6px;">Cancelar</button>' +
+        '<div id="valProgresso" class="muted" style="font-size:10.5px;">Iniciando…</div>' : "");
+
+    var r = VAL.resultado, res = "";
+    if (r && r.erro) res = '<div class="alert alert-warn" style="font-size:11px;">' + r.erro + '</div>';
+    else if (r && !VAL.rodando) {
+      var cIn = r.calibracao.pct >= 80 ? "#10b981" : (r.calibracao.pct >= 60 ? "#eab308" : "#ef4444");
+      var cOut = r.mediaPct >= 80 ? "#10b981" : (r.mediaPct >= 60 ? "#eab308" : "#ef4444");
+      var deg = r.degradacao;
+      var cDeg = deg <= 5 ? "#10b981" : (deg <= 15 ? "#eab308" : "#ef4444");
+      var leitura = deg <= 5
+        ? "Degradação baixa — a configuração manteve desempenho fora do mapa onde nasceu."
+        : (deg <= 15
+          ? "Degradação moderada — parte do desempenho era específico do alvo de calibração."
+          : "Degradação alta — forte indício de que a configuração <b>decorou</b> o alvo original (overfitting).");
+
+      res =
+        '<div style="background:var(--graphite);border:1px solid var(--border);border-radius:8px;padding:10px;margin-top:8px;">' +
+        '<div style="font-size:10.5px;color:#8fa3c4;">CALIBRAÇÃO (in-sample) · alvo ' + r.calibracao.alvo + '</div>' +
+        '<div style="font-size:16px;font-weight:700;color:' + cIn + ';">' + r.calibracao.cobertura + '/' + r.calibracao.total +
+        ' · ' + r.calibracao.pct.toFixed(1) + '%</div>' +
+        '<div style="height:1px;background:var(--border);margin:8px 0;"></div>' +
+        '<div style="font-size:10.5px;color:#8fa3c4;">VALIDAÇÃO (out-of-sample) · ' + r.qtd + ' alvos novos</div>' +
+        '<div style="font-size:16px;font-weight:700;color:' + cOut + ';">' + r.mediaCob.toFixed(1) + '/' + r.total +
+        ' · ' + r.mediaPct.toFixed(1) + '%</div>' +
+        '<div class="muted" style="font-size:10px;margin-top:3px;">Melhor ' + r.melhor + ' · Pior ' + r.pior +
+        ' · Cobertura total em ' + r.taxaTotal.toFixed(0) + '% dos alvos</div>' +
+        '<div style="height:1px;background:var(--border);margin:8px 0;"></div>' +
+        '<div style="font-size:10.5px;color:#8fa3c4;">DEGRADAÇÃO</div>' +
+        '<div style="font-size:18px;font-weight:800;color:' + cDeg + ';">' + (deg >= 0 ? "" : "+") + (-deg).toFixed(1).replace("-", "") +
+        (deg >= 0 ? " p.p. ↓" : " p.p. ↑") + '</div>' +
+        '<div class="muted" style="font-size:10.5px;margin-top:4px;">' + leitura + '</div>' +
+        '</div>' +
+        '<details style="margin-top:8px;"><summary class="muted" style="font-size:10.5px;cursor:pointer;">Ver alvo a alvo</summary>' +
+        '<div class="table-wrap" style="max-height:180px;margin-top:6px;"><table style="font-size:10.5px;">' +
+        '<tr><th>Alvo</th><th>Cob.</th><th>%</th></tr>' +
+        r.alvos.map(function (a) {
+          var c = a.pct >= 80 ? "#10b981" : (a.pct >= 60 ? "#eab308" : "#ef4444");
+          return '<tr><td>' + a.concurso + '</td><td>' + a.cobertura + '/' + a.total +
+            '</td><td style="color:' + c + ';">' + a.pct.toFixed(0) + '%</td></tr>';
+        }).join("") + '</table></div></details>' +
+        '<button id="btnValSalvar" class="btn-secondary" style="width:100%;margin-top:8px;font-size:11px;">Anexar ao preset</button>';
+    }
+
+    el.innerHTML = cab + ctrl + res;
+    ligar();
+  }
+
+  function ligar() {
+    ["valQtd", "valPasso"].forEach(function (id) {
+      var i = document.getElementById(id);
+      if (i && !i.__v) {
+        i.__v = true;
+        i.addEventListener("change", function () {
+          VAL.qtd = Number(document.getElementById("valQtd").value) || 10;
+          VAL.passo = Number(document.getElementById("valPasso").value) || 1;
+          render();
+        });
+      }
+    });
+    var b = document.getElementById("btnValidar");
+    if (b && !b.__v) { b.__v = true; b.addEventListener("click", executar); }
+    var c = document.getElementById("btnValCancel");
+    if (c && !c.__v) { c.__v = true; c.addEventListener("click", function () { VAL.cancelar = true; }); }
+
+    var s = document.getElementById("btnValSalvar");
+    if (s && !s.__v) {
+      s.__v = true;
+      s.addEventListener("click", function () {
+        if (!VAL.resultado || VAL.resultado.erro) return;
+        var nome = prompt("Nome do preset validado:",
+          (MPL_STATE.modalidade ? MPL_STATE.modalidade.sigla : "MPL") +
+          " · val " + VAL.resultado.mediaPct.toFixed(0) + "%");
+        if (!nome) return;
+        if (typeof MPL_PRESETS === "undefined") return alert("Módulo de presets não carregado.");
+        var p = MPL_PRESETS.capturar(nome);
+        p.validacoes = [{
+          quando: new Date().toISOString(),
+          alvos: VAL.resultado.qtd,
+          mediaPct: Number(VAL.resultado.mediaPct.toFixed(1)),
+          degradacao: Number(VAL.resultado.degradacao.toFixed(1)),
+          taxaTotal: Number(VAL.resultado.taxaTotal.toFixed(1))
+        }];
+        var lista = MPL_PRESETS.listar();
+        lista.push(p);
+        localStorage.setItem("mplPresets", JSON.stringify(lista));
+        alert("Preset salvo com o registro de validação.\n\nRecarregue a aba Radar para vê-lo na lista.");
+      });
+    }
+  }
+
+  if (typeof mplOn === "function") mplOn("radar:form", montarSecao, 67);
+  document.addEventListener("DOMContentLoaded", function () { setTimeout(montarSecao, 950); });
+
+  console.log("MPL VCA Fase C: validação walk-forward ativa (config congelada, alvos out-of-sample).");
+})();
